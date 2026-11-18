@@ -28,8 +28,11 @@ from flydsl.expr.typing import Vector as Vec
 
 E, TOPK, NQ, EPL = 896, 16, 4, 16
 RANK_UNROLL = 32  # candidates ranked per loop step (all loads first: the step costs one LDS latency)
-MAXC = 64  # candidates the fast path ranks; one LDS slot each, plus EPL slots for the unselected elements
-ENT_WORDS = (MAXC + EPL) * 4  # LDS words per wave: per slot (key, tie rank << 16 | expert, sigmoid, -)
+MAXC = 64  # candidates the fast path ranks; one LDS slot each
+SENTINELS = RANK_UNROLL  # slots after the candidates holding key 0, so a rank step never reads past them
+DUMMY0 = MAXC + SENTINELS  # the slots the unselected elements write to
+ENT_SLOTS = DUMMY0 + EPL
+ENT_WORDS = ENT_SLOTS * 4  # LDS words per wave: per slot (tie term, key, sigmoid bits, expert)
 LDS_WORDS = {"ent": ENT_WORDS, "osig": TOPK + 1, "oid": TOPK + 1, "tie": 64, "tex": 64, "tmask": 64}
 PRELOAD_HINTS = {"llvm_options": {"amdgpu-kernarg-preload": True, "amdgpu-kernarg-preload-count": 16}}
 DPP_TREE = (0xB1, 0x4E, 0x141, 0x140, 0x142, 0x143)
@@ -149,7 +152,7 @@ def topk_pivot(st, smem, wv, lane):
 
 
 def _ent_addr(smem, wv, slot):
-    return fx.Int32(fx.ptrtoint(smem.ent.ptr)) + (wv * (MAXC + EPL) + slot) * 16
+    return fx.Int32(fx.ptrtoint(smem.ent.ptr)) + (wv * ENT_SLOTS + slot) * 16
 
 
 def _entry(st_key, tie_rank, sig, expert):
@@ -162,10 +165,13 @@ def topk_fast_write(st, smem, wv, lane):
     """The candidates to LDS in expert-lane order (slots 0..nc-1; the others go to the spare slots)."""
     run = st.excl
     for i in range_constexpr(EPL):
-        slot = st.cand[i].select(run, fx.Int32(MAXC + i))
+        slot = st.cand[i].select(run, fx.Int32(DUMMY0 + i))
         ent = _entry(st.key[i], (st.rl << 5) | i, st.sig[i], 256 * (i // 4) + 4 * lane + (i % 4))
         llvm.store(_ir(ent), _lds_ptr(_ent_addr(smem, wv, slot)), alignment=16)
         run = run + st.cand[i].select(fx.Int32(1), fx.Int32(0))
+    zero = fx.Int32(0)
+    llvm.store(_ir(Vec.from_elements([zero, zero, zero, zero], fx.Int32)),
+               _lds_ptr(_ent_addr(smem, wv, (lane < SENTINELS).select(st.nc + lane, fx.Int32(DUMMY0)))), alignment=16)
     fx.rocdl.s_waitcnt(lgkmcnt=0)
     fx.rocdl.sched_barrier(0)
 
@@ -183,8 +189,7 @@ def topk_rank_step(rank, e, st, smem, wv):
     others = [fx.Uint64(llvm.load(T.i64, _lds_ptr(_ent_addr(smem, wv, e + u)), alignment=8))
               for u in range_constexpr(RANK_UNROLL)]
     for u in range_constexpr(RANK_UNROLL):
-        better = ((e + u) < st.nc) & (others[u] > st.mykey)
-        rank = rank + better.select(fx.Int32(1), fx.Int32(0))
+        rank = rank + (others[u] > st.mykey).select(fx.Int32(1), fx.Int32(0))
     return rank
 
 
@@ -268,7 +273,7 @@ def topk_slow_out(st, smem, wv, lane):
         nsel = nsel + sel[i].select(fx.Int32(1), fx.Int32(0))
     run = _scan(nsel) - nsel
     for i in range_constexpr(EPL):
-        slot_i = sel[i].select(run, fx.Int32(MAXC + i))
+        slot_i = sel[i].select(run, fx.Int32(DUMMY0 + i))
         ent = _entry(key[i], (rl << 5) | i, sig[i], 256 * (i // 4) + 4 * lane + (i % 4))
         llvm.store(_ir(ent), _lds_ptr(_ent_addr(smem, wv, slot_i)), alignment=16)
         run = run + sel[i].select(fx.Int32(1), fx.Int32(0))

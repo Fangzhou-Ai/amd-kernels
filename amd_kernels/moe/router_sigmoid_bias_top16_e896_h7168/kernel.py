@@ -86,7 +86,7 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
     MTP = (MT + WM - 1) // WM * WM  # row fragments, a multiple of the row waves
     MW = MTP // WM  # row fragments of a wave
     assert NWV % WN == 0 and N // 16 % NF == 0 and (NF * 2) % NWV == 0
-    assert 1 <= MT <= MT_MAX and NB % KS == 0 and (not FUSED or TILES * KS >= 16 * MT)  # a token a workgroup
+    assert 1 <= MT <= MT_MAX and NB % KS == 0 and (not FUSED or TILES * KS >= 16 * MT and 16 // NF * KS <= 64)  # a token a workgroup; a group's flags in one load
     NBK = NB // KS  # K blocks per workgroup
     MR = 16 * MT
     SLOT_FRAGS = NF + MTP
@@ -250,39 +250,28 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
             fx.rocdl.s_waitcnt(vmcnt=0)
             fx.gpu.barrier()
             buffer_ops.buffer_store(tag, flags, bid, mask=tx == 0, cache_modifier=SC1)
-            # token ``bid`` (bid < M; a token per workgroup: the grid has at least 16 MT workgroups): wave 0 polls, then
-            # the four waves each take one group of 256 experts (slab loads, sums, sigmoids, keys) into LDS (the dead
-            # GEMM ring) and wave 0 selects
-            if bid < i32_m:
-                if wave == 0:
-                    done = fx.Int32(0)
-                    while done < 4 * 64:
-                        done = fx.Int32(0)
-                        for r in range_constexpr(4):
-                            f = fx.Int32(buffer_ops.buffer_load(flags, lane + 64 * r, vec_width=1, dtype=fx.Int32,
-                                                                mask=(lane + 64 * r) < TILES * KS,
-                                                                cache_modifier=SC1 | 1))
-                            done = done + _popcount(_ballot((f == tag) | ((lane + 64 * r) >= TILES * KS)))
-                        fx.rocdl.s_sleep(POLL_SLEEP)
-                fx.gpu.barrier()
-                br = buffer_ops.create_buffer_resource_from_addr(arg_bias, num_records_bytes=N * 4)
-                for j, (sg, key) in enumerate(topk_q_scores(pr, br, lane, bid, i32_m, KS, SC1, wave)):
-                    llvm.store(_raw(Vec.from_elements([fx.Int32(key), sg.bitcast(fx.Int32)], fx.Int32)),
-                               _lds_ptr(lds_base + (lane * 16 + 4 * wave + j) * 8), alignment=8)
-                fx.rocdl.s_waitcnt(lgkmcnt=0)
-                fx.gpu.barrier()
+            # token ``bid`` (bid < M; a token per workgroup: the grid has at least 16 MT workgroups), wave 0: the experts 256 q
+            # + 4 lane + j live in the tiles t0 .. t1, whose workgroups are the flags lo .. hi - 1: each group is taken as
+            # its flags turn to this call's tag (slab loads, sums, sigmoids, keys), then the selection
             if (bid < i32_m) & (wave == 0):
                 tok = bid
                 out_bytes = fx.Int64(i32_m) * fx.Int64(i32_os) * 4
                 owr = buffer_ops.create_buffer_resource_from_addr(arg_ow, num_records_bytes=out_bytes)
                 oir = buffer_ops.create_buffer_resource_from_addr(arg_oid, num_records_bytes=out_bytes)
+                br = buffer_ops.create_buffer_resource_from_addr(arg_bias, num_records_bytes=N * 4)
                 st = topk_new(lane)
-                for i in range_constexpr(8):
-                    pair = Vec(llvm.load(T.vec(4, T.i32), _lds_ptr(lds_base + (lane * 16 + 2 * i) * 8), alignment=16))
-                    st.key.append(fx.Uint32(pair[0]))
-                    st.sig.append(fx.Int32(pair[1]).bitcast(fx.Float32))
-                    st.key.append(fx.Uint32(pair[2]))
-                    st.sig.append(fx.Int32(pair[3]).bitcast(fx.Float32))
+                for q in range_constexpr(NQ):
+                    lo = (256 * q // TN) * KS
+                    hi = ((min(256 * q + 255, N - 1)) // TN + 1) * KS
+                    done = fx.Int32(0)
+                    while done < hi - lo:
+                        f = fx.Int32(buffer_ops.buffer_load(flags, lane + lo, vec_width=1, dtype=fx.Int32,
+                                                            mask=lane < hi - lo, cache_modifier=SC1 | 1))
+                        done = _popcount(_ballot((f == tag) & (lane < hi - lo)))
+                        fx.rocdl.s_sleep(POLL_SLEEP)
+                    for sg, key in topk_q_scores(pr, br, lane, tok, i32_m, KS, SC1, q):
+                        st.sig.append(sg)
+                        st.key.append(key)
                 topk_pivot(st, smem, wave, lane)
                 out_id = fx.Int32(0)
                 out_w = fx.Float32(0.0)
