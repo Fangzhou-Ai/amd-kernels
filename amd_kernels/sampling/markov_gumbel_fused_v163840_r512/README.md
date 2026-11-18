@@ -13,7 +13,7 @@ launch per step in place of the stock ~9 (embedding gather, GEMV, add, Gumbel ke
 base-logit read and cache write (2 x n x 327 KB). Shapes: 1-48 requests, any step count, vocab 163840, rank 512,
 `markov_w1` / `markov_w2` bf16 contiguous. Caller: the K3.1 DSpark speculator at c16-c48 (8 / 13 / 20 / 48 requests,
 4 / 4 / 3 / 3 steps). Contract (`reference.py`): bit for bit vLLM's `gumbel_sample` on the cached logits (checked
-outside this repository, 964 draws, 0 mismatches); the bias sum order differs from the GEMV's (a few logits one bf16
+outside this repository, 434 draws, 0 mismatches); the bias sum order differs from the GEMV's (a few logits one bf16
 ulp, 1.5e-6 of elements); inputs finite.
 
 ## Entry points
@@ -27,16 +27,16 @@ ulp, 1.5e-6 of elements); inputs finite.
 
 ## Performance
 
-One MI355X, graph replay, 3 rotated `markov_w2` copies, 8 input sets (HBM-cold), T 1.0 (the other bodies: `--temp`),
+One MI355X, graph replay, 3 rotated `markov_w2` copies, 8 input sets (HBM-cold), T 1.0 (T 0.7 within 2 us; T 0: 138.7 / 140.9 / 119.6 / 140.0 us against vLLM's 237.7 / 272.4 / 185.5 / 275.1),
 median of 5 alternated rounds of 10 replays, us per chain. Baseline = vLLM's loop in the same harness.
 
 | requests / steps (conf) | 8 / 4 (c16) | 13 / 4 (c24) | 20 / 3 (c32) | 48 / 3 (c48) |
 |---|---|---|---|---|
-| vLLM loop | 248.4 | 289.3 | 201.9 | 307.8 |
-| this entry | 148.6 | 161.5 | 119.6 | 141.5 |
-| HBM MB / % of 6.4 TB/s | 692 / 73% | 705 / 68% | 543 / 71% | 598 / 66% |
+| vLLM loop | 247.6 | 285.8 | 199.3 | 306.5 |
+| this entry | 149.0 | 151.5 | 119.9 | 142.6 |
+| HBM MB / % of 6.4 TB/s | 692 / 73% | 705 / 73% | 543 / 71% | 598 / 65% |
 
-Limiter: `markov_w2` streams at ~5.5 TB/s (a plain 168 MB read ceiling on this node is 5.4-5.8 TB/s), the base-logit read and
+Limiter: `markov_w2` streams at ~5.5 TB/s (a `torch.sum` over 1.5 GB reads at 5.4 TB/s on this node), the base-logit read and
 cache write add 2 x n x 327 KB a step, and each step ends with a ~3 us ticket tail.
 
 ## Tests
