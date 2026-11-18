@@ -27,17 +27,21 @@ ulp, 1.5e-6 of elements); inputs finite.
 
 ## Performance
 
-One MI355X, graph replay, 3 rotated `markov_w2` copies, 8 input sets (HBM-cold), T 1.0 (T 0.7 within 2 us; T 0: 138.7 / 140.9 / 119.6 / 140.0 us against vLLM's 237.7 / 272.4 / 185.5 / 275.1),
+One MI355X, graph replay, 3 rotated `markov_w2` copies, 8 input sets (HBM-cold), T 1.0,
 median of 5 alternated rounds of 10 replays, us per chain. Baseline = vLLM's loop in the same harness.
 
 | requests / steps (conf) | 8 / 4 (c16) | 13 / 4 (c24) | 20 / 3 (c32) | 48 / 3 (c48) |
 |---|---|---|---|---|
-| vLLM loop | 247.6 | 285.8 | 199.3 | 306.5 |
-| this entry | 149.0 | 151.5 | 119.9 | 142.6 |
-| HBM MB / % of 6.4 TB/s | 692 / 73% | 705 / 73% | 543 / 71% | 598 / 65% |
+| vLLM loop | 238.0 | 276.9 | 202.7 | 307.6 |
+| this entry | 138.8 | 141.8 | 117.3 | 140.1 |
+| measured ceiling (streaming skeleton + extra bytes) | 115 | 118 | 90 | 100 |
+| % of the measured ceiling | 83% | 83% | 77% | 71% |
 
-Limiter: `markov_w2` streams at ~5.5 TB/s (a `torch.sum` over 1.5 GB reads at 5.4 TB/s on this node), the base-logit read and
-cache write add 2 x n x 327 KB a step, and each step ends with a ~3 us ticket tail.
+Ceiling: a FlyDSL skeleton with this kernel's weight-load pattern and no math reads `markov_w2` in 28.0 us (6.0 TB/s, grid / depth /
+cache-hint / interleave variants 27.3-29.5 us; includes launch), plus 2 x n x 327 KB a step at 6.1 TB/s, per step. Not in the
+ceiling and the remaining gap: the prologue (previous-token gather, `w1` rows, request state: 3.3 us at 16 rows, 6.8 us at 48; the
+weight stream cannot start before the loads of that chain without delaying them), the ticket tail (2.7 us at 16 rows, 5.7 us at 48)
+and ~5 us of spread between the workgroups' finish times. At T 0 (no noise): 129.5 / 133.4 / 117.5 / 137.7.
 
 ## Tests
 

@@ -224,7 +224,6 @@ def compile_markov_step(mt: int):
             return [Vec(buffer_ops.buffer_load(w2_r, wi * (RANK // 2) + k * 16 + (lane // 16) * 4, vec_width=4,
                                                dtype=I)) for k in range_constexpr(KSTEPS)]
 
-        nxt = load_tile(0)
 
         # previous token of row ``lane`` (lane < n): step 0 input_ids[anchor[r]], later draft_tokens[r, step - 1]
         first = i32_step == 0
@@ -252,15 +251,6 @@ def compile_markov_step(mt: int):
             ws.append(Vec(buffer_ops.buffer_load(w1_r, tok * (RANK // 2) + lane * 4, vec_width=4, dtype=I,
                                                  mask=row < i32_n)))
 
-        # the wave's base-logit slab (rows x WAVE_COLS), coalesced 16 B per lane, into LDS
-        bch = []
-        for it in range_constexpr((ROWS * (WAVE_COLS // 8) + 63) // 64):
-            j = lane + 64 * it
-            r, q = j // (WAVE_COLS // 8), j % (WAVE_COLS // 8)
-            ok = (j < ROWS * (WAVE_COLS // 8)) & (r < i32_n)
-            bch.append((r, q, Vec(buffer_ops.buffer_load(base_r, (r * i32_bs0 + i32_step * V + n0 + q * 8) // 2,
-                                                         vec_width=4, dtype=I, mask=ok))))
-
         temps, h0s, cvalid, crow_off = [], [], [], []
         for m in range_constexpr(MT):
             slot, pos_lo = rstate[m]
@@ -276,13 +266,25 @@ def compile_markov_step(mt: int):
             h0s.append(_mix(_mix(_mix(I(0), I(sd[0])), I(sd[1]) ^ i32_step), pos_lo))
             temps.append(valid.select(tmp, F(0.0)))
 
+        # the wave's base-logit slab (rows x WAVE_COLS), coalesced 16 B per lane, into LDS
+        bch = []
+        for it in range_constexpr((ROWS * (WAVE_COLS // 8) + 63) // 64):
+            j = lane + 64 * it
+            r, q = j // (WAVE_COLS // 8), j % (WAVE_COLS // 8)
+            ok = (j < ROWS * (WAVE_COLS // 8)) & (r < i32_n)
+            bch.append((r, q, Vec(buffer_ops.buffer_load(base_r, (r * i32_bs0 + i32_step * V + n0 + q * 8) // 2,
+                                                         vec_width=4, dtype=I, mask=ok))))
+
+        fx.rocdl.sched_barrier(0)
+        nxt = load_tile(0)
+        fx.rocdl.sched_barrier(0)
+        for r, q, v in bch:
+            for j in range_constexpr(4):
+                smem.buf.ptr[wave * ROWS * PBD + r * PBD + q * 4 + j] = v[j]
         for i in range_constexpr(ROWS // NW):
             row = wave + NW * i
             for j in range_constexpr(4):
                 smem.e.ptr[row * ER + lane * 4 + j] = ws[i][j]
-        for r, q, v in bch:
-            for j in range_constexpr(4):
-                smem.buf.ptr[wave * ROWS * PBD + r * PBD + q * 4 + j] = v[j]
         if wave == 0:  # noqa: SIM102
             if lane < 16:
                 for m in range_constexpr(MT):
@@ -406,31 +408,63 @@ def compile_markov_step(mt: int):
             else:
                 run(smem, False, False)
 
-        fx.rocdl.s_waitcnt(vmcnt=0)
-        fx.gpu.barrier()
-        if tx == 0:
-            smem.last.ptr[0] = (_atomic_add(arg_part, 1) == NWG - 1).select(I(1), I(0))
-        fx.gpu.barrier()
-        if smem.last.ptr[0] != 0:
-            pr = buffer_ops.create_buffer_resource_from_addr(arg_part, num_records_bytes=0x7FFFFFFF)
-            r, q = tx // 4, tx % 4
-            bv, bi = F(NEG_INF), I(0)
-            for c in range_constexpr(NWG // 4 // 2):
-                e = Vec(buffer_ops.buffer_load(pr, CNT_DWORDS + (r * NWG + q * (NWG // 4)) * 2 + c * 4, vec_width=4,
-                                               dtype=I, cache_modifier=SC1, mask=r < i32_n))
-                bv, bi = _comb(bv, bi, I(e[0]).bitcast(F), I(e[1]))
-                bv, bi = _comb(bv, bi, I(e[2]).bitcast(F), I(e[3]))
-            for mm in (1, 2):
-                ov = _xor_lane(bv.bitcast(I), mm, upper16).bitcast(F)
-                oi = _xor_lane(bi, mm, upper16)
-                bv, bi = _comb(bv, bi, ov, oi)
-            if (q == 0) & (r < i32_n):
-                tr = buffer_ops.create_buffer_resource_from_addr(
-                    arg_tokens + (fx.Int64(r) * fx.Int64(i32_tok_stride) + fx.Int64(i32_step)) * 8,
-                    num_records_bytes=8)
-                buffer_ops.buffer_store(Vec.from_elements([bi, I(0)], I), tr, 0)
+        if MT == 1:
+            fx.rocdl.s_waitcnt(vmcnt=0)
+            fx.gpu.barrier()
+            # one ticket per 16-row group; the workgroup that takes a group's last ticket reduces that group
+            for g in range_constexpr(MT):
+                if tx == g:
+                    smem.last.ptr[g] = (_atomic_add(arg_part + fx.Int64(g * 4), 1) == NWG - 1).select(I(1), I(0))
+            fx.gpu.barrier()
+            for g in range_constexpr(MT):
+                if smem.last.ptr[g] != 0:
+                    pr = buffer_ops.create_buffer_resource_from_addr(arg_part, num_records_bytes=0x7FFFFFFF)
+                    r, q = g * 16 + tx // 16, tx % 16
+                    bv, bi = F(NEG_INF), I(0)
+                    for c in range_constexpr(NWG // 16 // 2):
+                        e = Vec(buffer_ops.buffer_load(pr, CNT_DWORDS + (r * NWG + q * (NWG // 16)) * 2 + c * 4,
+                                                       vec_width=4, dtype=I, cache_modifier=SC1, mask=r < i32_n))
+                        bv, bi = _comb(bv, bi, I(e[0]).bitcast(F), I(e[1]))
+                        bv, bi = _comb(bv, bi, I(e[2]).bitcast(F), I(e[3]))
+                    for mm in (1, 2, 4, 8):
+                        ov = _xor_lane(bv.bitcast(I), mm, upper16).bitcast(F)
+                        oi = _xor_lane(bi, mm, upper16)
+                        bv, bi = _comb(bv, bi, ov, oi)
+                    if (q == 0) & (r < i32_n) & (tx < 256):
+                        tr = buffer_ops.create_buffer_resource_from_addr(
+                            arg_tokens + (fx.Int64(r) * fx.Int64(i32_tok_stride) + fx.Int64(i32_step)) * 8,
+                            num_records_bytes=8)
+                        buffer_ops.buffer_store(Vec.from_elements([bi, I(0)], I), tr, 0)
+                    if tx == 0:
+                        buffer_ops.buffer_store(I(0), pr, g, cache_modifier=SC1)
+
+        else:
+            fx.rocdl.s_waitcnt(vmcnt=0)
+            fx.gpu.barrier()
             if tx == 0:
-                buffer_ops.buffer_store(I(0), pr, 0, cache_modifier=SC1)
+                smem.last.ptr[0] = (_atomic_add(arg_part, 1) == NWG - 1).select(I(1), I(0))
+            fx.gpu.barrier()
+            if smem.last.ptr[0] != 0:
+                pr = buffer_ops.create_buffer_resource_from_addr(arg_part, num_records_bytes=0x7FFFFFFF)
+                r, q = tx // 4, tx % 4
+                bv, bi = F(NEG_INF), I(0)
+                for c in range_constexpr(NWG // 4 // 2):
+                    e = Vec(buffer_ops.buffer_load(pr, CNT_DWORDS + (r * NWG + q * (NWG // 4)) * 2 + c * 4, vec_width=4,
+                                                   dtype=I, cache_modifier=SC1, mask=r < i32_n))
+                    bv, bi = _comb(bv, bi, I(e[0]).bitcast(F), I(e[1]))
+                    bv, bi = _comb(bv, bi, I(e[2]).bitcast(F), I(e[3]))
+                for mm in (1, 2):
+                    ov = _xor_lane(bv.bitcast(I), mm, upper16).bitcast(F)
+                    oi = _xor_lane(bi, mm, upper16)
+                    bv, bi = _comb(bv, bi, ov, oi)
+                if (q == 0) & (r < i32_n):
+                    tr = buffer_ops.create_buffer_resource_from_addr(
+                        arg_tokens + (fx.Int64(r) * fx.Int64(i32_tok_stride) + fx.Int64(i32_step)) * 8,
+                        num_records_bytes=8)
+                    buffer_ops.buffer_store(Vec.from_elements([bi, I(0)], I), tr, 0)
+                if tx == 0:
+                    buffer_ops.buffer_store(I(0), pr, 0, cache_modifier=SC1)
+
 
     @flyc.jit
     def launch_markov_step(
