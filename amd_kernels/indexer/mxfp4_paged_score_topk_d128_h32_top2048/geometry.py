@@ -7,7 +7,8 @@ A sequence's keys are cut into ``nch = ceil(longest row bound / cb)`` chunks of 
 scored by as many workgroups as a short one, up to the chunk size's cap). A row keeps from chunk ``c`` its ``tb`` largest
 keys (all of them if it has fewer) and from the sequence's last chunk, where the newest keys are, all of its keys, so a row's pool is
 ``(nch - 1) * tb + cb`` entries, at most ``POOL``. A row's pool is ``keys`` and ``positions`` int32 planes of ``POOL`` entries;
-``meta`` holds per (row, chunk) the list's smallest key and the chunk's live key count.
+``meta`` holds per (row, chunk) the list's lower bound, the counts of live and listed keys and the chunk's extreme keys;
+a truncated chunk's scores are also stored whole, for the merge to read when its list falls short.
 """
 
 import flydsl.expr as fx
@@ -23,7 +24,8 @@ POOL = 20480
 QMAX = 6  # query rows a sequence may have
 MAX_ROWS = 256  # rows one call may hold
 INFO_OFFSET = MAX_ROWS * NCH_MAX * 16  # bytes: the per-row records follow the meta plane
-OVF_KEYS = 7 * 2048  # keys of chunks the merge scores again
+OVF_KEYS = 7 * 2048  # keys of chunks the merge reads whole
+FULL_STRIDE = NCH_MAX * CHUNK_MAX  # a row's plane of all scores of its truncated chunks
 POOL_TARGET = 12288  # entries a pool is cut to where the exactness bound below allows
 
 
@@ -66,6 +68,6 @@ def slot_size(tb):
     return tb + tb // 8
 
 
-def scratch_words(max_rows: int) -> tuple[int, int, int]:
-    """Words of the key plane, the position plane and the meta plane for ``max_rows`` rows."""
-    return max_rows * POOL, max_rows * POOL, max_rows * NCH_MAX * 4 + MAX_ROWS * 4
+def scratch_words(max_rows: int) -> tuple[int, int, int, int]:
+    """Words of the key plane, the position plane, the meta plane and the full-score plane for ``max_rows`` rows."""
+    return max_rows * POOL, max_rows * POOL, max_rows * NCH_MAX * 4 + MAX_ROWS * 4, max_rows * FULL_STRIDE

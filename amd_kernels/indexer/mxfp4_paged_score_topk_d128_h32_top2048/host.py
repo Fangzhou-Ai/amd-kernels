@@ -36,12 +36,8 @@ def cache_views(cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 @functools.cache
 def _scratch(device: torch.device):
-    """Key and position planes of the chunk lists and their meta, one set a device (launches on one stream)."""
-    words = scratch_words(MAX_ROWS)
-    keys = torch.zeros(words[0], dtype=torch.int32, device=device)
-    pos = torch.zeros(words[1], dtype=torch.int32, device=device)
-    meta = torch.zeros(scratch_words(MAX_ROWS)[2], dtype=torch.int32, device=device)
-    return keys, pos, meta
+    """Key, position, meta and full-score planes of the chunk lists, one set a device (launches on one stream)."""
+    return tuple(torch.zeros(words, dtype=torch.int32, device=device) for words in scratch_words(MAX_ROWS))
 
 
 def tile_rows(max_query_len: int, batch: int) -> int:
@@ -108,7 +104,7 @@ def _score_topk(
     if width > NCH_MAX * CHUNK_MAX:
         raise ValueError(f"at most {NCH_MAX * CHUNK_MAX} keys a sequence, got a block table of {width}")
     nch = grid_chunks(width)
-    keys, pos, meta = _scratch(cache.device)
+    keys, pos, meta, full = _scratch(cache.device)
     stream = torch.cuda.current_stream()
     common = (
         q_payload.data_ptr(), q_scales.data_ptr(), payload.data_ptr(), scales.data_ptr(), block_table.data_ptr(),
@@ -117,11 +113,13 @@ def _score_topk(
     geom = (block_table.stride(0), cache.stride(0), cache.shape[0] - 1, batch)
     tile = tile_rows(max_query_len, batch)
     tiles = -(-max_query_len // tile)
-    _run_compiled(_chunk_exe(tile, uniform, dbg is not None), *common, keys.data_ptr(), pos.data_ptr(), meta.data_ptr(), *geom,
-                  nch, max_query_len, dbg.data_ptr() if dbg is not None else 0, batch * nch * tiles, stream)
-    _run_compiled(_merge_exe(uniform, dbg is not None), *common, keys.data_ptr(), pos.data_ptr(), meta.data_ptr(),
-                  out_indices.data_ptr(), out_scores.data_ptr(), *geom, out_indices.stride(0), out_scores.stride(0),
-                  max_query_len, dbg.data_ptr() + 4 * 4096 * 16 if dbg is not None else 0, rows, stream)
+    _run_compiled(_chunk_exe(tile, uniform, dbg is not None), *common, keys.data_ptr(), pos.data_ptr(), meta.data_ptr(),
+                  full.data_ptr(), *geom, nch, max_query_len, dbg.data_ptr() if dbg is not None else 0,
+                  batch * nch * tiles, stream)
+    _run_compiled(_merge_exe(uniform, dbg is not None), query_start_loc.data_ptr(), keys.data_ptr(), pos.data_ptr(),
+                  meta.data_ptr(), full.data_ptr(), out_indices.data_ptr(), out_scores.data_ptr(), batch,
+                  out_indices.stride(0), out_scores.stride(0), max_query_len,
+                  dbg.data_ptr() + 4 * 4096 * 16 if dbg is not None else 0, rows, stream)
 
 
 def _mode(*args, **kwargs):

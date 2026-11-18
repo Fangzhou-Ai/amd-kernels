@@ -22,7 +22,7 @@ from flydsl.expr.typing import T
 
 from ._wave import I, I64, INT_MAX, INT_MIN, ballot, inclusive_scan, lane_prefix, now, popcount, readlane, store_lds, wave_reduce
 from ._wave import uniform as uniform_value
-from .geometry import CHUNK_MAX, INFO_OFFSET, NCH_MAX, POOL, QMAX, chunk_size_rt, list_size_rt, slot_size
+from .geometry import CHUNK_MAX, FULL_STRIDE, INFO_OFFSET, NCH_MAX, POOL, QMAX, chunk_size_rt, list_size_rt, slot_size
 from .scoring import SPEC_SIZES, Scorer, score_chunk
 
 NW = 8
@@ -46,8 +46,8 @@ def compile_chunk_lists(rows: int, uniform: bool = False, timing: bool = False):
     @flyc.kernel(name=name, known_block_size=[NW * 64, 1, 1])
     def kernel(arg_q: fx.Int64, arg_qs: fx.Int64, arg_kv: fx.Int64, arg_kvs: fx.Int64, arg_bt: fx.Int64,
                arg_w: fx.Int64, arg_ends: fx.Int64, arg_qsl: fx.Int64, arg_keys: fx.Int64, arg_idx: fx.Int64,
-               arg_meta: fx.Int64, i32_bt_stride: fx.Int32, i32_page_stride: fx.Int32, i32_last_page: fx.Int32,
-               i32_batch: fx.Int32, i32_nch_grid: fx.Int32, i32_qlen: fx.Int32, arg_dbg: fx.Int64):
+               arg_meta: fx.Int64, arg_full: fx.Int64, i32_bt_stride: fx.Int32, i32_page_stride: fx.Int32,
+               i32_last_page: fx.Int32, i32_batch: fx.Int32, i32_nch_grid: fx.Int32, i32_qlen: fx.Int32, arg_dbg: fx.Int64):
         tx = fx.thread_idx.x
         lane = tx % 64
         wave = I(rocdl.readfirstlane(T.i32, tx // 64))
@@ -94,6 +94,7 @@ def compile_chunk_lists(rows: int, uniform: bool = False, timing: bool = False):
         lidx = buffer_ops.create_buffer_resource_from_addr(arg_idx, num_records_bytes=NUM_REC)
         meta = buffer_ops.create_buffer_resource_from_addr(arg_meta, num_records_bytes=NUM_REC)
         info = buffer_ops.create_buffer_resource_from_addr(arg_meta + INFO_OFFSET, num_records_bytes=NUM_REC)
+        full = buffer_ops.create_buffer_resource_from_addr(arg_full, num_records_bytes=NUM_REC)
         sc = Scorer(wave, lane, arg_q, arg_qs, arg_kv, arg_kvs, arg_bt, arg_w, i32_bt_stride, i32_page_stride,
                     i32_last_page, b, row0, last, ends, max_end, spec)
         lds_copy4 = fx.make_copy_atom(fx.UniversalCopy128b(), I)
@@ -206,6 +207,10 @@ def compile_chunk_lists(rows: int, uniform: bool = False, timing: bool = False):
             cap = last_chunk.select(cb, slot)
             nvalid = fx.max(fx.min(end_r - cc * cb, cb), I(0))
             stamp(3)
+            if nvalid > cap:
+                for jj in range(0, nblk, 1):
+                    buffer_ops.buffer_store(lds_load4(smem.keys, region + I(jj) * 256 + lane * 4), full,
+                                            row * FULL_STRIDE + cc * cb + I(jj) * 256 + lane * 4)
             for jj, st in range(0, nblk, 1, init=[I(INT_MIN), I(INT_MAX)]):
                 v4 = lds_load4(smem.keys, region + I(jj) * 256 + lane * 4)
                 kmax, kmin = st[0], st[1]
@@ -306,10 +311,10 @@ def compile_chunk_lists(rows: int, uniform: bool = False, timing: bool = False):
     @flyc.jit
     def launch_chunk_lists(arg_q: fx.Int64, arg_qs: fx.Int64, arg_kv: fx.Int64, arg_kvs: fx.Int64, arg_bt: fx.Int64,
                            arg_w: fx.Int64, arg_ends: fx.Int64, arg_qsl: fx.Int64, arg_keys: fx.Int64,
-                           arg_idx: fx.Int64, arg_meta: fx.Int64, i32_bt_stride: fx.Int32, i32_page_stride: fx.Int32,
-                           i32_last_page: fx.Int32, i32_batch: fx.Int32, i32_nch_grid: fx.Int32, i32_qlen: fx.Int32,
+                           arg_idx: fx.Int64, arg_meta: fx.Int64, arg_full: fx.Int64, i32_bt_stride: fx.Int32,
+                           i32_page_stride: fx.Int32, i32_last_page: fx.Int32, i32_batch: fx.Int32, i32_nch_grid: fx.Int32, i32_qlen: fx.Int32,
                            arg_dbg: fx.Int64, grid_x: fx.Int32, stream: fx.Stream):
-        kernel(arg_q, arg_qs, arg_kv, arg_kvs, arg_bt, arg_w, arg_ends, arg_qsl, arg_keys, arg_idx, arg_meta,
+        kernel(arg_q, arg_qs, arg_kv, arg_kvs, arg_bt, arg_w, arg_ends, arg_qsl, arg_keys, arg_idx, arg_meta, arg_full,
                i32_bt_stride, i32_page_stride, i32_last_page, i32_batch, i32_nch_grid, i32_qlen, arg_dbg).launch(
             grid=(I64(grid_x), 1, 1), block=(NW * 64, 1, 1), stream=stream)
 
