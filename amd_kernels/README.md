@@ -43,6 +43,8 @@ One line per kernel package. Each package's README has what it does, its entry p
 
 - [`indexer/indexer_nvfp4_d128_p128_top16`](indexer/indexer_nvfp4_d128_p128_top16/README.md): the sparse-attention
   indexer: block scores over NVFP4 index pages and the top-16 blocks, decode and prefill, one or four GPUs.
+- [`indexer/mxfp4_prefill_score_d128_h32`](indexer/mxfp4_prefill_score_d128_h32/README.md): the DSA prefill indexer's MXFP4 MQA
+  logits of ragged rows (32 heads, head dim 128) over staged key pages, eight rows per workgroup sharing each key page.
 
 ## Embedding and activation
 
