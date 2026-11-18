@@ -60,3 +60,36 @@ def router_sigmoid_bias_top16_e896_h7168_reference(x: torch.Tensor, w: torch.Ten
     logits = logits_reference(x, w)
     weights, ids = top16_reference(logits, bias, routed_scaling_factor)
     return weights, ids, logits
+
+
+def moe_sort_reference(topk_ids: torch.Tensor, topk_weights: torch.Tensor):
+    """The BM=16 sort of [M, 16] top-k ids / weights in AITER's auxiliary layout, rows of one expert in ascending (token,
+    slot) order: (sorted_token_ids token | slot << 24, sorted_weights, sorted_expert_ids per 16 rows, num_valid_ids
+    [padded rows, M], m_indices, reverse_sorted [M * 16]). Padding rows: token id M, weight 0, m_indices M. Rows past
+    ``num_valid_ids[0]`` stay padding rows; ``sorted_expert_ids`` entries past ``num_valid_ids[0] / 16`` are 0."""
+    m = topk_ids.shape[0]
+    routes = m * TOPK
+    cap = (routes + min(E, routes) * 15 + 15) // 16 * 16
+    dev = topk_ids.device
+    flat = topk_ids.reshape(-1).long()
+    counts = torch.bincount(flat, minlength=E)
+    padded = (counts + 15) // 16 * 16
+    first_row = torch.cumsum(padded, 0) - padded
+    first_pair = torch.cumsum(counts, 0) - counts
+    order = torch.argsort(flat, stable=True)  # pairs by expert, then (token, slot)
+    expert_of = flat[order]
+    row = torch.empty(routes, dtype=torch.long, device=dev)
+    row[order] = first_row[expert_of] + (torch.arange(routes, device=dev) - first_pair[expert_of])
+    tok = torch.arange(routes, device=dev) // TOPK
+    slot = torch.arange(routes, device=dev) % TOPK
+    sti = torch.full((cap,), m, dtype=torch.int32, device=dev)
+    sti[row] = (tok | (slot << 24)).to(torch.int32)
+    sw = torch.zeros(cap, dtype=torch.float32, device=dev)
+    sw[row] = topk_weights.reshape(-1)
+    mi = torch.full((cap,), m, dtype=torch.int32, device=dev)
+    mi[row] = tok.to(torch.int32)
+    sei = torch.zeros(cap // 16, dtype=torch.int32, device=dev)
+    blocks = torch.repeat_interleave(torch.arange(E, device=dev), padded // 16)
+    sei[:blocks.numel()] = blocks.to(torch.int32)
+    nv = torch.tensor([int(padded.sum()), m], dtype=torch.int32, device=dev)
+    return sti, sw, sei, nv, mi, row.to(torch.int32)

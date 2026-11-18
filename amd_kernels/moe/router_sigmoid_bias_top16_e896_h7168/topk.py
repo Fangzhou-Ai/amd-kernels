@@ -306,6 +306,7 @@ def topk_finish(rank, valid, mysig, myid, lane, wr, ir, tok, i32_os, i32_scale):
     keep = lane < TOPK
     buffer_ops.buffer_store(w, wr, tok * i32_os + lane, mask=keep)
     buffer_ops.buffer_store(out_id, ir, tok * i32_os + lane, mask=keep)
+    return out_id, w
 
 
 @launcher

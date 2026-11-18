@@ -26,25 +26,31 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T, Vector as Vec
 
 from .reference import E as N, H as K
+from .aux import (FLAG_BASE, MASK_WORDS, aux_counts, aux_expert_blocks, aux_max_blocks, aux_pair_row, aux_prefill,
+                  aux_publish_cum, atomic_or)
 from .topk import (LDS_WORDS, MAXC, NQ, RANK_UNROLL, TOPK, _ballot, _popcount, topk_fast_write, topk_new, topk_pivot, topk_q_finish,
                    topk_q_load, topk_rank_start, topk_rank_step, topk_slow_out, topk_slow_select,
                    topk_finish, topk_tie_masks)
 
-TN = 64
-TILES = N // TN  # 14
 SC1 = 0x10  # agent-scope (cross-XCD) stores and loads of the slabs and counters
 CNT_STRIDE = 128  # bytes: one counter per tile, each on its own line
-EPOCH = 16  # what one call adds to each tile counter
+EPOCH = 32  # what one call adds to each tile counter
 POLL_SLEEP = 2  # s_sleep units (64 clocks) between two polls of the tile counters
 NB = K // 64  # 112 K blocks
 NWV = 4
 W_CM = 2  # nt
 MT_MAX = 12
-RING_BYTES = 160 * 1024
+RING_BYTES = 146 * 1024
 
 
-def ring_depth(mt: int) -> int:
-    return 4 if (4 + mt) * 2048 * 4 <= RING_BYTES else 3
+def ring_depth(frags: int) -> int:
+    """Ring slots that fit the LDS next to the top-k arrays (one slot = ``frags`` fragments of 2 KB)."""
+    return 4 if frags * 2048 * 4 <= RING_BYTES else 3
+
+
+def tiles(nf: int) -> int:
+    """Column tiles of ``nf`` 16-column fragments."""
+    return N // 16 // nf
 
 
 def partial_bytes(m: int, ks: int) -> int:
@@ -78,19 +84,32 @@ def _atomic_add(addr, v):
 
 
 @launcher
-def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1):
-    """``fused`` 0: the GEMM launch alone (partials out); 1: the whole router (the top-16 follows in the same launch)."""
-    MT, KS, SHUF, FUSED = mt, ks, shuf, fused
+def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: int = 4, nrw: int = 1, aux: int = 0):
+    """``fused`` 0: the GEMM launch alone (partials out); 1: the whole router (the top-16 follows in the same launch).
+    The workgroup tile is ``wn nrw`` 16-column weight fragments; its ``wn`` x ``4 / wn`` waves split the columns
+    (``nrw`` fragments each) and the row fragments (``MTP / (4 / wn)`` each). ``aux`` 1: the launch also writes the BM=16
+    MoE sort of the top-16 and zeroes the moe buffer (``aux.py``)."""
+    MT, KS, SHUF, FUSED, WN, NRW, AUX = mt, ks, shuf, fused, wn, nrw, aux
+    assert not AUX or FUSED
+    WM = NWV // WN
+    NF = WN * NRW  # weight fragments of the tile
+    TN = 16 * NF
+    TILES = tiles(NF)
+    MTP = (MT + WM - 1) // WM * WM  # row fragments, a multiple of the row waves
+    MW = MTP // WM  # row fragments of a wave
+    assert NWV % WN == 0 and N // 16 % NF == 0 and (NF * 2) % NWV == 0
     assert 1 <= MT <= MT_MAX and NB % KS == 0 and KS <= EPOCH and (not FUSED or TILES * KS * NWV >= 16 * MT)  # four tokens a workgroup at most
     NBK = NB // KS  # K blocks per workgroup
     MR = 16 * MT
-    R = min(ring_depth(MT), NBK)
-    WF = NWV  # weight positions per slot
-    SLOT = (WF + MT) * 2048
+    SLOT_FRAGS = NF + MTP
+    R = min(ring_depth(SLOT_FRAGS), NBK)
+    WF = NF  # weight positions per slot
+    SLOT = SLOT_FRAGS * 2048
     LDS = R * SLOT
-    XD = MT * 2  # activation DMAs per block
+    XD = MTP * 2  # activation DMAs per block
     XPW = (XD + NWV - 1) // NWV
-    PER = 2 + XPW  # DMAs per wave per block
+    WPW = NF * 2 // NWV  # weight DMAs per wave per block
+    PER = WPW + XPW  # DMAs per wave per block
     assert LDS <= RING_BYTES and (R - 1) * PER <= 63, (LDS, R, PER)
 
     @fx.struct
@@ -102,11 +121,13 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1):
         tex: fx.Array[fx.Int32, NWV * LDS_WORDS["tex"], 16]
         tmask: fx.Array[fx.Int32, NWV * LDS_WORDS["tmask"], 16]
 
-    name = f"router_{'fused' if FUSED else 'partials'}_e896_h7168_mt{MT}_ks{KS}" + ("_shuf" if SHUF else "_row")
+    name = f"router_{'fused' if FUSED else 'partials'}_e896_h7168_mt{MT}_ks{KS}_w{WN}n{NRW}" + ("_aux" if AUX else "") + ("_shuf" if SHUF else "_row")
 
     @flyc.kernel(name=name, known_block_size=[64 * NWV, 1, 1])
     def kernel(arg_x: fx.Int64, arg_w: fx.Int64, arg_p: fx.Int64, arg_c: fx.Int64, arg_bias: fx.Int64,
-               arg_ow: fx.Int64, arg_oid: fx.Int64, i32_m: fx.Int32, i32_os: fx.Int32, i32_scale: fx.Int32):
+               arg_ow: fx.Int64, arg_oid: fx.Int64, arg_aux: fx.Int64, arg_sti: fx.Int64, arg_sw: fx.Int64,
+               arg_sei: fx.Int64, arg_nv: fx.Int64, arg_mi: fx.Int64, arg_rs: fx.Int64, arg_mb: fx.Int64,
+               i32_m: fx.Int32, i32_os: fx.Int32, i32_scale: fx.Int32, i32_cap: fx.Int32, i32_zvecs: fx.Int32):
         tx, bid = fx.thread_idx.x, fx.block_idx.x
         smem = fx.SharedAllocator().allocate(Shared).peek()
         lane = tx % 64
@@ -114,6 +135,8 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1):
         kz = bid % KS
         tile = bid // KS
         n0 = tile * TN
+        wn = wave % WN  # the wave's column fragments wn NRW ..
+        wm = wave // WN  # and row fragments wm MW ..
         b0 = kz * NBK
         g = lane // 16
         l16 = lane % 16
@@ -125,14 +148,17 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1):
 
         # DMA jj of a fragment: rows 8 jj + r8, 16-byte piece (lane % 8) ^ ((r8 >> 1) | (jj << 2)) of the line
         w_src, w_dst = [], []
-        for jj in range_constexpr(2):
+        for i in range_constexpr(WPW):
+            d = wave + i * NWV  # weight DMA 2 f + jj: rows 8 jj + r8 of fragment f
+            f = d // 2
+            jj = d % 2
             pc = (lane % 8) ^ ((r8 // 2) + jj * 4)
             if const_expr(SHUF):
-                off = (tile * NWV + wave) * (K * 32) + (jj * 8 + r8) * 128 + pc * 16
+                off = (tile * NF + f) * (K * 32) + (jj * 8 + r8) * 128 + pc * 16
             else:
-                off = (n0 + wave * 16 + jj * 8 + r8) * (K * 2) + pc * 16
+                off = (n0 + f * 16 + jj * 8 + r8) * (K * 2) + pc * 16
             w_src.append(off)
-            w_dst.append((wave * 2 + jj) * 1024)
+            w_dst.append(d * 1024)
         x_src, x_dst = [], []
         for i in range_constexpr(XPW):
             d = wave + i * NWV
@@ -155,7 +181,7 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1):
 
         def dma(b):
             bg = b0 + b
-            for q in range_constexpr(2):
+            for q in range_constexpr(WPW):
                 issue(wr, w_dst[q], w_src[q], b, bg * (2048 if SHUF else 128), aux_w)
             for q in range_constexpr(XPW):
                 issue(xr, x_dst[q], x_src[q], b, bg * 128, aux_x)
@@ -168,16 +194,18 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1):
             p = _lds_ptr(lds_base + (b % R) * SLOT + pos * 2048 + rd_off[kk])
             return Vec(llvm.load(T.vec(4, T.i32), p, alignment=16)).bitcast(fx.BFloat16)
 
-        acc = [Vec.filled(4, 0.0, fx.Float32) for _ in range_constexpr(MT)]
+        acc = [[Vec.filled(4, 0.0, fx.Float32) for _ in range_constexpr(MW)] for _ in range_constexpr(NRW)]
 
         def read_ops(b, kk):
-            return rd(b, wave, kk), [rd(b, WF + m, kk) for m in range_constexpr(MT)]
+            return ([rd(b, wn * NRW + i, kk) for i in range_constexpr(NRW)],
+                    [rd(b, WF + wm * MW + m, kk) for m in range_constexpr(MW)])
 
         def mfmas(ops):
             wv, xv = ops
-            for m in range_constexpr(MT):
-                acc[m] = Vec(fx.rocdl.mfma_f32_16x16x32_bf16(
-                    Vec.make_type(4, fx.Float32), [wv, xv[m], acc[m], 0, 0, 0]))
+            for i in range_constexpr(NRW):
+                for m in range_constexpr(MW):
+                    acc[i][m] = Vec(fx.rocdl.mfma_f32_16x16x32_bf16(
+                        Vec.make_type(4, fx.Float32), [wv[i], xv[m], acc[i][m], 0, 0, 0]))
 
         def barrier():
             llvm.inline_asm(None, [], "s_barrier", "~{memory}", has_side_effects=True)
@@ -207,11 +235,20 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1):
             mfmas(ops_b)
 
         pr = buffer_ops.create_buffer_resource_from_addr(arg_p, num_records_bytes=KS * i32_m * (N * 4))
-        for m in range_constexpr(MT):
-            buffer_ops.buffer_store(acc[m].bitcast(fx.Int32), pr,
-                                    ((kz * i32_m + m * 16 + l16) * N + n0 + wave * 16 + g * 4) * 4,
-                                    offset_is_bytes=True, mask=(m * 16 + l16) < i32_m,
-                                    cache_modifier=SC1 if FUSED else 0)
+        for i in range_constexpr(NRW):
+            for m in range_constexpr(MW):
+                row = (wm * MW + m) * 16 + l16
+                buffer_ops.buffer_store(acc[i][m].bitcast(fx.Int32), pr,
+                                        ((kz * i32_m + row) * N + n0 + (wn * NRW + i) * 16 + g * 4) * 4,
+                                        offset_is_bytes=True, mask=row < i32_m, cache_modifier=SC1 if FUSED else 0)
+        if const_expr(AUX):
+            cap_bytes = fx.Int64(i32_cap) * 4
+            aux_prefill(bid * (64 * NWV) + tx, TILES * KS * 64 * NWV, i32_m, i32_cap, i32_zvecs,
+                        buffer_ops.create_buffer_resource_from_addr(arg_aux, num_records_bytes=FLAG_BASE * 4),
+                        buffer_ops.create_buffer_resource_from_addr(arg_sti, num_records_bytes=cap_bytes),
+                        buffer_ops.create_buffer_resource_from_addr(arg_sw, num_records_bytes=cap_bytes),
+                        buffer_ops.create_buffer_resource_from_addr(arg_mi, num_records_bytes=cap_bytes),
+                        buffer_ops.create_buffer_resource_from_addr(arg_mb, num_records_bytes=fx.Int64(i32_zvecs) * 16))
         if const_expr(FUSED):
             # every slab store is acknowledged before the arrival; workgroup ``t`` (t < M) then waits for all tiles and
             # takes token t in its wave 0 (a token's 50 KB of slabs go through one CU's load path)
@@ -232,11 +269,12 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1):
                 owr = buffer_ops.create_buffer_resource_from_addr(arg_ow, num_records_bytes=out_bytes)
                 oir = buffer_ops.create_buffer_resource_from_addr(arg_oid, num_records_bytes=out_bytes)
                 st = topk_new(lane)
-                # the experts 256 q + 4 lane + j live in tiles 4 q .. 4 q + 3: take each group as its tiles finish
+                # the experts 256 q + 4 lane + j live in the tiles t0 .. t1: take each group as its tiles finish
                 for q in range_constexpr(NQ):
-                    in_group = (lane >= 4 * q) & (lane < min(4 * q + 4, TILES))
+                    t0, t1 = 256 * q // TN, (min(256 * q + 255, N - 1)) // TN
+                    in_group = (lane >= t0) & (lane <= t1)
                     ready = fx.Int32(0)
-                    while ready < min(4, TILES - 4 * q):
+                    while ready < t1 - t0 + 1:
                         c = fx.Int32(buffer_ops.buffer_load(cr, lane * (CNT_STRIDE // 4), vec_width=1,
                                                             dtype=fx.Int32, mask=lane < TILES,
                                                             cache_modifier=SC1 | 1))
@@ -245,6 +283,8 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1):
                     parts, bv = topk_q_load(pr, br, lane, tok, i32_m, KS, SC1, q)
                     topk_q_finish(st, lane, q, parts, bv)
                 topk_pivot(st, smem, wave, lane)
+                out_id = fx.Int32(0)
+                out_w = fx.Float32(0.0)
                 if st.nc <= MAXC:
                     topk_fast_write(st, smem, wave, lane)
                     topk_rank_start(st, smem, wave, lane)
@@ -253,19 +293,65 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1):
                     while e < st.nc:
                         rank = topk_rank_step(rank, e, st, smem, wave)
                         e = e + RANK_UNROLL
-                    topk_finish(rank, lane < st.nc, st.mysig, st.myid, lane, owr, oir, tok, i32_os, i32_scale)
+                    out_id, out_w = topk_finish(rank, lane < st.nc, st.mysig, st.myid, lane, owr, oir, tok, i32_os,
+                                                i32_scale)
                 else:
                     ss = topk_slow_select(st)
                     if ss.total_ties != ss.need:
                         topk_tie_masks(ss, smem, wave, lane)
                     rank, mysig, myid = topk_slow_out(ss, smem, wave, lane)
-                    topk_finish(rank, lane < TOPK, mysig, myid, lane, owr, oir, tok, i32_os, i32_scale)
+                    out_id, out_w = topk_finish(rank, lane < TOPK, mysig, myid, lane, owr, oir, tok, i32_os, i32_scale)
+                if const_expr(AUX):
+                    # publish the token (its bit in the mask of each routed expert, then its flag), wait for every token
+                    # and write the token's 16 rows of the sort
+                    if lane < TOPK:
+                        atomic_or(arg_aux + fx.Int64((out_id * MASK_WORDS + (tok >> 5)) * 4), fx.Int32(1) << (tok & 31))
+                    fx.rocdl.s_waitcnt(vmcnt=0)
+                    tag = (ebase >> 5) + 1
+                    fres = buffer_ops.create_buffer_resource_from_addr(arg_aux + FLAG_BASE * 4, num_records_bytes=256 * 4)
+                    buffer_ops.buffer_store(tag, fres, tok, mask=lane == 0, cache_modifier=SC1)
+                    fx.rocdl.s_waitcnt(vmcnt=0)
+                    done = fx.Int32(0)
+                    while done < 192:
+                        done = fx.Int32(0)
+                        for r in range_constexpr(3):
+                            f = fx.Int32(buffer_ops.buffer_load(fres, lane + 64 * r, vec_width=1, dtype=fx.Int32,
+                                                                mask=(lane + 64 * r) < i32_m, cache_modifier=SC1 | 1))
+                            done = done + _popcount(_ballot((f == tag) | ((lane + 64 * r) >= i32_m)))
+                        fx.rocdl.s_sleep(POLL_SLEEP)
+                    mres = buffer_ops.create_buffer_resource_from_addr(arg_aux, num_records_bytes=FLAG_BASE * 4)
+                    ac = aux_counts(mres, lane)
+                    aux_publish_cum(ac, lds_base, wave, lane)
+                    row = aux_pair_row(lds_base, wave, mres, out_id, tok)
+                    cap_bytes = fx.Int64(i32_cap) * 4
+                    sti_r = buffer_ops.create_buffer_resource_from_addr(arg_sti, num_records_bytes=cap_bytes)
+                    sw_r = buffer_ops.create_buffer_resource_from_addr(arg_sw, num_records_bytes=cap_bytes)
+                    mi_r = buffer_ops.create_buffer_resource_from_addr(arg_mi, num_records_bytes=cap_bytes)
+                    rs_r = buffer_ops.create_buffer_resource_from_addr(arg_rs, num_records_bytes=fx.Int64(i32_m) * 64)
+                    keep = lane < TOPK
+                    buffer_ops.buffer_store(tok | (lane << 24), sti_r, row, mask=keep, cache_modifier=SC1)
+                    buffer_ops.buffer_store(out_w, sw_r, row, mask=keep, cache_modifier=SC1)
+                    buffer_ops.buffer_store(tok, mi_r, row, mask=keep, cache_modifier=SC1)
+                    buffer_ops.buffer_store(row, rs_r, tok * TOPK + lane, mask=keep, cache_modifier=SC1)
+                    if tok == 0:
+                        sei_r = buffer_ops.create_buffer_resource_from_addr(arg_sei, num_records_bytes=cap_bytes)
+                        nv_r = buffer_ops.create_buffer_resource_from_addr(arg_nv, num_records_bytes=8)
+                        buffer_ops.buffer_store(ac.total, nv_r, 0, mask=lane == 0, cache_modifier=SC1)
+                        buffer_ops.buffer_store(i32_m, nv_r, 1, mask=lane == 0, cache_modifier=SC1)
+                        maxb = aux_max_blocks(ac)
+                        blk = fx.Int32(0)
+                        while blk < maxb:
+                            aux_expert_blocks(ac, blk, lane, sei_r)
+                            blk = blk + 1
 
     @flyc.jit
     def launch(arg_x: fx.Int64, arg_w: fx.Int64, arg_p: fx.Int64, arg_c: fx.Int64, arg_bias: fx.Int64,
-               arg_ow: fx.Int64, arg_oid: fx.Int64, i32_m: fx.Int32, i32_os: fx.Int32, i32_scale: fx.Int32,
+               arg_ow: fx.Int64, arg_oid: fx.Int64, arg_aux: fx.Int64, arg_sti: fx.Int64, arg_sw: fx.Int64,
+               arg_sei: fx.Int64, arg_nv: fx.Int64, arg_mi: fx.Int64, arg_rs: fx.Int64, arg_mb: fx.Int64,
+               i32_m: fx.Int32, i32_os: fx.Int32, i32_scale: fx.Int32, i32_cap: fx.Int32, i32_zvecs: fx.Int32,
                stream: fx.Stream):
-        kernel(arg_x, arg_w, arg_p, arg_c, arg_bias, arg_ow, arg_oid, i32_m, i32_os, i32_scale).launch(
+        kernel(arg_x, arg_w, arg_p, arg_c, arg_bias, arg_ow, arg_oid, arg_aux, arg_sti, arg_sw, arg_sei, arg_nv,
+               arg_mi, arg_rs, arg_mb, i32_m, i32_os, i32_scale, i32_cap, i32_zvecs).launch(
             grid=(TILES * KS, 1, 1), block=(64 * NWV, 1, 1), stream=stream)
 
     return launch

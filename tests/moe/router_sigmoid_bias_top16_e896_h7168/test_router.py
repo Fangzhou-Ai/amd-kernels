@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """router_sigmoid_bias_top16_e896_h7168 against its reference and AITER: the GEMM half on the fp64 logits, the top-16
 half bit for bit against aiter.biased_grouped_topk on the logits it consumes (ties and slot order included), scaling,
-both weight layouts, every K split."""
+both weight layouts, every tile configuration and K split."""
 import pytest
 import torch
 
@@ -13,7 +13,7 @@ from amd_kernels.moe.router_sigmoid_bias_top16_e896_h7168.reference import (E, H
                                                                             top16_reference)
 
 MS = [1, 2, 5, 12, 15, 16, 17, 24, 33, 40, 48, 65, 80, 96, 112, 128, 129, 160, 176, 192, 193, 300]
-KS = [4, 7, 8, 14, 16]
+CONFIGS = [(ks, 4, 1) for ks in (4, 7, 8, 14, 16)] + [(ks, 4, 2) for ks in (14, 28)] + [(ks, 1, 8) for ks in (14, 28)] + [(14, 2, 4)]
 
 
 def aiter_top16(logits, bias, scale=1.0):
@@ -84,11 +84,11 @@ def test_scale(params, m):
     assert torch.equal(ids, aids) and same_bits(weights, aw)
 
 
-@pytest.mark.parametrize("ks", KS)
+@pytest.mark.parametrize("config", CONFIGS)
 @pytest.mark.parametrize("m", [3, 40, 192])
-def test_every_k_split(params, monkeypatch, ks, m):
+def test_every_tile_config(params, monkeypatch, config, m):
     w, ws, bias = params
-    monkeypatch.setitem(host.KS_BY_MT, host.m_tile_fragments(m), ks)
+    monkeypatch.setitem(host.CONFIG_BY_MT, host.m_tile_fragments(m), config)
     host._WORK.clear()
     x = torch.randn(m, H, device="cuda").to(torch.bfloat16)
     lg = router_logits(x, ws, shuffled=True)

@@ -8,13 +8,14 @@ import torch
 
 from amd_kernels.warm_up import entry
 
-from .kernel import CNT_STRIDE, MT_MAX, TILES, compile_router_e896_h7168, partial_bytes
+from .aux import WORKSPACE_WORDS, aux_capacity
+from .kernel import CNT_STRIDE, MT_MAX, compile_router_e896_h7168, partial_bytes
 from .reference import E, H, TOPK
 from .topk import compile_router_sigmoid_bias_top16_e896
 
 MAX_M = 16 * MT_MAX
-# row tile (16 rows) -> K splits (graph replay sweep over 4-28 at M 12-192: 14 is within noise of the best everywhere)
-KS_BY_MT = {mt: 14 for mt in range(1, MT_MAX + 1)}
+# row tile (16 rows) -> (K splits, waves along the columns, fragments per column wave)
+CONFIG_BY_MT = {mt: (14, 4, 1) for mt in range(1, MT_MAX + 1)}
 
 
 def supports(w: torch.Tensor, bias: torch.Tensor | None = None) -> bool:
@@ -48,8 +49,8 @@ def m_tile_fragments(m: int) -> int:
 
 
 @functools.cache
-def _router_kernel(mt: int, ks: int, shuf: bool, fused: bool):
-    return compile_router_e896_h7168(mt, ks, int(shuf), int(fused))
+def _router_kernel(mt: int, ks: int, shuf: bool, fused: bool, wn: int, nrw: int, aux: bool):
+    return compile_router_e896_h7168(mt, ks, int(shuf), int(fused), wn, nrw, int(aux))
 
 
 @functools.cache
@@ -71,13 +72,14 @@ _WORK: dict = {}
 
 
 def _workspace(device: torch.device, stream: int):
-    """The partial slabs and the tile counters (zero, never reset: each call adds one epoch to each) of one (device,
-    stream)."""
+    """The partial slabs, the tile counters (zero, never reset: each call adds one epoch to each) and the sort's masks
+    and flags (flags carry the call's epoch) of one (device, stream)."""
     key = (device.index, stream)
     ws = _WORK.get(key)
     if ws is None:
-        ws = (torch.empty(max(partial_bytes(MAX_M, ks) for ks in KS_BY_MT.values()), dtype=torch.uint8, device=device),
-              torch.zeros(TILES * CNT_STRIDE // 4 + 2048, dtype=torch.int32, device=device))
+        ws = (torch.empty(max(partial_bytes(MAX_M, ks) for ks, _, _ in CONFIG_BY_MT.values()), dtype=torch.uint8, device=device),
+              torch.zeros(16 * CNT_STRIDE // 4, dtype=torch.int32, device=device),
+              torch.zeros(WORKSPACE_WORDS, dtype=torch.int32, device=device))
         _WORK[key] = ws
     return ws
 
@@ -86,24 +88,51 @@ def _bits(v: float) -> int:
     return struct.unpack("<i", struct.pack("<f", v))[0]
 
 
+def make_aux(m: int, device: torch.device, zero_moe_buf: bool = True) -> dict:
+    """Output tensors of the BM=16 MoE sort of ``m`` tokens, in AITER's ``register_presorted_moe`` layout (capacity as
+    ``aiter.presorted_moe.aux_sort_capacity``); ``moe_buf`` [m, 3584] bf16 is zeroed by the launch when ``zero_moe_buf``."""
+    cap = aux_capacity(m)
+    i32 = torch.int32
+    return {"sorted_token_ids": torch.empty(cap, dtype=i32, device=device),
+            "sorted_weights": torch.empty(cap, dtype=torch.float32, device=device),
+            "sorted_expert_ids": torch.empty(cap // 16, dtype=i32, device=device),
+            "num_valid_ids": torch.empty(2, dtype=i32, device=device),
+            "m_indices": torch.empty(cap, dtype=i32, device=device),
+            "reverse_sorted": torch.empty(m * TOPK, dtype=i32, device=device),
+            "moe_buf": torch.empty(m, 3584, dtype=torch.bfloat16, device=device) if zero_moe_buf else None}
+
+
 def _launch(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None, scale: float, out: tuple | None,
-            shuffled: bool):
-    """One launch: the whole router into ``out``, or (``out`` None) the GEMM partials alone; -> (slabs, K splits)."""
+            shuffled: bool, aux: dict | None = None):
+    """One launch: the whole router into ``out`` (and the sort into ``aux``), or (``out`` None) the GEMM partials alone;
+    -> (slabs, K splits)."""
     m = x.shape[0]
     assert x.ndim == 2 and x.shape[1] == H and x.dtype == torch.bfloat16 and x.is_contiguous()
     assert supports(w) and x.device == w.device and 1 <= m <= MAX_M
     stream = torch.cuda.current_stream()
     mt = m_tile_fragments(m)
-    ks = KS_BY_MT[mt]
-    part, counters = _workspace(x.device, stream.cuda_stream)
+    ks, wn, nrw = CONFIG_BY_MT[mt]
+    part, counters, aux_ws = _workspace(x.device, stream.cuda_stream)
+    ptrs = [0] * 8
+    cap = zvecs = 0
     if out is None:
         bias_ptr = ow = oid = row_stride = 0
     else:
         weights, ids = out
         assert weights.stride(0) == ids.stride(0) and weights.stride(1) == ids.stride(1) == 1
         bias_ptr, ow, oid, row_stride = bias.data_ptr(), weights.data_ptr(), ids.data_ptr(), weights.stride(0)
-    _run(_router_kernel(mt, ks, bool(shuffled), out is not None), x.data_ptr(), w.data_ptr(), part.data_ptr(),
-         counters.data_ptr(), bias_ptr, ow, oid, m, row_stride, _bits(scale), stream)
+        if aux is not None:
+            cap = aux_capacity(m)
+            for t, n in ((aux["sorted_token_ids"], cap), (aux["sorted_weights"], cap), (aux["sorted_expert_ids"], cap // 16),
+                         (aux["num_valid_ids"], 2), (aux["m_indices"], cap), (aux["reverse_sorted"], m * TOPK)):
+                assert t.is_contiguous() and t.numel() >= n and t.device == x.device
+            mb = aux.get("moe_buf")
+            zvecs = 0 if mb is None else m * 3584 * 2 // 16
+            ptrs = [aux_ws.data_ptr(), aux["sorted_token_ids"].data_ptr(), aux["sorted_weights"].data_ptr(),
+                    aux["sorted_expert_ids"].data_ptr(), aux["num_valid_ids"].data_ptr(), aux["m_indices"].data_ptr(),
+                    aux["reverse_sorted"].data_ptr(), 0 if mb is None else mb.data_ptr()]
+    _run(_router_kernel(mt, ks, bool(shuffled), out is not None, wn, nrw, aux is not None), x.data_ptr(), w.data_ptr(),
+         part.data_ptr(), counters.data_ptr(), bias_ptr, ow, oid, *ptrs, m, row_stride, _bits(scale), cap, zvecs, stream)
     return part, ks
 
 
@@ -144,7 +173,7 @@ def top16(logits: torch.Tensor, bias: torch.Tensor, routed_scaling_factor: float
 
 
 def _router(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor, routed_scaling_factor: float = 1.0,
-            out: tuple | None = None, *, shuffled: bool = False):
+            out: tuple | None = None, *, shuffled: bool = False, aux: dict | None = None):
     """(topk_weights fp32 [M, 16], topk_ids int32 [M, 16]) of the router: x [M, 7168] @ W^T, then AITER's biased top-16
     (sigmoid, + bias, renormalised, times ``routed_scaling_factor``; slots in descending score order). W = w (row-major
     [896, 7168]) or shuffle_weight's layout. Any M (above 192 rows: launches of 192 rows). One launch, deterministic, no
@@ -155,23 +184,26 @@ def _router(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor, routed_scaling
         out = (torch.empty(m, TOPK, dtype=torch.float32, device=x.device),
                torch.empty(m, TOPK, dtype=torch.int32, device=x.device))
     if m > MAX_M:
+        assert aux is None, "the sort covers one launch of at most 192 rows"
         for i in range(0, m, MAX_M):
             _router(x[i:i + MAX_M], w, bias, routed_scaling_factor, (out[0][i:i + MAX_M], out[1][i:i + MAX_M]),
                     shuffled=shuffled)
         return out
     if m:
-        _launch(x, w, bias, routed_scaling_factor, out, shuffled)
+        _launch(x, w, bias, routed_scaling_factor, out, shuffled, aux)
     return out
 
 
-def _mode(x, w, bias, routed_scaling_factor=1.0, out=None, *, shuffled=False):
-    """What a call fixes about its kernels besides M (``amd_kernels.warm_up``): the weight layout."""
-    return (bool(shuffled),)
+def _mode(x, w, bias, routed_scaling_factor=1.0, out=None, *, shuffled=False, aux=None):
+    """What a call fixes about its kernels besides M (``amd_kernels.warm_up``): the weight layout, the sort."""
+    return (bool(shuffled), aux is not None)
 
 
-def _inputs(mode, n, x, w, bias, routed_scaling_factor=1.0, out=None, *, shuffled=False):
-    return (torch.zeros(n, H, dtype=torch.bfloat16, device=x.device), w, bias, routed_scaling_factor), {
-        "shuffled": shuffled}
+def _inputs(mode, n, x, w, bias, routed_scaling_factor=1.0, out=None, *, shuffled=False, aux=None):
+    kw = {"shuffled": shuffled}
+    if mode[1]:
+        kw["aux"] = make_aux(n, x.device)
+    return (torch.zeros(n, H, dtype=torch.bfloat16, device=x.device), w, bias, routed_scaling_factor), kw
 
 
 router_sigmoid_bias_top16_e896_h7168 = entry(
