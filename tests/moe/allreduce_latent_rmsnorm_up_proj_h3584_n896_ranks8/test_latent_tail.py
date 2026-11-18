@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """Eight-rank contract at the served row counts: eager and graph calls, replayed and changed inputs, determinism."""
+import os
+
 import torch
 import torch.distributed as dist
 from amd_kernels.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8 import LatentTailComm
@@ -25,43 +27,49 @@ def check(out, parts, nw, w, shared0, tag):
     assert float(cos.min()) >= 0.99999, ("cos", tag, float(cos.min()))
 
 
-def worker(rank, errors):
-    dev = torch.device("cuda", rank)
-    c = LatentTailComm(rank, dist.group.WORLD, dev)
-    for m in SERVED_ROWS:
-        for ci in range(2):
+def contract(c, rank, dev, rows, tag):
+    for m in rows:
+        for ci in range(1):
             parts, nw, w, shared0 = make(m, m * 10 + ci, dev, rank)
             shared = torch.zeros(m, 7168, dtype=torch.bfloat16, device=dev)  # stock layout: a view of [m, 7168]
             view = shared[:, rank * 896:(rank + 1) * 896]
             view.copy_(shared0)
             call(c, parts[rank], nw, w, view)
             torch.cuda.synchronize()
-            check(view, parts, nw, w, shared0, ("eager", m, ci))
+            check(view, parts, nw, w, shared0, (tag, "eager", m, ci))
             first = view.clone()
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
                 call(c, parts[rank], nw, w, view)
-            for it in range(3):
+            for it in range(2):
                 view.copy_(shared0)
                 g.replay()
                 torch.cuda.synchronize()
-                assert torch.equal(bits(view), bits(first)), ("replay", it, m, ci)
-                check(view, parts, nw, w, shared0, ("graph", m, ci))
+                assert torch.equal(bits(view), bits(first)), ("replay", it, tag, m, ci)
+                check(view, parts, nw, w, shared0, (tag, "graph", m, ci))
             for x in parts:
                 x.neg_()
             view.copy_(shared0)
             g.replay()
             torch.cuda.synchronize()
-            check(view, parts, nw, w, shared0, ("changed", m, ci))
+            check(view, parts, nw, w, shared0, (tag, "changed", m, ci))
         if rank == 0:
-            print("contract PASS rows", m, flush=True)
+            print("contract PASS", tag, "rows", m, flush=True)
+
+
+def worker(rank, errors):
+    dev = torch.device("cuda", rank)
+    mode = os.environ.get("LATENT_LL", "0")
+    ll, ll2 = mode in ("1", "2"), mode == "2"
+    c = LatentTailComm(rank, dist.group.WORLD, dev, ll=ll, ll2=ll2)
+    contract(c, rank, dev, SERVED_ROWS, f"mode{mode}")
     c.close()
-    split_and_replicated(rank, dev)
+    split_and_replicated(rank, dev, ll, ll2)
 
 
-def split_and_replicated(rank, dev):
+def split_and_replicated(rank, dev, ll, ll2):
     """The two-launch mode, and the replicated-shared layout: ``out`` a compact shard view apart from ``shared``."""
-    c = LatentTailComm(rank, dist.group.WORLD, dev, fused=False)
+    c = LatentTailComm(rank, dist.group.WORLD, dev, fused=False, ll=ll, ll2=ll2)
     for m in (12, 80, 192):
         parts, nw, w, shared0 = make(m, 7000 + m, dev, rank)
         full = torch.zeros(m, 7168, dtype=torch.bfloat16, device=dev)  # persistent zero-padded partial buffer

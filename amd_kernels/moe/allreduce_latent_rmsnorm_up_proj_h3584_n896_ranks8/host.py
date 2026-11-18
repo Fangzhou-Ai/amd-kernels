@@ -19,8 +19,8 @@ MAX_ROWS = T.MAX_ROWS
 
 
 @functools.cache
-def _kernel(mode, mpg, ts=False):
-    return T.compile_tail(mode, 1 if mode == "ar" else mpg, ts)
+def _kernel(mode, mpg, ts=False, ll=False, ll2=False):
+    return T.compile_tail(mode, 1 if mode == "ar" else mpg, ts, ll, ll2)
 
 
 def _release(ptr, peer):
@@ -59,7 +59,7 @@ class LatentTailComm:
     All ranks make the same calls in the same order; close only after the work completes.
     """
 
-    def __init__(self, rank, group, device, fused=True):
+    def __init__(self, rank, group, device, fused=True, ll=False, ll2=False):
         if dist.get_world_size(group) != WORLD:
             raise ValueError("eight ranks required")
         device = torch.device(device)
@@ -67,7 +67,7 @@ class LatentTailComm:
             device = torch.device("cuda", torch.cuda.current_device())
         if torch.cuda.current_device() != device.index or dist.get_rank(group) != rank:
             raise ValueError("select this rank device before creating the communicator")
-        self.rank, self.group, self.device, self.fused = rank, group, device, fused
+        self.rank, self.group, self.device, self.fused, self.ll, self.ll2 = rank, group, device, fused, ll, ll2
         ptr, handle = ops.allocate_shared_buffer_and_handle(T.BUF_BYTES)
         peers = exchange(handle, rank, group)
         self.bufs = [ptr if r == rank else ops.open_mem_handle(peers[r]) for r in range(WORLD)]
@@ -109,7 +109,7 @@ class LatentTailComm:
                 x.data_ptr(), x.stride(0), norm_weight.data_ptr(), w.data_ptr(), shared.data_ptr(), shared.stride(0),
                 out.data_ptr(), out.stride(0), f32_bits(eps), 0, self.ts_ptr, stream)
         for mode in modes or (("fused",) if self.fused else ("ar", "up")):
-            run_compiled(_kernel(mode, mpg, bool(self.ts_ptr)), *args)
+            run_compiled(_kernel(mode, mpg, bool(self.ts_ptr), self.ll, self.ll2), *args)
         return out
 
     def close(self):

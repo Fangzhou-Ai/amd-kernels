@@ -6,6 +6,7 @@ all-reduce of the latent, the Triton fused RMSNorm + up-projection, AITER all-re
 fused entry replaces the first two and keeps the same final all-reduce. Prints a roofline table."""
 import argparse
 import json
+import os
 import statistics
 
 import torch
@@ -44,8 +45,9 @@ def worker(rank, errors, rows, rounds):
 
     dev = torch.device("cuda", rank)
     ca = CustomAllreduce(group=dist.group.WORLD, device=dev, max_size=64 * 1024 * 1024)
-    comm = LatentTailComm(rank, dist.group.WORLD, dev)
-    comm_split = LatentTailComm(rank, dist.group.WORLD, dev, fused=False)
+    ll = os.environ.get("LATENT_LL", "0") == "1"
+    comm = LatentTailComm(rank, dist.group.WORLD, dev, ll=ll)
+    comm_split = LatentTailComm(rank, dist.group.WORLD, dev, fused=False, ll=ll)
     triton_fn = stock_triton()
     ws = [(torch.randn(N, K, device=dev) * 0.03).bfloat16() for _ in range(NI)]
     nw = (1 + 0.1 * torch.randn(K, device=dev)).bfloat16()

@@ -57,14 +57,20 @@ UP_WGS = NTILES * GROUPS
 NWAVES = 8
 KW = K // NWAVES  # K columns per wave
 KSTEPS = KW // 32  # 14
+XROW = KW * 2 + 16  # LDS bytes of a staged row slice: 57 packs of 16 B, so 16 rows hit 16 different bank groups
 LINE = 128
 F1 = 0
 C2 = MAX_RB * LINE
 INBOX = C2 + LINE
-BUF_BYTES = INBOX + WORLD * MAX_ROWS * SL * 2
+LL_ROW = SL // 4  # 16 B packs of an LL slice row: two payload dwords, each followed by the epoch
+INBOX_BYTES = WORLD * MAX_ROWS * LL_ROW * 16
+BUF_BYTES = INBOX + INBOX_BYTES
 LAT_BYTES = MAX_ROWS * K * 2
 SSQ_BYTES = MAX_ROWS * WORLD * 4
-LAT_ALLOC = LAT_BYTES + SSQ_BYTES  # the ``lat`` buffer: xn rows, then ssq[row][owner] fp32
+LATLL_ROW = K * 4  # bytes of an LL latent row: every payload dword in an 8 B pack with the epoch
+LATLL_BYTES = MAX_ROWS * LATLL_ROW
+SSQLL_BYTES = MAX_ROWS * WORLD * 8
+LAT_ALLOC = max(LAT_BYTES + SSQ_BYTES, LATLL_BYTES + SSQLL_BYTES)  # the ``lat`` buffer: xn rows, then ssq[row][owner]
 CNT_WORDS = 1024
 UP_EPOCH0 = MAX_RB
 
@@ -94,14 +100,14 @@ def mfma_wait():
 
 
 @launcher
-def compile_tail(mode: str, mpg: int, ts: bool = False):
+def compile_tail(mode: str, mpg: int, ts: bool = False, ll: bool = False, ll2: bool = False):
     """``mpg``: 16-token tiles of an m group (rows <= 64 mpg); ``ts``: each workgroup stores ``s_memrealtime`` (10 ns) stamps
-    of its phases into ``arg_ts`` ([workgroup][8] words, a profiling build)."""
+    of its phases into ``arg_ts`` ([workgroup][wave][8] words, a profiling build)."""
     assert mode in ("fused", "ar", "up") and 1 <= mpg <= MAX_MT // GROUPS
     do_ar, do_up = mode != "up", mode != "ar"
     UP0 = MAX_RB if mode == "fused" else 0  # first up-projection workgroup
-    LDS = NWAVES * mpg * 1024
-    name = f"latent_tail_h3584_n896_{mode}_mpg{mpg}" + ("_ts" if ts else "")
+    LDS = NWAVES * 16 * XROW + NWAVES * mpg * 1024
+    name = f"latent_tail_h3584_n896_{mode}_mpg{mpg}" + ("_ts" if ts else "") + ("_ll" if ll else "") + ("2" if ll2 else "")
     grid = (MAX_RB if do_ar else 0) + (UP_WGS if do_up else 0)
 
     @fx.struct
@@ -150,7 +156,8 @@ def compile_tail(mode: str, mpg: int, ts: bool = False):
                 if const_expr(wait):
                     fx.rocdl.s_waitcnt(vmcnt=0)
                 t = llvm.inline_asm(T.i64, [], "s_memrealtime $0\n\ts_waitcnt lgkmcnt(0)", "=s", has_side_effects=True)
-                buffer_ops.buffer_store(fx.Int64(t).to(fx.Int32), at(arg_ts, 1 << 24), bid * 8 + k, mask=tx == 0)
+                buffer_ops.buffer_store(fx.Int64(t).to(fx.Int32), at(arg_ts, 1 << 26), (bid * NWAVES + wave) * 8 + k,
+                                        mask=lane == 0)
 
         def count_done():
             """One add to the C2 of every rank (the first eight lanes)."""
@@ -169,26 +176,57 @@ def compile_tail(mode: str, mpg: int, ts: bool = False):
                 xr = at(arg_x, i32_m * i32_sx * 2)
                 mine_pk = [pack(xr, row * (i32_sx // 2) + d * (SL // 2) + p * 4, ok) for d in range_constexpr(WORLD)]
                 wpk = bf16x8(pack(at(arg_nw, K * 2), i32_me * (SL // 2) + p * 4, ok))
-                for d in range_constexpr(WORLD):
-                    dest = at(bs[d] + INBOX, WORLD * MAX_ROWS * SL * 2)
-                    buffer_ops.buffer_store(mine_pk[d], dest, (i32_me * MAX_ROWS + row) * (SL // 2) + p * 4,
-                                            mask=ok & (i32_me != d), cache_modifier=SYS)
-                stamp(1, True)
-                fx.rocdl.s_waitcnt(vmcnt=0)
-                fx.gpu.barrier()
-                stamp(2)
-                if peer:
-                    flag_store(sel8(lane, bs) + F1 + flags + fx.Int64(i32_me) * 4, e)
-                    spin(mine + F1 + flags + fx.Int64(lane) * 4, e)
-                fx.gpu.barrier()
-                stamp(3)
-
-                inbox = at(mine + INBOX, WORLD * MAX_ROWS * SL * 2)
-                pk = []
-                for s in range_constexpr(WORLD):
-                    got = pack(inbox, (s * MAX_ROWS + row) * (SL // 2) + p * 4, ok & (i32_me != s), SYS)
-                    pk.append([(i32_me == s).select(fx.Int32(mine_pk[s][i]), fx.Int32(got[i]))
-                               for i in range_constexpr(4)])
+                if const_expr(ll):
+                    for d in range_constexpr(WORLD):
+                        dest = at(bs[d] + INBOX, INBOX_BYTES)
+                        base = ((i32_me * MAX_ROWS + row) * LL_ROW + 2 * p) * 4
+                        for h in range_constexpr(2):
+                            buffer_ops.buffer_store(
+                                Vec.from_elements([mine_pk[d][2 * h], e, mine_pk[d][2 * h + 1], e], fx.Int32), dest,
+                                base + 4 * h, mask=ok & (i32_me != d), cache_modifier=SYS)
+                    stamp(1)
+                    inbox = at(mine + INBOX, INBOX_BYTES)
+                    pk = []
+                    first = []
+                    for s in range_constexpr(WORLD):
+                        base = ((s * MAX_ROWS + row) * LL_ROW + 2 * p) * 4
+                        first.append([pack(inbox, base + 4 * h, ok & (i32_me != s), SYS) for h in range_constexpr(2)])
+                    for s in range_constexpr(WORLD):
+                        base = ((s * MAX_ROWS + row) * LL_ROW + 2 * p) * 4
+                        a0, a1 = first[s]
+                        miss = ok & (i32_me != s) & ((fx.Int32(a0[1]) != e) | (fx.Int32(a0[3]) != e)
+                                                     | (fx.Int32(a1[1]) != e) | (fx.Int32(a1[3]) != e))
+                        while miss:
+                            llvm.inline_asm(None, [], "", "~{memory}", has_side_effects=True)
+                            a0 = pack(inbox, base, ok, SYS)
+                            a1 = pack(inbox, base + 4, ok, SYS)
+                            miss = ((fx.Int32(a0[1]) != e) | (fx.Int32(a0[3]) != e)
+                                    | (fx.Int32(a1[1]) != e) | (fx.Int32(a1[3]) != e))
+                        got = [a0[0], a0[2], a1[0], a1[2]]
+                        pk.append([(i32_me == s).select(fx.Int32(mine_pk[s][i]), fx.Int32(got[i]))
+                                   for i in range_constexpr(4)])
+                    stamp(2)
+                    stamp(3)
+                else:
+                    for d in range_constexpr(WORLD):
+                        dest = at(bs[d] + INBOX, WORLD * MAX_ROWS * SL * 2)
+                        buffer_ops.buffer_store(mine_pk[d], dest, (i32_me * MAX_ROWS + row) * (SL // 2) + p * 4,
+                                                mask=ok & (i32_me != d), cache_modifier=SYS)
+                    stamp(1, True)
+                    fx.rocdl.s_waitcnt(vmcnt=0)
+                    fx.gpu.barrier()
+                    stamp(2)
+                    if peer:
+                        flag_store(sel8(lane, bs) + F1 + flags + fx.Int64(i32_me) * 4, e)
+                        spin(mine + F1 + flags + fx.Int64(lane) * 4, e)
+                    fx.gpu.barrier()
+                    stamp(3)
+                    inbox = at(mine + INBOX, WORLD * MAX_ROWS * SL * 2)
+                    pk = []
+                    for s in range_constexpr(WORLD):
+                        got = pack(inbox, (s * MAX_ROWS + row) * (SL // 2) + p * 4, ok & (i32_me != s), SYS)
+                        pk.append([(i32_me == s).select(fx.Int32(mine_pk[s][i]), fx.Int32(got[i]))
+                                   for i in range_constexpr(4)])
                 lat_pk, xn_pk = [], []
                 ssq = fx.Float32(0.0)
                 for i in range_constexpr(4):
@@ -205,20 +243,34 @@ def compile_tail(mode: str, mpg: int, ts: bool = False):
                 stamp(4, True)
                 res = Vec.from_elements(xn_pk, fx.Int32)
                 ssq = wave_sum_lane63(ssq)
-                for d in range_constexpr(WORLD):
-                    lat = at(lats[d], LAT_ALLOC)
-                    buffer_ops.buffer_store(res, lat, row * (K // 2) + i32_me * (SL // 2) + p * 4, mask=ok,
-                                            cache_modifier=SYS)
-                    buffer_ops.buffer_store(ssq, lat, (LAT_BYTES // 4) + row * WORLD + i32_me,
-                                            mask=(lane == 63) & (row < i32_m), cache_modifier=SYS)
-                fx.rocdl.s_waitcnt(vmcnt=0)
-                fx.gpu.barrier()
+                if const_expr(ll2):
+                    for d in range_constexpr(WORLD):
+                        lat = at(lats[d], LAT_ALLOC)
+                        base = row * (LATLL_ROW // 4) + (i32_me * (SL // 4) + 2 * p) * 4
+                        for h in range_constexpr(2):
+                            buffer_ops.buffer_store(
+                                Vec.from_elements([xn_pk[2 * h], e, xn_pk[2 * h + 1], e], fx.Int32), lat, base + 4 * h,
+                                mask=ok, cache_modifier=SYS)
+                        buffer_ops.buffer_store(
+                            Vec.from_elements([ssq.bitcast(fx.Int32), e], fx.Int32), lat,
+                            LATLL_BYTES // 4 + (row * WORLD + i32_me) * 2, mask=(lane == 63) & (row < i32_m),
+                            cache_modifier=SYS)
+                else:
+                    for d in range_constexpr(WORLD):
+                        lat = at(lats[d], LAT_ALLOC)
+                        buffer_ops.buffer_store(res, lat, row * (K // 2) + i32_me * (SL // 2) + p * 4, mask=ok,
+                                                cache_modifier=SYS)
+                        buffer_ops.buffer_store(ssq, lat, (LAT_BYTES // 4) + row * WORLD + i32_me,
+                                                mask=(lane == 63) & (row < i32_m), cache_modifier=SYS)
+                    fx.rocdl.s_waitcnt(vmcnt=0)
+                    fx.gpu.barrier()
                 stamp(5)
-            count_done()
-            if const_expr(mode == "ar"):
-                if tx == 0:
-                    spin_load(mine + C2, e * (MAX_RB * WORLD))
-                fx.gpu.barrier()
+            if const_expr(not ll2):
+                count_done()
+                if const_expr(mode == "ar"):
+                    if tx == 0:
+                        spin_load(mine + C2, e * (MAX_RB * WORLD))
+                    fx.gpu.barrier()
             buffer_ops.buffer_store(e, cr, rb, mask=tx == 0)
             stamp(6, True)
 
@@ -239,44 +291,101 @@ def compile_tail(mode: str, mpg: int, ts: bool = False):
                 stamp(0)
                 wr = at(arg_w, N * K * 2)
                 a_op = [pack(wr, ((n0 + l16) * K + kb + 32 * s) // 2, None, NT) for s in range_constexpr(KSTEPS)]
-                latr = at(my_lat, LAT_BYTES)
-                ssr = at(my_lat + LAT_BYTES, SSQ_BYTES)
+                latr = at(my_lat, LATLL_BYTES if ll2 else LAT_BYTES)
+                ssr = at(my_lat + (LATLL_BYTES if ll2 else LAT_BYTES), SSQLL_BYTES if ll2 else SSQ_BYTES)
                 shr = at(arg_shared, i32_m * (i32_ssh * 2))
                 outr = at(arg_out, i32_m * (i32_sout * 2))
                 eps = i32_eps.bitcast(fx.Float32)
                 zero = fx.Int32(i32_zero).bitcast(fx.Float32)
                 stamp(1, True)
-                if const_expr(mode == "fused"):
+                if const_expr(ll2):
+                    if const_expr(mode == "fused"):
+                        if lane == 0:  # the last pack this wave's owner stores of the last row: the rest follows
+                            spin_load(my_lat + (((i32_m - 1) * (LATLL_ROW // 4) + (wave * (SL // 4) + SL // 4 - 1) * 4
+                                                 + 3) * 4).to(fx.Int64), e2)
+                elif const_expr(mode == "fused"):
                     if tx == 0:
                         spin_load(mine + C2, e2 * (MAX_RB * WORLD))
                     fx.gpu.barrier()
                 stamp(2)
 
-                def load_b(tt):
-                    r = m0 + tt * 16 + l16
-                    r = (r < i32_m).select(r, i32_m - 1)
-                    return [pack(latr, (r * K + kb + 32 * s) // 2) for s in range_constexpr(KSTEPS)]
+                red = lds + NWAVES * 16 * XROW  # the waves' accumulators meet here
+                stage = lds + wave * (16 * XROW)  # this wave's x rows, private
 
-                nxt = load_b(0)
+                def load_x(tt):
+                    """16 token rows of this wave's 896 B K slice, one coalesced 16 B per lane (lanes 0..55)."""
+                    out = []
+                    for r in range_constexpr(16):
+                        rr = m0 + tt * 16 + r
+                        rr = (rr < i32_m).select(rr, i32_m - 1)
+                        out.append(pack(latr, (rr * K + wave * KW) // 2 + lane * 4, lane < PK))
+                    return out
+
+                def load_x_ll(tt):
+                    """The same rows from the LL buffer: two 16 B packs per lane, each re-read until both its epochs
+                    match."""
+                    first = []
+                    for r in range_constexpr(16):
+                        rr = m0 + tt * 16 + r
+                        rr = (rr < i32_m).select(rr, i32_m - 1)
+                        base = rr * (LATLL_ROW // 4) + (wave * (SL // 4) + 2 * lane) * 4
+                        first.append((base, pack(latr, base, lane < PK, SYS), pack(latr, base + 4, lane < PK, SYS)))
+                    out = []
+                    for base, a0, a1 in first:
+                        miss = (lane < PK) & ((fx.Int32(a0[1]) != e2) | (fx.Int32(a0[3]) != e2)
+                                              | (fx.Int32(a1[1]) != e2) | (fx.Int32(a1[3]) != e2))
+                        while miss:
+                            llvm.inline_asm(None, [], "", "~{memory}", has_side_effects=True)
+                            a0 = pack(latr, base, lane < PK, SYS)
+                            a1 = pack(latr, base + 4, lane < PK, SYS)
+                            miss = ((fx.Int32(a0[1]) != e2) | (fx.Int32(a0[3]) != e2)
+                                    | (fx.Int32(a1[1]) != e2) | (fx.Int32(a1[3]) != e2))
+                        out.append(Vec.from_elements([a0[0], a0[2], a1[0], a1[2]], fx.Int32))
+                    return out
+
+                def put_x(v):
+                    if lane < PK:
+                        for r in range_constexpr(16):
+                            llvm.StoreOp(fx.as_ir_value(v[r]), _lds_ptr(stage + r * XROW + lane * 16), alignment=16)
+
+                nxt = None if ll2 else load_x(0)
                 ep = tx < mpg * 64
                 trow = m0 + (tx // 64) * 16 + (tx % 16)
                 tcol = n0 + ((tx % 64) // 16) * 4
-                sq0 = Vec(buffer_ops.buffer_load(ssr, trow * WORLD, vec_width=4, dtype=fx.Float32, mask=ep,
-                                                 cache_modifier=SYS))
-                sq1 = Vec(buffer_ops.buffer_load(ssr, trow * WORLD + 4, vec_width=4, dtype=fx.Float32, mask=ep,
-                                                 cache_modifier=SYS))
+                if const_expr(ll2):
+                    sqs = []
+                    for i in range_constexpr(4):
+                        v = pack(ssr, (trow * WORLD + 2 * i) * 2, ep, SYS)
+                        miss = ep & ((fx.Int32(v[1]) != e2) | (fx.Int32(v[3]) != e2))
+                        while miss:
+                            llvm.inline_asm(None, [], "", "~{memory}", has_side_effects=True)
+                            v = pack(ssr, (trow * WORLD + 2 * i) * 2, ep, SYS)
+                            miss = ep & ((fx.Int32(v[1]) != e2) | (fx.Int32(v[3]) != e2))
+                        sqs += [fx.Int32(v[0]).bitcast(fx.Float32), fx.Int32(v[2]).bitcast(fx.Float32)]
+                else:
+                    sq0 = Vec(buffer_ops.buffer_load(ssr, trow * WORLD, vec_width=4, dtype=fx.Float32, mask=ep,
+                                                     cache_modifier=SYS))
+                    sq1 = Vec(buffer_ops.buffer_load(ssr, trow * WORLD + 4, vec_width=4, dtype=fx.Float32, mask=ep,
+                                                     cache_modifier=SYS))
+                    sqs = [sq0[0], sq0[1], sq0[2], sq0[3], sq1[0], sq1[1], sq1[2], sq1[3]]
                 sh = Vec(buffer_ops.buffer_load(shr, trow * (i32_ssh // 2) + tcol // 2, vec_width=2, dtype=fx.Int32,
                                                 mask=ep))
                 stamp(3, True)
                 for tt in range_constexpr(mpg):
-                    cur = nxt
-                    if tt + 1 < mpg:
-                        nxt = load_b(tt + 1)
+                    if const_expr(ll2):
+                        cur = load_x_ll(tt)
+                    else:
+                        cur = nxt
+                        if tt + 1 < mpg:
+                            nxt = load_x(tt + 1)
+                    put_x(cur)
                     acc = Vec.filled(4, zero, fx.Float32)
                     for s in range_constexpr(KSTEPS):
-                        acc = mfma(a_op[s], cur[s], acc)
+                        b = Vec(llvm.load(T.vec(4, T.i32), _lds_ptr(stage + l16 * XROW + 64 * s + 16 * g),
+                                          alignment=16))
+                        acc = mfma(a_op[s], b, acc)
                     mfma_wait()
-                    llvm.StoreOp(fx.as_ir_value(acc), _lds_ptr(lds + ((wave * mpg + tt) * 64 + lane) * 16),
+                    llvm.StoreOp(fx.as_ir_value(acc), _lds_ptr(red + ((wave * mpg + tt) * 64 + lane) * 16),
                                  alignment=16)
                 stamp(4)
                 fx.gpu.barrier()
@@ -284,11 +393,11 @@ def compile_tail(mode: str, mpg: int, ts: bool = False):
                 if ep:
                     tt = tx // 64
                     ln = tx % 64
-                    tot = Vec(llvm.load(T.vec(4, T.f32), _lds_ptr(lds + (tt * 64 + ln) * 16), alignment=16))
+                    tot = Vec(llvm.load(T.vec(4, T.f32), _lds_ptr(red + (tt * 64 + ln) * 16), alignment=16))
                     for w2 in range_constexpr(1, NWAVES):
-                        tot = tot + Vec(llvm.load(T.vec(4, T.f32), _lds_ptr(lds + ((w2 * mpg + tt) * 64 + ln) * 16),
+                        tot = tot + Vec(llvm.load(T.vec(4, T.f32), _lds_ptr(red + ((w2 * mpg + tt) * 64 + ln) * 16),
                                                   alignment=16))
-                    sq = ((sq0[0] + sq0[1]) + (sq0[2] + sq0[3])) + ((sq1[0] + sq1[1]) + (sq1[2] + sq1[3]))
+                    sq = ((sqs[0] + sqs[1]) + (sqs[2] + sqs[3])) + ((sqs[4] + sqs[5]) + (sqs[6] + sqs[7]))
                     inv = rsq(sq * fx.Float32(1.0 / K) + eps)
                     shf = bf16x8(Vec.from_elements([sh[0], sh[1], fx.Int32(0), fx.Int32(0)], fx.Int32))
                     o = [tot[i] * inv + shf[i] for i in range_constexpr(4)]
