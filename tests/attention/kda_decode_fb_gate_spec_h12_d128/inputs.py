@@ -9,7 +9,7 @@ PROJ_COLS = 6288
 SPEC_TOKENS = 6  # num_speculative_tokens 5 + the verified token
 
 
-def make_inputs(rows, tokens=SPEC_TOKENS, seed=0, device="cuda", conv_dim_first=True, norm_f32=False, pad_seqs=0,
+def make_inputs(rows, tokens=SPEC_TOKENS, seed=0, device="cuda", conv_dim_first=False, norm_f32=False, pad_seqs=0,
                 slot_pitch=0):
     """``rows`` tokens as ceil(rows / tokens) sequences (the last one shorter), plus ``pad_seqs`` padding sequences
     (slot 0 everywhere). Returns the entry's keyword arguments."""
