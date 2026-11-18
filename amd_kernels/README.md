@@ -14,6 +14,8 @@ One line per kernel package. Each package's README has what it does, its entry p
   gate_up + SwiGLU at 1-8 rows.
 - [`gemm/bf16_n50016_k6144`](gemm/bf16_n50016_k6144/README.md): the lm_head vocabulary shard, with an optional row map.
 - [`gemm/bf16_n200064_k256`](gemm/bf16_n200064_k256/README.md): the draft's Markov projection over selected rows.
+- [`gemm/bf16_latent_down_mxfp4_quant_k7168_n3584`](gemm/bf16_latent_down_mxfp4_quant_k7168_n3584/README.md): the
+  latent MoE down projection (7168 -> 3584) with the routed experts' MXFP4 activation quant fused into its epilogue.
 - [`gemm/bf16_concat_linear_n1536_k30720`](gemm/bf16_concat_linear_n1536_k30720/README.md): the draft's input fc over
   five taps, and the four-rank gather.
 
