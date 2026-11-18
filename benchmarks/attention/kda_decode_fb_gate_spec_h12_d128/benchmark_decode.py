@@ -152,7 +152,7 @@ def main():
         pairs = [stock_calls(a) for a in sets]
         fb_us = timeit_graph([p[0] for p in pairs])
         dec_us = timeit_graph([p[1] for p in pairs])
-        stock = timeit_graph([c for p in pairs for c in p])
+        stock = 2 * timeit_graph([c for p in pairs for c in p])
         mb = hbm_bytes(rows, n_seq)
         print(f"{rows:>4} {tokens:>3} {n_seq:>4} {mb / 1e6:>7.1f} {fused:>9.1f} {mb / (fused * 1e-6) / 1e12:>6.2f} "
               f"{floor:>9.1f} {fused / floor:>10.2f}x {one:>9.1f} {stock:>9.1f} {fb_us:>7.1f} + {dec_us:<6.1f} "

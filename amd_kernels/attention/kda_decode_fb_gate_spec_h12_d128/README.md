@@ -28,7 +28,22 @@ states within 2e-3 of the reference in the tests, identical conv state, two runs
 
 ## Performance
 
-TBD
+Graph replay, 1 MI355X, inputs > 700 MB (cold), median us per layer call. `floor` = skeleton kernel (same grid, table
+lookups, state read, snapshot writes, no math). Ceiling = 6.2 TB/s (measured blend of 6.5 read / 6.0 write, hw_ceilings.md).
+
+| M (rows x tok) | MB | fused us | TB/s | % ceiling | floor us | fused/floor | stock f_b + AITER us | speedup |
+|---|---|---|---|---|---|---|---|---|
+| 12 (2 x 6) | 11.8 | 10.0 | 1.18 | 19 | 5.5 | 1.82 | 16.2 | 1.63x |
+| 24 (6 x 4) | 24.9 | 8.7 | 2.87 | 46 | 5.8 | 1.49 | 14.7 | 1.69x |
+| 40 (10 x 4) | 41.2 | 9.9 | 4.16 | 67 | 7.1 | 1.40 | 17.5 | 1.77x |
+| 65 (13 x 5) | 63.9 | 13.7 | 4.66 | 75 | 10.4 | 1.32 | 21.5 | 1.57x |
+| 80 (20 x 4) | 81.9 | 15.6 | 5.25 | 85 | 14.6 | 1.07 | 22.1 | 1.41x |
+| 128 (32 x 4) | 130.9 | 25.5 | 5.14 | 83 | 19.5 | 1.31 | 32.3 | 1.27x |
+| 192 (48 x 4) | 196.1 | 34.4 | 5.69 | 92 | 30.6 | 1.13 | 45.1 | 1.31x |
+
+Small M is latency-bound (launch 1.6 us + prologue ~3.5 us + tail ~1 us); the large tiers are at 83-92% of the HBM
+ceiling. Not helpful (measured, <3%): conv write-back placement, state-load ordering, store interleaving, extra waves.
+Details and attempts log: analysis/kernels/kda_decode_fb_gate_spec_h12_d128.md.
 
 ## Tests
 
