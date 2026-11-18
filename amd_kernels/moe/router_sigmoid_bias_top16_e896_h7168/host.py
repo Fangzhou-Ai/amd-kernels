@@ -8,7 +8,7 @@ import torch
 
 from amd_kernels.warm_up import entry
 
-from .kernel import MT_MAX, compile_router_partials_e896_h7168, partial_bytes
+from .kernel import CNT_STRIDE, MT_MAX, TILES, compile_router_e896_h7168, partial_bytes
 from .reference import E, H, TOPK
 from .topk import compile_router_sigmoid_bias_top16_e896
 
@@ -48,8 +48,8 @@ def m_tile_fragments(m: int) -> int:
 
 
 @functools.cache
-def _partials_kernel(mt: int, ks: int, shuf: bool):
-    return compile_router_partials_e896_h7168(mt, ks, int(shuf))
+def _router_kernel(mt: int, ks: int, shuf: bool, fused: bool):
+    return compile_router_e896_h7168(mt, ks, int(shuf), int(fused))
 
 
 @functools.cache
@@ -71,11 +71,13 @@ _WORK: dict = {}
 
 
 def _workspace(device: torch.device, stream: int):
-    """The partial slabs of one (device, stream)."""
+    """The partial slabs and the tile counters (zero, never reset: each call adds one epoch to each) of one (device,
+    stream)."""
     key = (device.index, stream)
     ws = _WORK.get(key)
     if ws is None:
-        ws = torch.empty(max(partial_bytes(MAX_M, ks) for ks in KS_BY_MT.values()), dtype=torch.uint8, device=device)
+        ws = (torch.empty(max(partial_bytes(MAX_M, ks) for ks in KS_BY_MT.values()), dtype=torch.uint8, device=device),
+              torch.zeros(TILES * CNT_STRIDE // 4 + 2048, dtype=torch.int32, device=device))
         _WORK[key] = ws
     return ws
 
@@ -84,15 +86,24 @@ def _bits(v: float) -> int:
     return struct.unpack("<i", struct.pack("<f", v))[0]
 
 
-def _partials(x: torch.Tensor, w: torch.Tensor, shuffled: bool):
+def _launch(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None, scale: float, out: tuple | None,
+            shuffled: bool):
+    """One launch: the whole router into ``out``, or (``out`` None) the GEMM partials alone; -> (slabs, K splits)."""
     m = x.shape[0]
     assert x.ndim == 2 and x.shape[1] == H and x.dtype == torch.bfloat16 and x.is_contiguous()
     assert supports(w) and x.device == w.device and 1 <= m <= MAX_M
     stream = torch.cuda.current_stream()
     mt = m_tile_fragments(m)
     ks = KS_BY_MT[mt]
-    part = _workspace(x.device, stream.cuda_stream)
-    _run(_partials_kernel(mt, ks, bool(shuffled)), x.data_ptr(), w.data_ptr(), part.data_ptr(), m, stream)
+    part, counters = _workspace(x.device, stream.cuda_stream)
+    if out is None:
+        bias_ptr = ow = oid = row_stride = 0
+    else:
+        weights, ids = out
+        assert weights.stride(0) == ids.stride(0) and weights.stride(1) == ids.stride(1) == 1
+        bias_ptr, ow, oid, row_stride = bias.data_ptr(), weights.data_ptr(), ids.data_ptr(), weights.stride(0)
+    _run(_router_kernel(mt, ks, bool(shuffled), out is not None), x.data_ptr(), w.data_ptr(), part.data_ptr(),
+         counters.data_ptr(), bias_ptr, ow, oid, m, row_stride, _bits(scale), stream)
     return part, ks
 
 
@@ -104,12 +115,12 @@ def _top16(part: torch.Tensor, ks: int, bias: torch.Tensor, routed_scaling_facto
 
 
 def router_logits(x: torch.Tensor, w: torch.Tensor, *, shuffled: bool = False) -> torch.Tensor:
-    """fp32 logits [M, 896] = the partial slabs of the GEMM launch summed in slice order (what the top-k launch
-    computes); for tests and benchmarks, serving never materialises them."""
+    """fp32 logits [M, 896] = the partial slabs of the GEMM summed in slice order (what the top-k stage computes); for
+    tests and benchmarks, serving never materialises them."""
     m = x.shape[0]
     if m > MAX_M:
         return torch.cat([router_logits(x[i:i + MAX_M], w, shuffled=shuffled) for i in range(0, m, MAX_M)])
-    part, ks = _partials(x, w, shuffled)
+    part, ks = _launch(x, w, None, 1.0, None, shuffled)
     slabs = part[:partial_bytes(m, ks)].view(torch.float32).view(ks, m, E)
     logits = slabs[0].clone()
     for k in range(1, ks):
@@ -119,7 +130,8 @@ def router_logits(x: torch.Tensor, w: torch.Tensor, *, shuffled: bool = False) -
 
 def top16(logits: torch.Tensor, bias: torch.Tensor, routed_scaling_factor: float = 1.0,
           out: tuple | None = None):
-    """(weights fp32 [M, 16], ids int32 [M, 16]) from fp32 logits [M, 896]: sigmoid + bias + top-16 + renormalise."""
+    """(weights fp32 [M, 16], ids int32 [M, 16]) from fp32 logits [M, 896]: AITER's biased top-16 (sigmoid + bias,
+    renormalised, times the scale)."""
     m = logits.shape[0]
     assert logits.dtype == torch.float32 and logits.shape[1] == E and logits.is_contiguous()
     assert bias.dtype == torch.float32 and bias.shape == (E,) and bias.is_contiguous()
@@ -133,10 +145,10 @@ def top16(logits: torch.Tensor, bias: torch.Tensor, routed_scaling_factor: float
 
 def _router(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor, routed_scaling_factor: float = 1.0,
             out: tuple | None = None, *, shuffled: bool = False):
-    """(topk_weights fp32 [M, 16], topk_ids int32 [M, 16]) of the router: x [M, 7168] @ W^T, sigmoid, + bias, top-16,
-    renormalised, times ``routed_scaling_factor``. Slots in ascending expert id; equal biased scores: lowest id first.
-    W = w (row-major [896, 7168]) or shuffle_weight's layout. Any M (above 192 rows: launches of 192 rows).
-    Deterministic, no atomics, CUDA-graph safe. One call at a time per stream (the workspace)."""
+    """(topk_weights fp32 [M, 16], topk_ids int32 [M, 16]) of the router: x [M, 7168] @ W^T, then AITER's biased top-16
+    (sigmoid, + bias, renormalised, times ``routed_scaling_factor``; slots in descending score order). W = w (row-major
+    [896, 7168]) or shuffle_weight's layout. Any M (above 192 rows: launches of 192 rows). One launch, deterministic, no
+    atomics into outputs, CUDA-graph safe. One call at a time per stream (the workspace)."""
     m = x.shape[0]
     assert bias.dtype == torch.float32 and bias.shape == (E,) and bias.is_contiguous()
     if out is None:
@@ -148,8 +160,7 @@ def _router(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor, routed_scaling
                     shuffled=shuffled)
         return out
     if m:
-        part, ks = _partials(x, w, shuffled)
-        _top16(part, ks, bias, routed_scaling_factor, out, m)
+        _launch(x, w, bias, routed_scaling_factor, out, shuffled)
     return out
 
 

@@ -26,9 +26,16 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T, Vector as Vec
 
 from .reference import E as N, H as K
+from .topk import (LDS_WORDS, MAXC, NQ, RANK_UNROLL, TOPK, _ballot, _popcount, topk_fast_write, topk_new, topk_pivot, topk_q_finish,
+                   topk_q_load, topk_rank_start, topk_rank_step, topk_slow_out, topk_slow_select,
+                   topk_finish, topk_tie_masks)
 
 TN = 64
 TILES = N // TN  # 14
+SC1 = 0x10  # agent-scope (cross-XCD) stores and loads of the slabs and counters
+CNT_STRIDE = 128  # bytes: one counter per tile, each on its own line
+EPOCH = 16  # what one call adds to each tile counter
+POLL_SLEEP = 2  # s_sleep units (64 clocks) between two polls of the tile counters
 NB = K // 64  # 112 K blocks
 NWV = 4
 W_CM = 2  # nt
@@ -58,10 +65,23 @@ def _lds_ptr(byte_addr):
     return llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), _raw(fx.Int64(byte_addr)))
 
 
+def _atomic_add(addr, v):
+    """Returning scalar global RMW by one active lane; the caller drained its sc1 stores first."""
+    low = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.Int64(addr).to(fx.Int32)))
+    high = fx.Int32(fx.rocdl.readfirstlane(T.i32, (fx.Int64(addr) >> 32).to(fx.Int32)))
+    pointer = (low.to(fx.Uint32).to(fx.Uint64) | (high.to(fx.Uint32).to(fx.Uint64) << 32)).bitcast(fx.Int64)
+    inc = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.Int32(v)))
+    return fx.Int32(llvm.inline_asm(T.i32, [fx.as_ir_value(inc), fx.as_ir_value(pointer)],
+                                    "s_atomic_add $0, $2, 0 glc\n\ts_waitcnt lgkmcnt(0)", "=s,0,s,~{memory}",
+                                    has_side_effects=True, is_align_stack=False,
+                                    asm_dialect=llvm.AsmDialect.AD_ATT))
+
+
 @launcher
-def compile_router_partials_e896_h7168(mt: int, ks: int, shuf: int):
-    MT, KS, SHUF = mt, ks, shuf
-    assert 1 <= MT <= MT_MAX and NB % KS == 0
+def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1):
+    """``fused`` 0: the GEMM launch alone (partials out); 1: the whole router (the top-16 follows in the same launch)."""
+    MT, KS, SHUF, FUSED = mt, ks, shuf, fused
+    assert 1 <= MT <= MT_MAX and NB % KS == 0 and KS <= EPOCH and (not FUSED or TILES * KS * NWV >= 16 * MT)  # four tokens a workgroup at most
     NBK = NB // KS  # K blocks per workgroup
     MR = 16 * MT
     R = min(ring_depth(MT), NBK)
@@ -76,11 +96,17 @@ def compile_router_partials_e896_h7168(mt: int, ks: int, shuf: int):
     @fx.struct
     class Shared:
         buf: fx.Array[fx.Uint8, LDS, 16]
+        flag: fx.Array[fx.Int32, 4]
+        ent: fx.Array[fx.Int32, NWV * LDS_WORDS["ent"], 16]
+        tie: fx.Array[fx.Int32, NWV * LDS_WORDS["tie"], 16]
+        tex: fx.Array[fx.Int32, NWV * LDS_WORDS["tex"], 16]
+        tmask: fx.Array[fx.Int32, NWV * LDS_WORDS["tmask"], 16]
 
-    name = f"router_partials_e896_h7168_mt{MT}_ks{KS}" + ("_shuf" if SHUF else "_row")
+    name = f"router_{'fused' if FUSED else 'partials'}_e896_h7168_mt{MT}_ks{KS}" + ("_shuf" if SHUF else "_row")
 
     @flyc.kernel(name=name, known_block_size=[64 * NWV, 1, 1])
-    def kernel(arg_x: fx.Int64, arg_w: fx.Int64, arg_p: fx.Int64, i32_m: fx.Int32):
+    def kernel(arg_x: fx.Int64, arg_w: fx.Int64, arg_p: fx.Int64, arg_c: fx.Int64, arg_bias: fx.Int64,
+               arg_ow: fx.Int64, arg_oid: fx.Int64, i32_m: fx.Int32, i32_os: fx.Int32, i32_scale: fx.Int32):
         tx, bid = fx.thread_idx.x, fx.block_idx.x
         smem = fx.SharedAllocator().allocate(Shared).peek()
         lane = tx % 64
@@ -184,10 +210,62 @@ def compile_router_partials_e896_h7168(mt: int, ks: int, shuf: int):
         for m in range_constexpr(MT):
             buffer_ops.buffer_store(acc[m].bitcast(fx.Int32), pr,
                                     ((kz * i32_m + m * 16 + l16) * N + n0 + wave * 16 + g * 4) * 4,
-                                    offset_is_bytes=True, mask=(m * 16 + l16) < i32_m)
+                                    offset_is_bytes=True, mask=(m * 16 + l16) < i32_m,
+                                    cache_modifier=SC1 if FUSED else 0)
+        if const_expr(FUSED):
+            # every slab store is acknowledged before the arrival; workgroup ``t`` (t < M) then waits for all tiles and
+            # takes token t in its wave 0 (a token's 50 KB of slabs go through one CU's load path)
+            fx.rocdl.s_waitcnt(vmcnt=0)
+            fx.gpu.barrier()
+            if tx == 0:
+                inc = fx.Int32(EPOCH // KS) + (kz < EPOCH % KS).select(fx.Int32(1), fx.Int32(0))
+                old = _atomic_add(arg_c + fx.Int64(tile) * CNT_STRIDE, inc)
+                smem.flag.ptr[0] = old - (old & (EPOCH - 1))
+            fx.rocdl.s_waitcnt(lgkmcnt=0)
+            fx.gpu.barrier()
+            tok = bid + wave * (TILES * KS)  # the token of this wave: one per workgroup, up to four when M exceeds the grid
+            if tok < i32_m:
+                ebase = fx.Int32(smem.flag.ptr[0])
+                cr = buffer_ops.create_buffer_resource_from_addr(arg_c, num_records_bytes=TILES * CNT_STRIDE)
+                br = buffer_ops.create_buffer_resource_from_addr(arg_bias, num_records_bytes=N * 4)
+                out_bytes = fx.Int64(i32_m) * fx.Int64(i32_os) * 4
+                owr = buffer_ops.create_buffer_resource_from_addr(arg_ow, num_records_bytes=out_bytes)
+                oir = buffer_ops.create_buffer_resource_from_addr(arg_oid, num_records_bytes=out_bytes)
+                st = topk_new(lane)
+                # the experts 256 q + 4 lane + j live in tiles 4 q .. 4 q + 3: take each group as its tiles finish
+                for q in range_constexpr(NQ):
+                    in_group = (lane >= 4 * q) & (lane < min(4 * q + 4, TILES))
+                    ready = fx.Int32(0)
+                    while ready < min(4, TILES - 4 * q):
+                        c = fx.Int32(buffer_ops.buffer_load(cr, lane * (CNT_STRIDE // 4), vec_width=1,
+                                                            dtype=fx.Int32, mask=lane < TILES,
+                                                            cache_modifier=SC1 | 1))
+                        ready = _popcount(_ballot(((c - ebase) >= EPOCH) & in_group))
+                        fx.rocdl.s_sleep(POLL_SLEEP)
+                    parts, bv = topk_q_load(pr, br, lane, tok, i32_m, KS, SC1, q)
+                    topk_q_finish(st, lane, q, parts, bv)
+                topk_pivot(st, smem, wave, lane)
+                if st.nc <= MAXC:
+                    topk_fast_write(st, smem, wave, lane)
+                    topk_rank_start(st, smem, wave, lane)
+                    rank = fx.Int32(0)
+                    e = fx.Int32(0)
+                    while e < st.nc:
+                        rank = topk_rank_step(rank, e, st, smem, wave)
+                        e = e + RANK_UNROLL
+                    topk_finish(rank, lane < st.nc, st.mysig, st.myid, lane, owr, oir, tok, i32_os, i32_scale)
+                else:
+                    ss = topk_slow_select(st)
+                    if ss.total_ties != ss.need:
+                        topk_tie_masks(ss, smem, wave, lane)
+                    rank, mysig, myid = topk_slow_out(ss, smem, wave, lane)
+                    topk_finish(rank, lane < TOPK, mysig, myid, lane, owr, oir, tok, i32_os, i32_scale)
 
     @flyc.jit
-    def launch(arg_x: fx.Int64, arg_w: fx.Int64, arg_p: fx.Int64, i32_m: fx.Int32, stream: fx.Stream):
-        kernel(arg_x, arg_w, arg_p, i32_m).launch(grid=(TILES * KS, 1, 1), block=(64 * NWV, 1, 1), stream=stream)
+    def launch(arg_x: fx.Int64, arg_w: fx.Int64, arg_p: fx.Int64, arg_c: fx.Int64, arg_bias: fx.Int64,
+               arg_ow: fx.Int64, arg_oid: fx.Int64, i32_m: fx.Int32, i32_os: fx.Int32, i32_scale: fx.Int32,
+               stream: fx.Stream):
+        kernel(arg_x, arg_w, arg_p, arg_c, arg_bias, arg_ow, arg_oid, i32_m, i32_os, i32_scale).launch(
+            grid=(TILES * KS, 1, 1), block=(64 * NWV, 1, 1), stream=stream)
 
     return launch

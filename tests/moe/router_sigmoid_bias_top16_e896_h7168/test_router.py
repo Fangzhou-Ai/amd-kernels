@@ -13,7 +13,7 @@ from amd_kernels.moe.router_sigmoid_bias_top16_e896_h7168.reference import (E, H
                                                                             top16_reference)
 
 MS = [1, 2, 5, 12, 15, 16, 17, 24, 33, 40, 48, 65, 80, 96, 112, 128, 129, 160, 176, 192, 193, 300]
-KS = [1, 2, 4, 7, 8, 14, 16, 28]
+KS = [4, 7, 8, 14, 16]
 
 
 def aiter_top16(logits, bias, scale=1.0):

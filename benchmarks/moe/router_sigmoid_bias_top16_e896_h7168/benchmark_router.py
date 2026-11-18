@@ -66,8 +66,8 @@ if __name__ == "__main__":
         stock = timing([lambda x=x, w=w, a=a, b=b: biased_grouped_topk(torch.mm(x, w.T, out_dtype=torch.float32), bias,
                                                                          a, b, 1, 1, True, 1.0)
                         for x, w, a, b in zip(xs, ws, sw, si)])
-        gemm = timing([lambda x=x, w=w: host._partials(x, w, True) for x, w in zip(xs, wss)])
-        part, ks = host._partials(xs[0], wss[0], True)
+        gemm = timing([lambda x=x, w=w: host._launch(x, w, None, 1.0, None, True) for x, w in zip(xs, wss)])
+        part, ks = host._launch(xs[0], wss[0], None, 1.0, None, True)
         outs = [(torch.empty(m, TOPK, device="cuda"), torch.empty(m, TOPK, dtype=torch.int32, device="cuda"))
                 for _ in range(COPIES)]
         topk = timing([lambda o=o: host._top16(part, ks, bias, 1.0, o, m) for o in outs])
