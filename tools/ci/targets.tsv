@@ -40,6 +40,7 @@ norm/gemma_add_rmsnorm_h6144/test_slots4_lossless.py	4
 
 # compile tests: compile-only mode, sharing one card (the same FlyDSL compiles, kernel and cache key, as a normal run)
 attention/norm_rope_fp8_insert_d128_rot64/test_compile.py	compile
+attention/kda_decode_fb_gate_spec_h12_d128/test_compile.py	compile
 attention/norm_rope_nvfp4_insert_d128_rot64_p128/test_compile.py	compile
 attention/nvfp4_sparse_decode_gqa16_d128_p128_top16/test_compile.py	compile
 attention/nvfp4_sparse_prefill_gqa16_d128_p128_top16/test_compile.py	compile
