@@ -433,3 +433,24 @@ def fp8_pack4(a, b, c, d):
     """Four f32 (already in range) -> one dword of four E4M3 bytes, RNE."""
     lo = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, a, b, fx.Int32(0), False))
     return fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, c, d, lo, True))
+
+
+def lds_dma(src, dst, cpol=""):
+    """A global_load_lds_dwordx4: lane i's 16 B at the 64-bit address ``src``
+    -> LDS byte ``dst`` (uniform) + 16 i. ``cpol``: cache policy bits ("sc1":
+    device scope). An ``s_nop`` between the M0 write and the load: right after
+    the write the load could read a stale M0. Completes at ``dma_wait``."""
+    llvm.inline_asm(
+        None,
+        [as_ir_value(fx.Int64(src)), as_ir_value(uniform(dst))],
+        f"s_mov_b32 m0, $1\n\ts_nop 0\n\tglobal_load_lds_dwordx4 $0, off {cpol}",
+        "v,s,~{m0},~{memory}",
+        has_side_effects=True,
+    )
+
+
+@traced
+def dma_wait():
+    """This wave's DMAs (and loads) landed, then the CTA's after the barrier."""
+    llvm.inline_asm(None, [], "s_waitcnt vmcnt(0)", "", has_side_effects=True)
+    gpu.barrier()
