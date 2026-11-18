@@ -21,6 +21,8 @@ One line per kernel package. Each package's README has what it does, its entry p
 
 - [`moe/mxfp4_h6144_i768_e128_top4`](moe/mxfp4_h6144_i768_e128_top4/README.md): routed MXFP4 experts (A4W4) with the
   MXFP8 shared expert.
+- [`moe/router_sigmoid_bias_top16_e896_h7168`](moe/router_sigmoid_bias_top16_e896_h7168/README.md): the MoE router,
+  bf16 gate GEMM + sigmoid + correction bias + top-16 + renormalisation, two launches.
 
 ## Attention
 
