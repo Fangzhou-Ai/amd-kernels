@@ -16,14 +16,11 @@ from .norm_math import K, N, WORLD
 
 NAME = "moe/allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8"
 MAX_ROWS = T.MAX_ROWS
-SK_MAX = max(T.split_k(ns) for ns in (1, 2, 4))
 
 
 @functools.cache
-def _kernel(mode, mt, ns, nj, pd):
-    if mode == "ar":  # no up-projection code: one variant
-        mt = 1
-    return T.compile_tail(mode, mt, ns, nj, pd)
+def _kernel(mode, mpg, ts=False):
+    return T.compile_tail(mode, 1 if mode == "ar" else mpg, ts)
 
 
 def _release(ptr, peer):
@@ -34,18 +31,13 @@ def _release(ptr, peer):
     assert rc == 0, f"HIP buffer release failed: {rc}"
 
 
-def config(mt: int) -> tuple[int, int, int]:
-    """(NS, NJ, PD) of the up-projection kernel for ``mt`` 16-row tiles."""
-    return 4, 2, 4
-
-
 def _mode(comm, partial, norm_weight, up_weight, shared, out=None, eps=1e-6):
     """What a call fixes about its kernels besides the row count (``amd_kernels.warm_up``)."""
     return ()
 
 
 def _sizes(mode):
-    return tuple(16 * i for i in range(1, T.MAX_MT + 1))
+    return tuple(16 * T.GROUPS * i for i in range(1, T.MAX_MT // T.GROUPS + 1))
 
 
 def _inputs(mode, n, comm, partial, norm_weight, up_weight, shared, out=None, eps=1e-6):
@@ -79,18 +71,21 @@ class LatentTailComm:
         ptr, handle = ops.allocate_shared_buffer_and_handle(T.BUF_BYTES)
         peers = exchange(handle, rank, group)
         self.bufs = [ptr if r == rank else ops.open_mem_handle(peers[r]) for r in range(WORLD)]
-        self.lat = torch.zeros(MAX_ROWS, K, dtype=torch.bfloat16, device=device)
-        lat_peers = exchange(alloc_handle(self.lat.data_ptr()), rank, group)
+        self.lat_buf = torch.zeros(T.LAT_ALLOC // 2, dtype=torch.bfloat16, device=device)
+        self.lat = self.lat_buf[:MAX_ROWS * K].view(MAX_ROWS, K)
+        lat_peers = exchange(alloc_handle(self.lat_buf.data_ptr()), rank, group)
         self.lat_opened = [open_handle(raw) for r, (raw, _) in enumerate(lat_peers) if r != rank]
         opened = iter(self.lat_opened)
-        lats = [self.lat.data_ptr() if r == rank else next(opened) + lat_peers[r][1] for r in range(WORLD)]
+        lats = [self.lat_buf.data_ptr() if r == rank else next(opened) + lat_peers[r][1] for r in range(WORLD)]
         self.buf_table = torch.tensor(self.bufs + lats, dtype=torch.int64, device=device)
         self.counts = torch.zeros(T.CNT_WORDS, dtype=torch.int32, device=device)
-        self.part = torch.zeros(SK_MAX * MAX_ROWS * N, dtype=torch.float32, device=device)
-        self.ss = torch.zeros(T.groups(1) * SK_MAX * MAX_ROWS, dtype=torch.float32, device=device)
-        self.tickets = torch.zeros(T.groups(1) * 32, dtype=torch.int32, device=device)
+        self.ts = None  # a [workgroup, 8] int32 tensor of phase stamps (profiling build), set by the caller
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
+
+    @property
+    def ts_ptr(self):
+        return 0 if self.ts is None else self.ts.data_ptr()
 
     def _launch(self, x, norm_weight, w, shared, out, eps, modes=None):
         if not self.bufs:
@@ -109,14 +104,12 @@ class LatentTailComm:
         if tuple(shared.shape) != (m, N) or tuple(out.shape) != (m, N):
             raise ValueError(f"shared and out must be [{m}, {N}]")
         stream = torch.cuda.current_stream()
-        mt = (m + 15) // 16
-        ns, nj, pd = config(mt)
+        mpg = T.mpg_of((m + 15) // 16)
         args = (m, (m + T.RB - 1) // T.RB, self.rank, self.buf_table.data_ptr(), self.counts.data_ptr(),
                 x.data_ptr(), x.stride(0), norm_weight.data_ptr(), w.data_ptr(), shared.data_ptr(), shared.stride(0),
-                out.data_ptr(), out.stride(0), self.part.data_ptr(), self.ss.data_ptr(), self.tickets.data_ptr(),
-                f32_bits(eps), 0, stream)
+                out.data_ptr(), out.stride(0), f32_bits(eps), 0, self.ts_ptr, stream)
         for mode in modes or (("fused",) if self.fused else ("ar", "up")):
-            run_compiled(_kernel(mode, mt, ns, nj, pd), *args)
+            run_compiled(_kernel(mode, mpg, bool(self.ts_ptr)), *args)
         return out
 
     def close(self):

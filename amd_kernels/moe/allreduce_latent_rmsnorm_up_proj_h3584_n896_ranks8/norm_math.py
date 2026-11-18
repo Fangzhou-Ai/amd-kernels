@@ -41,6 +41,25 @@ def pk_bf16(a, b):
     return fx.Int32(fx.rocdl.cvt_pk_bf16_f32(fx.as_ir_value(fx.Float32(a)), fx.as_ir_value(fx.Float32(b))))
 
 
+def _bits(x):
+    return fx.Float32(x).bitcast(fx.Int32)
+
+
+def _dpp_f(v, ctrl, row_mask=0xF, old=None):
+    """v_mov_b32_dpp of an fp32; rows ``row_mask`` leaves out keep ``old``, out-of-row sources read 0."""
+    o = _llvm.mlir_undef(T.i32) if old is None else fx.as_ir_value(_bits(old))
+    r = _rocdl_ops.update_dpp(T.i32, o, fx.as_ir_value(_bits(v)), ctrl, row_mask, 0xF, True)
+    return fx.Int32(r).bitcast(fx.Float32)
+
+
+def wave_sum_lane63(acc):
+    """Sum of the 64 lanes, valid in lane 63: row_shr 8/4/2/1 adds, row_bcast 15 and 31."""
+    for sh in (8, 4, 2, 1):
+        acc = acc + _dpp_f(acc, 0x110 + sh)
+    acc = _dpp_f(acc, 0x142, row_mask=0xA, old=acc) + acc
+    return acc + _dpp_f(acc, 0x143)
+
+
 def rsq(x):
     return fx.Float32(_rocdl_ops.rsq(T.f32, fx.as_ir_value(x)))
 
