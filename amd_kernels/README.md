@@ -36,6 +36,9 @@ One line per kernel package. Each package's README has what it does, its entry p
   one NVFP4 sparse attention layer at its served dtypes: the indexer, the warm-up, the decode / prefill calls.
 - [`attention/swa_decode_fp8kv_gqa16_d128`](attention/swa_decode_fp8kv_gqa16_d128/README.md): the draft's
   sliding-window decode attention over an fp8 KV cache.
+- [`attention/dsa_prologue_qkv_a_norm_kv_insert_h7168`](attention/dsa_prologue_qkv_a_norm_kv_insert_h7168/README.md):
+  the DSA decode prologue around the qkv_a GEMM: q_a / kv_a norms + fp8_ds_mla KV insert, and the indexer's key
+  LayerNorm + MXFP4 insert, query MXFP4 quant and head weights.
 - [`attention/norm_rope_fp8_insert_d128_rot64`](attention/norm_rope_fp8_insert_d128_rot64/README.md): the draft's
   norm + RoPE + fp8 KV insert.
 
