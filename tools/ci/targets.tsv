@@ -53,6 +53,7 @@ norm/gemma_add_rmsnorm_h6144/test_compile.py	compile
 # test_dispatch 194 -> 8 (AITER's hipcc build of its CK module), test_publish 178 -> 17)
 gemm/bf16_n50016_k6144/test_gemm.py	1		same
 moe/router_sigmoid_bias_top16_e896_h7168/test_router.py	1		same
+moe/router_sigmoid_bias_top16_e896_h7168/test_aux_sort.py	1		same
 attention/nvfp4_sparse_decode_gqa16_d128_p128_top16/test_index_decode_ranks4.py	4
 sampling/batch_sharded_markov_v200064_h6144_r256_ranks4/test_batch_sharded.py	4
 decoder/dense_mxfp8_h6144_i3072_ranks4/test_decoder_ranks4.py	4

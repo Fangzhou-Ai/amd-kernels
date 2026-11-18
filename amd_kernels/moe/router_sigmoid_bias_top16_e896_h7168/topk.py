@@ -27,10 +27,10 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 E, TOPK, NQ, EPL = 896, 16, 4, 16
-RANK_UNROLL = 16  # candidates ranked per loop step (all loads first: the step costs one LDS latency)
+RANK_UNROLL = 32  # candidates ranked per loop step (all loads first: the step costs one LDS latency)
 MAXC = 64  # candidates the fast path ranks; one LDS slot each, plus EPL slots for the unselected elements
 ENT_WORDS = (MAXC + EPL) * 4  # LDS words per wave: per slot (key, tie rank << 16 | expert, sigmoid, -)
-LDS_WORDS = {"ent": ENT_WORDS, "tie": 64, "tex": 64, "tmask": 64}
+LDS_WORDS = {"ent": ENT_WORDS, "osig": TOPK + 1, "oid": TOPK + 1, "tie": 64, "tex": 64, "tmask": 64}
 PRELOAD_HINTS = {"llvm_options": {"amdgpu-kernarg-preload": True, "amdgpu-kernarg-preload-count": 16}}
 DPP_TREE = (0xB1, 0x4E, 0x141, 0x140, 0x142, 0x143)
 NEG_LOG2E = -1.44269504088896340736
@@ -94,22 +94,19 @@ def _lds_ptr(byte_addr):
     return llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), _ir(fx.Int64(byte_addr)))
 
 
-def topk_q_load(pr, br, lane, tok, i32_m, ks, slab_cm, q):
-    """Issue the loads of group ``q`` (the experts 256 q + 4 lane + j): the ``ks`` slab vectors and the bias."""
-    mask = (lane < 32) if q == NQ - 1 else None
-    parts = [Vec(buffer_ops.buffer_load(pr, (s * i32_m + tok) * E + 256 * q + 4 * lane, vec_width=4,
-                                        dtype=fx.Float32, mask=mask, cache_modifier=slab_cm))
-             for s in range_constexpr(ks)]
-    bv = Vec(buffer_ops.buffer_load(br, 256 * q + 4 * lane, vec_width=4, dtype=fx.Float32, mask=mask))
-    return parts, bv
-
-
-def topk_q_finish(st, lane, q, parts, bv):
-    """Group ``q``: the slab sum in slice order, AITER's sigmoid (rcp(1 + exp2(-log2(e) x)), the product in double), the
-    biased score and its order-preserving unsigned key, appended to ``st.sig`` / ``st.key`` (index 4 q + j)."""
+def topk_q_scores(pr, br, lane, tok, i32_m, ks, slab_cm, q):
+    """Group ``q`` (an int or a wave-uniform Int32: the experts 256 q + 4 lane + j): the ``ks`` slab vectors summed in slice
+    order, AITER's sigmoid (rcp(1 + exp2(-log2(e) x)), the product in double), the biased score and its order-preserving
+    unsigned key. Returns [(sigmoid, key)] for j = 0..3."""
+    dynamic = not isinstance(q, int)
+    valid = ((q != NQ - 1) | (lane < 32)) if dynamic else ((lane < 32) if q == NQ - 1 else None)
+    parts = [Vec(buffer_ops.buffer_load(pr, (s * i32_m + tok) * E + 256 * q + 4 * lane, vec_width=4, dtype=fx.Float32,
+                                        mask=valid, cache_modifier=slab_cm)) for s in range_constexpr(ks)]
+    bv = Vec(buffer_ops.buffer_load(br, 256 * q + 4 * lane, vec_width=4, dtype=fx.Float32, mask=valid))
     acc = parts[0]
-    for s in range_constexpr(1, len(parts)):
+    for s in range_constexpr(1, ks):
         acc = acc + parts[s]
+    out = []
     for j in range_constexpr(4):
         y = (fx.Float32(acc[j]).to(fx.Float64) * fx.Float64(NEG_LOG2E)).to(fx.Float32)
         y = (y > -126.0).select(y, fx.Float32(-126.0))  # exp2f's denormal range only ever rounds 1 + e to 1
@@ -117,8 +114,8 @@ def topk_q_finish(st, lane, q, parts, bv):
         sg = fx.Float32(fx.rocdl.rcp(T.f32, fx.Float32(1.0) + e))
         u = (sg + fx.Float32(bv[j])).bitcast(fx.Int32)
         k = fx.Uint32(u ^ ((u >> 31) | fx.Int32(-(2**31))))
-        st.sig.append(sg)
-        st.key.append((lane < 32).select(k, fx.Uint32(0)) if q == NQ - 1 else k)
+        out.append((sg, k if valid is None else valid.select(k, fx.Uint32(0))))
+    return out
 
 
 def topk_new(lane):
@@ -287,20 +284,22 @@ def topk_slow_out(st, smem, wv, lane):
     return rank, fx.Int32(own[2]), fx.Int32(own[3])
 
 
-def topk_finish(rank, valid, mysig, myid, lane, wr, ir, tok, i32_os, i32_scale):
-    """The ``valid`` lanes hold distinct ranks 0..: for slot r = 0..15 the lane ranked r hands its sigmoid and expert id to
-    lane r (read by lane index), and the sum runs in slot order; lanes 0-15 then write ``sigmoid * (scale / sum)``."""
-    total = fx.Float32(0.0)
-    out_sig = fx.Float32(0.0)
-    out_id = fx.Int32(0)
-    for r in range_constexpr(TOPK):
-        m = _ballot(valid & (rank == r))
-        j = _popcount((m & (fx.Int64(0) - m)) - fx.Int64(1))
-        s = fx.Int32(fx.rocdl.readlane(T.i32, mysig, j)).bitcast(fx.Float32)
-        i_ = fx.Int32(fx.rocdl.readlane(T.i32, myid, j))
-        total = s if r == 0 else total + s
-        out_sig = (lane == r).select(s, out_sig)
-        out_id = (lane == r).select(i_, out_id)
+def topk_finish(rank, valid, mysig, myid, lane, smem, wv, wr, ir, tok, i32_os, i32_scale):
+    """The ``valid`` lanes hold distinct ranks 0..: each hands its sigmoid and expert id to LDS slot ``rank``; lanes 0-15
+    read their slot, the sum of the 16 sigmoids runs in slot order (lane by lane), and lanes 0-15 write
+    ``sigmoid * (scale / sum)``. Returns (expert id, weight) of the lane."""
+    base = wv * (TOPK + 1)
+    slot = ((rank < TOPK) & valid).select(rank, fx.Int32(TOPK))
+    smem.osig.ptr[base + slot] = mysig.bitcast(fx.Float32)
+    smem.oid.ptr[base + slot] = myid
+    fx.rocdl.s_waitcnt(lgkmcnt=0)
+    fx.rocdl.sched_barrier(0)
+    out_sig = fx.Float32(smem.osig.ptr[base + lane % TOPK])
+    out_id = fx.Int32(smem.oid.ptr[base + lane % TOPK])
+    bits = out_sig.bitcast(fx.Int32)
+    total = fx.Int32(fx.rocdl.readlane(T.i32, bits, fx.Int32(0))).bitcast(fx.Float32)
+    for r in range_constexpr(1, TOPK):
+        total = total + fx.Int32(fx.rocdl.readlane(T.i32, bits, fx.Int32(r))).bitcast(fx.Float32)
     factor = i32_scale.bitcast(fx.Float32) / total
     w = (total > 0.0).select(out_sig * factor, fx.Float32(0.0))
     keep = lane < TOPK
@@ -317,6 +316,8 @@ def compile_router_sigmoid_bias_top16_e896(ks: int):
     @fx.struct
     class Shared:
         ent: fx.Array[fx.Int32, LDS_WORDS["ent"], 16]
+        osig: fx.Array[fx.Float32, LDS_WORDS["osig"], 16]
+        oid: fx.Array[fx.Int32, LDS_WORDS["oid"], 16]
         tie: fx.Array[fx.Int32, LDS_WORDS["tie"], 16]
         tex: fx.Array[fx.Int32, LDS_WORDS["tex"], 16]
         tmask: fx.Array[fx.Int32, LDS_WORDS["tmask"], 16]
@@ -333,9 +334,10 @@ def compile_router_sigmoid_bias_top16_e896(ks: int):
         wr = buffer_ops.create_buffer_resource_from_addr(arg_w, num_records_bytes=out_bytes)
         ir = buffer_ops.create_buffer_resource_from_addr(arg_ids, num_records_bytes=out_bytes)
         st = topk_new(lane)
-        loads = [topk_q_load(pr, br, lane, tok, i32_m, ks, 0, q) for q in range_constexpr(NQ)]
         for q in range_constexpr(NQ):
-            topk_q_finish(st, lane, q, *loads[q])
+            for sg, k in topk_q_scores(pr, br, lane, tok, i32_m, ks, 0, q):
+                st.sig.append(sg)
+                st.key.append(k)
         topk_pivot(st, smem, 0, lane)
         if st.nc <= MAXC:
             topk_fast_write(st, smem, 0, lane)
@@ -345,13 +347,13 @@ def compile_router_sigmoid_bias_top16_e896(ks: int):
             while e < st.nc:
                 rank = topk_rank_step(rank, e, st, smem, 0)
                 e = e + RANK_UNROLL
-            topk_finish(rank, lane < st.nc, st.mysig, st.myid, lane, wr, ir, tok, i32_os, i32_scale)
+            topk_finish(rank, lane < st.nc, st.mysig, st.myid, lane, smem, 0, wr, ir, tok, i32_os, i32_scale)
         else:
             ss = topk_slow_select(st)
             if ss.total_ties != ss.need:
                 topk_tie_masks(ss, smem, 0, lane)
             rank, mysig, myid = topk_slow_out(ss, smem, 0, lane)
-            topk_finish(rank, lane < TOPK, mysig, myid, lane, wr, ir, tok, i32_os, i32_scale)
+            topk_finish(rank, lane < TOPK, mysig, myid, lane, smem, 0, wr, ir, tok, i32_os, i32_scale)
 
     @flyc.jit
     def launch(arg_p: fx.Int64, arg_bias: fx.Int64, arg_w: fx.Int64, arg_ids: fx.Int64, i32_m: fx.Int32,

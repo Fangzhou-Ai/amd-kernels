@@ -9,7 +9,7 @@ import torch
 from amd_kernels.warm_up import entry
 
 from .aux import WORKSPACE_WORDS, aux_capacity
-from .kernel import CNT_STRIDE, MT_MAX, compile_router_e896_h7168, partial_bytes
+from .kernel import FLAG_WORDS, MT_MAX, compile_router_e896_h7168, partial_bytes
 from .reference import E, H, TOPK
 from .topk import compile_router_sigmoid_bias_top16_e896
 
@@ -72,13 +72,13 @@ _WORK: dict = {}
 
 
 def _workspace(device: torch.device, stream: int):
-    """The partial slabs, the tile counters (zero, never reset: each call adds one epoch to each) and the sort's masks
+    """The partial slabs, the arrival flags (zero, never reset: each call advances each by one) and the sort's masks
     and flags (flags carry the call's epoch) of one (device, stream)."""
     key = (device.index, stream)
     ws = _WORK.get(key)
     if ws is None:
         ws = (torch.empty(max(partial_bytes(MAX_M, ks) for ks, _, _ in CONFIG_BY_MT.values()), dtype=torch.uint8, device=device),
-              torch.zeros(16 * CNT_STRIDE // 4, dtype=torch.int32, device=device),
+              torch.zeros(FLAG_WORDS, dtype=torch.int32, device=device),
               torch.zeros(WORKSPACE_WORDS, dtype=torch.int32, device=device))
         _WORK[key] = ws
     return ws

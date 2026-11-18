@@ -88,6 +88,9 @@ def test_scale(params, m):
 @pytest.mark.parametrize("m", [3, 40, 192])
 def test_every_tile_config(params, monkeypatch, config, m):
     w, ws, bias = params
+    ks, wn, nrw = config
+    if 56 // (wn * nrw) * ks < 16 * host.m_tile_fragments(m):
+        pytest.skip("fewer workgroups than tokens")
     monkeypatch.setitem(host.CONFIG_BY_MT, host.m_tile_fragments(m), config)
     host._WORK.clear()
     x = torch.randn(m, H, device="cuda").to(torch.bfloat16)
