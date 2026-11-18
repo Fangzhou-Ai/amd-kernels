@@ -5,6 +5,7 @@
 import functools
 
 import flydsl.expr as fx
+from flydsl._mlir import ir as _ir
 import torch
 from flydsl._mlir.dialects import arith as _arith
 from flydsl._mlir.dialects import llvm as _llvm
@@ -49,6 +50,14 @@ def maxnum(a, b):
     return fx.Float32(_arith.MaxNumFOp(fx.as_ir_value(a), fx.as_ir_value(b)).result)
 
 
+def tree_absmax(vals):
+    """max |v| of a list of fp32, as a balanced tree (a short dependent chain)."""
+    a = [fx.math.absf(v) for v in vals]
+    while len(a) > 1:
+        a = [maxnum(a[i], a[i + 1]) if i + 1 < len(a) else a[i] for i in range(0, len(a), 2)]
+    return a[0]
+
+
 def _dpp(src, ctrl, old=None, bank_mask=0xF):
     o = _llvm.mlir_undef(T.i32) if old is None else fx.as_ir_value(old)
     full = old is None and bank_mask == 0xF
@@ -73,6 +82,23 @@ def row_max(x):
     """Max over the 16 lanes of a DPP row, in every lane."""
     for m in (1, 2, 4, 8):
         x = maxnum(x, xor_lane(bits(x), m).bitcast(fx.Float32))
+    return x
+
+
+def _swap(v, op):
+    pair_ty = _ir.Type.parse("!llvm.struct<(i32, i32)>")
+    res = op(pair_ty, fx.as_ir_value(v), fx.as_ir_value(v), False, False)
+    return fx.Int32(_llvm.extractvalue(T.i32, res, [0])), fx.Int32(_llvm.extractvalue(T.i32, res, [1]))
+
+
+def wave_allsum(x):
+    """Sum over the 64 lanes of a wave in every lane, without LDS or SGPR hops (DPP xor 1..8, permlane16/32 swaps).
+    Every lane adds the same operands in the same order, so all lanes hold the same bits."""
+    for m in (1, 2, 4, 8):
+        x = x + xor_lane(bits(x), m).bitcast(fx.Float32)
+    for op in (_rocdl_ops.permlane16_swap, _rocdl_ops.permlane32_swap):
+        a, b = _swap(bits(x), op)
+        x = a.bitcast(fx.Float32) + b.bitcast(fx.Float32)
     return x
 
 
