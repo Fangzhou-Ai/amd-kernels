@@ -31,6 +31,7 @@ HIST = HPAD + 64  # + one dummy word a lane, for keys outside the round's prefix
 NUM_REC = 0x7FFFF000
 import os
 SKIP = int(os.environ.get('KK_SKIP', '0'))
+FENCE_SCOPE = os.environ.get('KK_FENCE', 'wavefront')  # the select's LDS exchanges stay inside one wave
 
 
 def chunk_parts(rows: int, uniform: bool = False, timing: bool = False, sync: bool = False):
@@ -105,7 +106,7 @@ def chunk_parts(rows: int, uniform: bool = False, timing: bool = False, sync: bo
             fx.copy(lds_copy4, reg, fx.make_view(fx.add_offset(field.ptr, idx), fx.make_layout(4, 1)))
 
         def fence():
-            fx.memory_fence(ordering=fx.AtomicOrdering.AcqRel, syncscope="workgroup")
+            fx.memory_fence(ordering=fx.AtomicOrdering.AcqRel, syncscope=FENCE_SCOPE)
 
         def hist_scan(wb, need):
             """The bin holding the ``need``-th largest key of the histogram at ``wb`` (a lane's 32 bins: 8 vector reads,
@@ -293,9 +294,6 @@ def chunk_parts(rows: int, uniform: bool = False, timing: bool = False, sync: bo
 
             tk, listed, chunk_max, chunk_min, total = I(INT_MIN), nvalid, I(INT_MIN), I(INT_MAX), I(0)
             if nvalid > cap:
-                for jj in range(0, nblk, 1):
-                    buffer_ops.buffer_store(lds_load4(smem.keys, region + I(jj) * 256 + lane * 4), full,
-                                            row * FULL_STRIDE + cc * cb + I(jj) * 256 + lane * 4, cache_modifier=CM)
                 chunk_max, chunk_min, smax_, smin_ = stats_pass()
                 kt, ties, tk, listed = threshold(wb, region, nblk, tb, cap, smax_, smin_)
                 stamp(4)
@@ -309,6 +307,10 @@ def chunk_parts(rows: int, uniform: bool = False, timing: bool = False, sync: bo
                 buffer_ops.buffer_store(fx.Vector.from_elements([tk, (nvalid << 16) | listed, chunk_max, chunk_min], dtype=I), meta, (row * NCH_MAX + cc) * 4, cache_modifier=CM)
                 if cc == 0:
                     buffer_ops.buffer_store(fx.Vector.from_elements([cb, nch, b, I(0)], dtype=I), info, row * 4, cache_modifier=CM)
+            if nvalid > cap:
+                for jj in range(0, nblk, 1):
+                    buffer_ops.buffer_store(lds_load4(smem.keys, region + I(jj) * 256 + lane * 4), full,
+                                            row * FULL_STRIDE + cc * cb + I(jj) * 256 + lane * 4, cache_modifier=CM)
 
         if (tile * rows < count) & ((c * cb < max_end) | (c == 0)):
             stamp(0)

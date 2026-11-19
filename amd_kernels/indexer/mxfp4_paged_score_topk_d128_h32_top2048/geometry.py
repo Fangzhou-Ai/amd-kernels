@@ -19,18 +19,18 @@ CHUNK_MAX = 2048
 CHUNK_STEP = 512
 CHUNKS_TARGET = 40  # default chunks a sequence is cut into (the host may ask for fewer, see host.plan)
 NCH_MAX = 64  # CHUNK_MAX chunks cover 131072 keys, 1 Mi tokens at DCP8
-POOL = 20480
+POOL = 8192  # entries of a row's pool at most: four 2048-entry blocks of the merge
 QMAX = 6  # query rows a sequence may have
 MAX_ROWS = 256  # rows one call may hold
 INFO_OFFSET = MAX_ROWS * NCH_MAX * 16  # bytes: the per-row records follow the meta plane
-OVF_KEYS = 7 * 2048  # keys of chunks the merge reads whole
+LIST_FLOOR = 64  # keys a list keeps at least: at most ~33 chunks can hold selected keys beyond their lists
 COUNTER_BYTES = 256  # a (sequence, row tile)'s ready and consumer counts: a cache line pair of their own
 COUNTER_GROUPS = 1024  # (sequence, row tile) groups a call may hold
 FULL_STRIDE = NCH_MAX * CHUNK_MAX  # a row's plane of all scores of its truncated chunks
 import os
 TBDIV = int(os.environ.get('KK_TBDIV', '4'))
 SPREAD = int(os.environ.get('KK_SPREAD', '2688'))  # list keys a sequence's chunks share when its selected keys spread evenly (1.3 x TOPK)
-POOL_TARGET = 12288  # entries a pool is cut to where the exactness bound below allows
+POOL_TARGET = POOL  # entries a pool is cut to
 
 
 def chunk_size(max_end: int, target: int = CHUNKS_TARGET) -> int:
@@ -46,8 +46,7 @@ def num_chunks(max_end: int, cb: int) -> int:
 def list_size(nch: int, cb: int) -> int:
     """Keys a chunk list keeps: a quarter of the chunk, cut to the pool target, but at least ``floor`` so that the
     chunks which can hold selected keys beyond their list (at most 2047 // list size) fit the overflow."""
-    slots = OVF_KEYS // cb
-    floor = -(-(2047 // (slots + 1) + 1) // 32) * 32
+    floor = LIST_FLOOR
     pool = (POOL_TARGET - cb) // max(nch - 1, 1) * 8 // 9 // 32 * 32 if nch > 1 else cb
     want = max(cb // TBDIV // 32 * 32, 32, SPREAD // max(nch, 1) // 32 * 32)
     return min(max(floor, min(want, pool)), cb)
@@ -61,8 +60,7 @@ def chunk_size_rt(max_end, target):
 
 def list_size_rt(nch, cb):
     """``list_size`` on kernel values."""
-    slots = I(OVF_KEYS) // cb
-    floor = ((I(2047) // (slots + 1) + 1 + 31) // 32) * 32
+    floor = I(LIST_FLOOR)
     pool = ((I(POOL_TARGET) - cb) // fx.max(nch - 1, I(1)) * 8 // 9 // 32) * 32
     pool = (nch > 1).select(pool, cb)
     want = fx.max(fx.max(cb // TBDIV // 32 * 32, I(32)), I(SPREAD) // fx.max(nch, I(1)) // 32 * 32)

@@ -28,7 +28,7 @@ from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import T
 
 from ._wave import SC1, AtomicBinOp, atomic_agent, carve, layout, popcount, F, I, I64, INT_MAX, INT_MIN, ballot, inclusive_scan, key_to_float, now, readlane, store_lds, vop, wave_reduce
-from .geometry import COUNTER_BYTES, FULL_STRIDE, INFO_OFFSET, NCH_MAX, OVF_KEYS, POOL, TOPK, list_size_rt, slot_size
+from .geometry import COUNTER_BYTES, FULL_STRIDE, INFO_OFFSET, NCH_MAX, POOL, TOPK, list_size_rt, slot_size
 
 NT = 512
 NWAVES = NT // 64
@@ -73,7 +73,7 @@ def merge_parts(blocks: int, uniform: bool = False, timing: bool = False, sync: 
     BLOCKS = blocks
     CM = (SC1 if os.environ.get('KK_CM', '1') == '1' else 0) if sync else 0  # loads of what chunk workgroups of other XCDs stored: coherent
     OFFS, WORDS = layout(bins=2 * BUF, scan=NWAVES + 1, acc=32, sidx=TOPK + NT + 4, sval=TOPK + NT + 4,
-                         ckey=NCAND + NT, cidx=NCAND + NT, cof=32)
+                         ckey=NCAND + NT, cidx=NCAND + NT, cof=64)
 
     @flyc.jit
     def role(smem, row, arg_qsl: fx.Int64, arg_keys: fx.Int64, arg_idx: fx.Int64, arg_meta: fx.Int64, arg_full: fx.Int64,
@@ -125,7 +125,7 @@ def merge_parts(blocks: int, uniform: bool = False, timing: bool = False, sync: 
             nb_, cb_, nkeys, full_ = st
             e0 = I(s_) * (NT * 4) + tid * 4
             ok = e0 < nkeys
-            q = fx.min(e0 // cb_, I(31))
+            q = fx.min(e0 // cb_, I(63))
             at = I(smem.cof.ptr[q]) * cb_ + (e0 - q * cb_)
             v4 = fx.Vector(buffer_ops.buffer_load(full_, at, vec_width=4, dtype=I, mask=ok, cache_modifier=CM))
             return [ok.select(I(v4[k]), I(INT_MIN)) for k in range(4)], at
@@ -421,7 +421,7 @@ def merge_parts(blocks: int, uniform: bool = False, timing: bool = False, sync: 
             else:
                 nsat = I(fx.math.ctpop(m).to(I))
                 if wave == 0:
-                    for q, sq in range(0, 32, 1, init=[m]):
+                    for q, sq in range(0, nsat, 1, init=[m]):
                         left = I64(sq[0])
                         if left != 0:
                             if lane == 0:

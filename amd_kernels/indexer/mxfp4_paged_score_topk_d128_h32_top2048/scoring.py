@@ -28,7 +28,7 @@ DEPTH = int(_os.environ.get('KK_DEPTH', '0'))  # 0: by the rows of the tile (1 f
 SPEC_SIZES = (512, 1024, 1536, 2048)
 import os
 SC = int(os.environ.get('KK_SC', '0'))
-TAG = f"s{SC}d{DEPTH}"  # experiment switches: part of the kernel names
+TAG = f"s{SC}d{DEPTH}k{_os.environ.get('KK_SKIP', '0')}"  # experiment switches: part of the kernel names
 
 
 @dataclass

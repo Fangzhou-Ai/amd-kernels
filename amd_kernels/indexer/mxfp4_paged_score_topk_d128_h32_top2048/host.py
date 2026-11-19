@@ -16,6 +16,7 @@ from .geometry import (CHUNK_MAX, CHUNKS_TARGET, MAX_ROWS, NCH_MAX, QMAX, TOPK, 
 
 HEADS = 32
 _FORCE = None
+_NOMERGE = False  # experiments: launch the chunk workgroups only
 _WIDE_BATCH = 16  # sequences above which a workgroup scores all rows of a sequence
 PAGE = 64
 
@@ -80,8 +81,8 @@ def _chunk_exe(rows: int, uniform: bool = False, timing: bool = False):
     return _lists.compile_chunk_lists(rows, uniform, timing)
 
 
-BLOCK_TIERS = (3, 6, 10)  # pool blocks the merge kernel holds: its variants
-TIER_WIDTHS = (16384, 65536, 131072)  # the widest block table of each
+BLOCK_TIERS = (2, 3, 4)  # pool blocks the merge kernel holds: its variants
+TIER_WIDTHS = (8192, 16384, 131072)  # the widest block table of each
 
 
 @functools.cache
@@ -152,7 +153,7 @@ def _score_topk(
         _run_compiled(_fused_exe(tile, blocks, uniform, dbg is not None), *common, keys.data_ptr(), pos.data_ptr(),
                       meta.data_ptr(), full.data_ptr(), cnt.data_ptr(), out_indices.data_ptr(), out_scores.data_ptr(),
                       *geom, nch, max_query_len, target, out_indices.stride(0), out_scores.stride(0), tiles, tile,
-                      batch * nch * tiles, dbg_ptr, batch * nch * tiles + rows, stream)
+                      batch * nch * tiles, dbg_ptr, batch * nch * tiles + (0 if _NOMERGE else rows), stream)
         return
     _run_compiled(_chunk_exe(tile, uniform, dbg is not None), *common, keys.data_ptr(), pos.data_ptr(), meta.data_ptr(),
                   full.data_ptr(), *geom, nch, max_query_len, target, dbg_ptr, batch * nch * tiles, stream)
