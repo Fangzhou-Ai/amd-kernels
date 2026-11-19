@@ -149,7 +149,7 @@ def test_top16_edge_scores():
 def test_back_to_back_calls_repeat_bits(params):
     """The slab parity tag: calls of different M (same and other row tiles) back to back, new weights and activations each
     time, never read a word of an older call: every call's bits equal the first call of the same inputs."""
-    w, ws, bias = params
+    _w, ws, bias = params
     g = torch.Generator(device="cuda").manual_seed(3)
     xs = {m: torch.randn(m, H, device="cuda", generator=g).to(torch.bfloat16) for m in (12, 17, 32, 33, 80, 192, 1)}
     first = {m: router_sigmoid_bias_top16_e896_h7168(x, ws, bias, shuffled=True) for m, x in xs.items()}

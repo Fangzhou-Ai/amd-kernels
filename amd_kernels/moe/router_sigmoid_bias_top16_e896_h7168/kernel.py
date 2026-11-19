@@ -26,7 +26,7 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T, Vector as Vec
 
 from .reference import E as N, H as K
-from .aux import (EPOCH_BASE, IDS_WORDS, MASK_BYTES, MASK_WORDS, NE, aux_counts, aux_expert_blocks, aux_max_blocks, aux_pair_row, aux_prefill, aux_publish_cum,
+from .aux import (EPOCH_BASE, IDS_WORDS, NE, aux_counts, aux_expert_blocks, aux_max_blocks, aux_pair_row, aux_prefill, aux_publish_cum,
                   aux_zero_masks, lds_or, mask_words)
 from .topk import (LDS_WORDS, MAXC, NQ, RANK_UNROLL, TOPK, _ballot, _popcount, topk_fast_write, topk_new, topk_pivot, topk_q_keys,
                    topk_rank_start, topk_rank_step, topk_slow_out, topk_slow_select,
@@ -34,7 +34,6 @@ from .topk import (LDS_WORDS, MAXC, NQ, RANK_UNROLL, TOPK, _ballot, _popcount, t
 
 SC1 = 0x10  # agent-scope (cross-XCD) stores and loads of the slabs and counters
 FLAG_WORDS = 256  # one flag word per workgroup (a call advances each by one)
-import os
 POLL_SLEEP = 1  # s_sleep units (64 clocks) between two polls of the slabs
 NB = K // 64  # 112 K blocks
 NWV = 4
@@ -107,7 +106,6 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
     assert NWV % WN == 0 and N // 16 % NF == 0 and (NF * 2) % NWV == 0
     assert 1 <= MT <= MT_MAX and NB % KS == 0 and (not FUSED or GRID >= 16 * MT) and (MS == 1 or WCNT % 8 == 0) and GRID <= FLAG_WORDS  # a token a workgroup; a pair of row splits on one XCD
     NBK = NB // KS  # K blocks per workgroup
-    MR = 16 * MT
     MR_ALLOC = slab_rows(MT, WN, MS)
     IDS_VECS = (192 * TOPK + 255) // 256  # vectors of 4 ids a lane loads
     MWORDS = mask_words(16 * MT)  # words of an expert's token mask

@@ -19,7 +19,7 @@ import torch
 
 os.environ.setdefault("VLLM_ROCM_USE_AITER", "1")
 
-from amd_kernels.moe.router_sigmoid_bias_top16_e896_h7168 import host, router_sigmoid_bias_top16_e896_h7168, shuffle_weight
+from amd_kernels.moe.router_sigmoid_bias_top16_e896_h7168 import host, router_sigmoid_bias_top16_e896_h7168
 from amd_kernels.moe.router_sigmoid_bias_top16_e896_h7168.reference import E, H, TOPK
 
 HBM_TBPS = 7.0

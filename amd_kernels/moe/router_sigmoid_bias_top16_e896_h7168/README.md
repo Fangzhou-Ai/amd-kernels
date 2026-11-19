@@ -8,51 +8,48 @@ One launch: `topk_weights fp32 [M, 16]`, `topk_ids int32 [M, 16]` from `x bf16 [
 (`register_presorted_moe`: sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, m_indices,
 reverse_sorted) and the zeroed [M, 3584] bf16 buffer the atomic stage 2 accumulates into.
 
-Contract (`reference.py`): logits = the bf16 products summed in fp32 (fp64 in the reference: the kernel's split-K sum order
-differs, logits agree to ~1e-6); the top-16 is bit for bit `aiter.biased_grouped_topk` on the same logits (the
-`topk_reg_kernel` serving runs): ids, slot order (choice descending, AITER's tie rank for equal choices), and weights
-`sigmoid * (scale / sum)` with the 16-term sum in slot order. The sort is deterministic (rows of an expert in ascending
-(token, slot) order, padding rows: token id M, weight 0, m_indices M; AITER's own sort orders an expert's rows by LDS
-atomics) and bit for bit `moe_sort_reference`. Two runs give the same bits; no atomic adds into outputs (the sort's
-token masks are bitwise ORs). Layouts of W: `row` (the checkpoint's) or `shuf` (a bit-exact permutation made once at
-load: one DMA reads 1 KB in one piece).
+Contract (`reference.py`): the top-16 is bit for bit `aiter.biased_grouped_topk` (the `topk_reg_kernel` serving runs) on
+the logits the kernel sums (bf16 products in fp32, split-K slabs added in slice order, each slab word with its lowest
+mantissa bit cleared: <= 1 ulp per slab; `router_logits` returns exactly these): ids, slot order (AITER's tie rank for
+equal choices) and weights `sigmoid * (scale / sum)`. The sort is deterministic (an expert's rows in ascending token
+order; padding rows: token id M, weight 0, m_indices M) and bit for bit `moe_sort_reference`. Two runs give the same bits.
+W layouts: `row` (the checkpoint's) or `shuf` (`shuffle_weight`, a bit-exact permutation made once at load).
 
-Design: 196 workgroups each stream a (column tile x K slice) of W and the activations through LDS (DMA) into MFMA
-(v_mfma_f32_16x16x32_bf16), store fp32 partials, and arrive on their tile's counter. Workgroup t < M then takes token t:
-it polls the counters of the tiles holding each 256-expert group, loads the slab sums, and selects the top-16 in one wave
-(pivot = the smallest row-of-16-lanes 4th-largest lane maximum; the keys at or above it, 16-70 of 896, are ranked
-against each other in LDS; a plateau of exact ties takes a sort + 16-round slow path). With `aux` every token's wave then
-ORs its bit into one 256-bit mask per routed expert, waits for all token flags and derives its rows from the masks.
+Design: 224 workgroups (CONFIG_BY_MT in `host.py`: K splits x 2 row splits above 48 rows) stream a (column tile x K slice)
+of W and x through LDS (DMA ring, whole slice in flight) into MFMA and store fp32 slabs whose lowest bit carries the
+call's parity (no arrival flag: the previous call's words, never an older one's, carry the other parity). Workgroup t < M
+takes token t: its four waves load the token's slab words (one 256-expert group each) until every word has this call's
+parity, then sigmoid + keys, an LDS exchange and one wave's top-16 (pivot, 16-70 candidates ranked in LDS; exact-tie
+plateaus take a sort + 16-round slow path). `aux`: each token's ids are published tagged, every token wave loads all ids,
+ORs them into expert masks in LDS and writes its 16 rows.
 
 ## Entry points
 - `router_sigmoid_bias_top16_e896_h7168`: the router (x, W, bias, routed_scaling_factor, optional `out`, `shuffled`,
-  optional `aux`); an `amd_kernels.warm_up` entry, the first call of each mode compiles every row-tile variant.
-- `make_aux`: the sort's output tensors of one M (AITER's capacity).
-- `shuffle_weight`, `shuffle_weight_` (in place), `unshuffle_weight`: the `shuf` layout; replace the parameter once
-  before graph capture.
-- `router_logits`, `top16`: the GEMM half (summed logits) and the top-16 launch alone, for tests and benchmarks.
-- `supports`: whether a weight is the [896, 7168] bf16 contiguous gate and the bias the fp32 [896].
-
-`host.py` holds the row-tile -> (K splits, tile shape) table; `kernel.py` the launch, `topk.py` the top-16 stages,
-`aux.py` the sort.
+  optional `aux`); an `amd_kernels.warm_up` entry: the first call of each mode compiles every row-tile variant.
+- `make_aux`: the sort's output tensors of one M (AITER's capacity; `moe_buf` None skips the zeroing).
+- `shuffle_weight`, `shuffle_weight_` (in place), `unshuffle_weight`: the `shuf` layout (replace the parameter once).
+- `router_logits`, `top16`: the GEMM half and the top-16 launch alone, for tests and benchmarks; `supports`.
+One call at a time per stream (the workspace holds the epoch words); CUDA-graph safe, no atomics into outputs.
 
 ## Performance
-One launch, graph replay, cold weights (24 copies), MI355X GPU 1, us. Stock = hipBLASLt `mm(out_dtype=fp32)` +
-`aiter.biased_grouped_topk`. Ceiling = launch floor (1.76) + cold HBM stream of W (12.8 MB, ~3.7 us in a graph) + flag
-hand-off and the minimal top-16 chain (~2.3 us), ~8 us at M=12, growing with the per-CU ingestion limit at large M.
+MI355X, graph, cold W (24 copies), min of 15, us (`benchmark_router.py`; launch floor 1.73). stock = hipBLASLt mm + AITER.
+`skel` = the same kernel with no MFMAs and no top-16 (the measured critical path of the hand-off), `stream` = the weight
+stream alone; %skel = skel / fused, %HBM = (12.8 MB at 7.0 TB/s + launch) / fused.
 
-| M | stock | fused | speedup | % of ceiling (est.) |
-|---|---|---|---|---|
-| 12 | 15.7 | 9.9 | 1.58x | ~80 |
-| 24 | 15.4 | 10.6 | 1.46x | ~76 |
-| 40 | 15.4 | 11.3 | 1.37x | ~74 |
-| 65 | 17.2 | 12.9 | 1.34x | ~70 |
-| 80 | 19.1 | 13.6 | 1.40x | ~70 |
-| 128 | 19.4 | 16.2 | 1.20x | ~70 |
-| 192 | 21.3 | 20.0 | 1.07x | ~65 |
+| M | cfg | stock | fused | +aux | speedup | stream | skel | %skel | %HBM |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 16:4:1 | 16.7 | 6.8 | 9.0 | 2.45x | 4.4 | 5.7 | 83 | 52 |
+| 12 | 16:4:1 | 15.5 | 7.6 | 10.2 | 2.04x | 4.4 | 6.0 | 78 | 47 |
+| 24 | 16:4:1 | 15.4 | 8.0 | 11.0 | 1.93x | 4.4 | 6.5 | 81 | 45 |
+| 40 | 16:4:1 | 15.4 | 8.5 | 12.1 | 1.81x | 4.4 | 7.1 | 83 | 43 |
+| 65 | 8:4:1:2 | 17.2 | 9.4 | 13.3 | 1.82x | 4.7 | 7.8 | 82 | 39 |
+| 80 | 8:4:1:2 | 19.4 | 9.5 | 13.5 | 2.05x | 4.7 | 8.1 | 85 | 39 |
+| 128 | 8:4:1:2 | 19.3 | 11.0 | 14.6 | 1.75x | 4.7 | 9.3 | 84 | 35 |
+| 192 | 8:4:1:2 | 21.4 | 12.6 | 16.8 | 1.70x | 4.7 | 10.6 | 84 | 31 |
 
-Not yet within 10% of the ceiling: the consumer tail (flag detect ~1.2 us, slab load ~1 us, pivot/rank/finish ~2 us)
-and, at large M, the per-CU DMA ingestion bound remain. `aux` adds ~1 us. Attempts are logged in the analysis report.
+Not within 10% of the ceiling at any tier (78-85% of `skel`, which still lacks the ~1.6 us top-16 chain): the tail after
+the last slab lands (store visibility + poll ~1.3 us, token chain ~2.0 us) and, from M=65, the L2 -> LDS bytes of the
+tiles (x is re-read by every column tile) remain. Timelines, floors and the log of attempts: analysis/kernels/.
 
 ## Tests
 - `python3 -m pytest tests/moe/router_sigmoid_bias_top16_e896_h7168 -q`
