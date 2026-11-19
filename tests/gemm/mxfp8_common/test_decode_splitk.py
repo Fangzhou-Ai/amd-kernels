@@ -71,7 +71,8 @@ def test_rows_fit_one_resident_grid():
                                                   config.waves_m, config.split_k)
             assert grid <= SK.GRID_MAX and n_mb == -(-m // config.tile_m), (n, k, m, config)
             assert counters <= SK.GRID_MAX // 2 * 8 * SK.CNT_STRIDE
-            assert G.prequant_code_tile_rows(m, n, k) == config.tile_m
+            with _caller(n, k):
+                assert G.prequant_code_tile_rows(m, n, k) == config.tile_m
 
 
 def _launchers(shape):
