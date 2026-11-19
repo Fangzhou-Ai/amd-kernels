@@ -14,10 +14,9 @@ F1 (row, me) at d; when F1 of all seven peers shows this call's epoch it adds th
 order 0..7 in fp32 (its own from registers) and rounds once to bf16 (the latent). It also does the norm's elementwise
 part once for everyone: hop 2 pushes ``xn = bf16(latent * w_norm)`` into the ``lat`` buffer of all eight ranks (itself
 included) and the row's sum of squares of its slice into ``lat``'s side array ``ssq[row][me]``; after the workgroup's
-waves have all had their stores acknowledged one lane raises F2 (rb, me) at every rank. An up-projection workgroup
-leaves its wait when F2 (rb, o) of every row block and owner shows the epoch, so a finished kernel has the whole
-reduced, scaled latent in its own ``lat`` and every owner has finished reading its inbox, which a peer's next call
-writes. Epochs are private per workgroup (one word each, read at the start and written at the end by the same
+wave has had its stores acknowledged it raises F2 (row, me) at every rank. An up-projection workgroup leaves its wait
+when F2 (row, o) of its rows and every owner shows the epoch, so a finished kernel has the whole reduced, scaled latent
+in its own ``lat`` and every owner has finished reading its inbox, which a peer's next call writes. Epochs are private per workgroup (one word each, read at the start and written at the end by the same
 workgroup): every workgroup of the fixed grid runs once per call and every rank makes the same calls, so all epochs equal
 the call count. No input address is exchanged: eager and graph calls are the same.
 
@@ -63,7 +62,7 @@ KSTEPS = KW // 32  # 14
 XROW = KW * 2 + 16  # LDS bytes of a staged row slice: 57 packs of 16 B, so 16 rows hit 16 different bank groups
 LINE = 128
 F1 = 0  # F1 (row, source): MAX_ROWS x WORLD words
-F2 = MAX_RB * LINE  # F2 (rb, owner): one line per row block
+F2 = MAX_RB * LINE  # F2 (row, owner): MAX_ROWS x WORLD words
 INBOX = 2 * MAX_RB * LINE
 INBOX_BYTES = WORLD * MAX_ROWS * SL * 2
 BUF_BYTES = INBOX + INBOX_BYTES
@@ -109,7 +108,7 @@ def mfma_wait(v):
 def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False):
     """``mpg``: 16-token tiles of an m group (rows <= 64 mpg); ``ts``: each workgroup stores ``s_memrealtime`` (10 ns) stamps
     of its phases into ``arg_ts`` ([workgroup][wave][8] words, a profiling build)."""
-    assert mode in ("fused", "ar", "up") and 1 <= mpg <= MAX_MT // GROUPS and rb in (2, 4, 8)
+    assert mode in ("fused", "ar", "up") and 1 <= mpg <= (MAX_MT + GROUPS - 1) // GROUPS and rb in (2, 4, 8)
     do_ar, do_up = mode != "up", mode != "ar"
     RB = rb
     UP0 = MAX_RB if mode == "fused" else 0  # first up-projection workgroup
@@ -167,10 +166,9 @@ def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False):
                 buffer_ops.buffer_store(fx.Int64(t).to(fx.Int32), at(arg_ts, 1 << 26), (bid * NWAVES + wave) * 8 + k,
                                         mask=lane == 0)
 
-        def send_done(rb, e):
-            """F2 (rb, me) = e at every rank (the first eight lanes): row block ``rb`` of this owner's slice has landed."""
-            if (wave == 0) & (lane < WORLD):
-                flag_store(sel8(lane, bs) + F2 + fx.Int64(rb) * LINE + fx.Int64(i32_me) * 4, e)
+        def send_done(row, e):
+            """F2 (row, me) = e at every rank (the first eight lanes): this owner's slice of ``row`` has landed."""
+            flag_store(sel8(lane, bs) + F2 + (fx.Int64(row) * WORLD + fx.Int64(i32_me)) * 4, e)
 
         def ar_role(rb):
             e = epoch(rb)
@@ -223,13 +221,11 @@ def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False):
                     buffer_ops.buffer_store(ssq, lat, (LAT_BYTES // 4) + row * WORLD + i32_me,
                                             mask=(lane == 63) & wrow, cache_modifier=SYS)
                 fx.rocdl.s_waitcnt(vmcnt=0)
-                fx.gpu.barrier()
                 stamp(5)
-                send_done(rb, e)
-                if const_expr(mode == "ar"):
-                    if (wave == 0) & (lane < WORLD):
-                        spin_load(mine + F2 + fx.Int64(rb) * LINE + fx.Int64(lane) * 4, e)
-                    fx.gpu.barrier()
+                if (lane < WORLD) & wrow:
+                    send_done(row, e)
+                    if const_expr(mode == "ar"):
+                        spin_load(mine + F2 + (fx.Int64(row) * WORLD + fx.Int64(lane)) * 4, e)
             buffer_ops.buffer_store(e, cr, rb, mask=tx == 0)
             stamp(6, True)
 
@@ -258,12 +254,29 @@ def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False):
                 zero = fx.Int32(i32_zero).bitcast(fx.Float32)
                 stamp(1, True)
                 if const_expr(mode == "fused"):
-                    # no workgroup barrier: wave w waits for what it will read, owner w's slice of every row block
-                    # (the waves that hold the epilogue threads wait for every owner's sums of squares too)
-                    for j in range(0, (i32_nrb * WORLD + 63) // 64):
-                        idx = lane + 64 * j
-                        if (idx < i32_nrb * WORLD) & ((wave < mpg) | (idx % WORLD == wave)):
-                            spin_load(mine + F2 + fx.Int64(idx // WORLD) * LINE + fx.Int64(idx % WORLD) * 4, e2)
+                    # wave 0 loads this group's F2 (row, owner) flags together and re-reads them until all show this
+                    # call's epoch, then the workgroup goes on
+                    f2 = at(mine + F2, MAX_ROWS * WORLD * 4)
+                    nrows = ((i32_m - m0 < mpg * 16).select(i32_m - m0, fx.Int32(mpg * 16)))
+
+                    def poll_f2():
+                        miss = fx.Int32(0)
+                        for j in range_constexpr(mpg * 16 * WORLD // 64):
+                            idx = lane + 64 * j
+                            need = idx < nrows * WORLD
+                            v = fx.Int32(buffer_ops.buffer_load(f2, (m0 + idx // WORLD) * WORLD + idx % WORLD,
+                                                                vec_width=1, dtype=fx.Int32, mask=need,
+                                                                cache_modifier=SYS))
+                            miss = miss | (need & ((v - e2) < 0)).select(fx.Int32(1), fx.Int32(0))
+                        return miss
+
+                    if wave == 0:
+                        miss = poll_f2()
+                        while miss != 0:
+                            fx.rocdl.s_sleep(1)
+                            llvm.inline_asm(None, [], "", "~{memory}", has_side_effects=True)
+                            miss = poll_f2()
+                    fx.gpu.barrier()
                 stamp(2)
 
                 red = lds + NWAVES * 16 * XROW  # the waves' accumulators meet here
