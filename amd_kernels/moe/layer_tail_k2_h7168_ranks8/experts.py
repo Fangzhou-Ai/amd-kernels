@@ -570,6 +570,21 @@ def batch_on(c):
     return c.get("batch", False)
 
 
+def lq_row(pad):
+    """LDS words of a token row of the quantized latent: 4 more than a multiple of the 32 banks, so the 16 token
+    lanes of a ``ug`` operand read hit different banks (measured: 12 us of the chain-only skeleton)."""
+    return LAT // 8 + (4 if pad else 0)
+
+
+def ls_row(pad):
+    return LAT // 32 + (1 if pad else 0)
+
+
+def ip_row(pad):
+    """LDS words of a pick's INTER row (the same bank rule for ``down``'s operand reads)."""
+    return 48 + (4 if pad else 0)
+
+
 RANK_UNROLL = 8  # (``plan.k2sync``) candidates compared a round
 
 
@@ -918,8 +933,9 @@ def load_latq4(c):
     for i in range_constexpr(its):
         if tid + THREADS * i < nblk:
             v = fx.Vector.from_elements(got[3 * i] + got[3 * i + 1], fx.Int32)
-            fx.ptr_store(v, c["latq"] + ws[i])
-            fx.ptr_store(got[3 * i + 2][0], c["latsc"] + bs[i])
+            tq_, bq_ = bs[i] // (LAT // 32), bs[i] % (LAT // 32)
+            fx.ptr_store(v, c["latq"] + (tq_ * lq_row(c["pad"]) + bq_ * 4))
+            fx.ptr_store(got[3 * i + 2][0], c["latsc"] + (tq_ * ls_row(c["pad"]) + bq_))
     gpu.barrier()
 
 
@@ -1045,12 +1061,12 @@ def stage_ug(c, task, ops):
         st = steps[i]
         bw = fx.Vector(
             fx.ptr_load(
-                c["latq"] + (t * (LAT // 8) + st * 16 + kb * 4),
+                c["latq"] + (t * lq_row(c["pad"]) + st * 16 + kb * 4),
                 result_type=fx.Vector.make_type(4, fx.Int32),
             )
         )
         if const_expr(few):
-            sb = fx.ptr_load(c["latsc"] + (t * (LAT // 32) + st * 4 + kb))
+            sb = fx.ptr_load(c["latsc"] + (t * ls_row(c["pad"]) + st * 4 + kb))
         else:
             sb = (fx.ptr_load(c["latsc"] + (t * (LAT // 128) + st)) >> (kb * 8)) & 0xFF
         # the code's byte (st % 2) 2 + rg % 2 of the word; rg % 2 is the wave's
@@ -1122,7 +1138,10 @@ def load_inter(c):
         gc = None
     for i in range_constexpr(per):
         if tid + THREADS * i < nw:
-            fx.ptr_store(got[i][0], c["interq"] + (tid + THREADS * i))
+            ix = tid + THREADS * i
+            fx.ptr_store(
+                got[i][0], c["interq"] + ((ix // 48) * ip_row(c["pad"]) + ix % 48)
+            )
     if const_expr(gc is None):
         gc = c["poll"](cspecs)
     for i in range_constexpr(perc):
@@ -1222,7 +1241,7 @@ def stage_down(c, rgd, nt, ops0):
                 if const_expr(inter_lds(s)):
                     bw = fx.Vector(
                         fx.ptr_load(
-                            c["interq"] + (pick * 48 + st * 16 + kb * 4),
+                            c["interq"] + (pick * ip_row(c["pad"]) + st * 16 + kb * 4),
                             result_type=fx.Vector.make_type(4, fx.Int32),
                         )
                     )
