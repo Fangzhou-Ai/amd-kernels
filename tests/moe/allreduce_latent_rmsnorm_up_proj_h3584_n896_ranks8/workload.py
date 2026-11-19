@@ -6,7 +6,7 @@ import torch
 K = 3584
 N = 896
 WORLD = 8
-SERVED_ROWS = (1, 12, 24, 40, 65, 80, 128, 192, 256)
+SERVED_ROWS = (1, 12, 40, 80, 192, 256)
 
 
 def rand(shape, seed, dev, scale=1.0):

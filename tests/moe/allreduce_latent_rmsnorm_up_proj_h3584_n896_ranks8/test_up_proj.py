@@ -40,7 +40,7 @@ def run(m, ll2=False, runs=3):
             nonlocal calls
             calls += 1
             if ll2:
-                fill_ll(lat_buf, xn, sqref, calls)
+                fill_ll(lat_buf, xn, sqref, calls, m)
             run_compiled(kernel, m, (m + 7) // 8, 0, table.data_ptr(), counts.data_ptr(), 0, 0, nw.data_ptr(),
                          w.data_ptr(), view.data_ptr(), view.stride(0), view.data_ptr(), view.stride(0),
                          f32_bits(1e-6), 0, 0, torch.cuda.current_stream())
@@ -59,15 +59,21 @@ def run(m, ll2=False, runs=3):
         assert torch.equal(view.view(torch.int16), again.view(torch.int16)), ("rerun", m)
 
 
-def fill_ll(lat_buf, xn, ssq, epoch):
-    """The LL image of ``xn`` and ``ssq`` in ``lat_buf`` (every payload dword followed by the epoch)."""
+def fill_ll(lat_buf, xn, ssq, epoch, m):
+    """The LL image of ``xn`` and ``ssq`` in ``lat_buf`` (every payload dword followed by the epoch; rows from ``m`` on
+    keep a stale epoch, as in a call of fewer rows)."""
     raw = lat_buf.view(torch.int32)
     pay = xn.contiguous().view(torch.int32).view(T.MAX_ROWS, K // 2)
-    ll = torch.stack([pay, torch.full_like(pay, epoch)], dim=-1).view(T.MAX_ROWS, K)
+    # lane p of owner o holds dwords 4 p .. 4 p + 3 of the slice; its packs sit at 112 o + p and 112 o + 56 + p
+    d = pay.view(T.MAX_ROWS, T.WORLD, T.PK, 2, 2).permute(0, 1, 3, 2, 4)  # [row, owner, half, lane, dword pair]
+    ll = torch.stack([d[..., 0], torch.full_like(d[..., 0], epoch), d[..., 1], torch.full_like(d[..., 0], epoch)],
+                     dim=-1).reshape(T.MAX_ROWS, K)
+    ll[m:, 1::2] = 0
     raw[: T.LATLL_BYTES // 4] = ll.view(-1)
     sq = ssq.contiguous().view(torch.int32)
-    raw[T.LATLL_BYTES // 4: T.LATLL_BYTES // 4 + T.MAX_ROWS * T.WORLD * 2] = torch.stack(
-        [sq, torch.full_like(sq, epoch)], dim=-1).view(-1)
+    sl = torch.stack([sq, torch.full_like(sq, epoch)], dim=-1).view(T.MAX_ROWS, T.WORLD * 2)
+    sl[m:, 1::2] = 0
+    raw[T.LATLL_BYTES // 4: T.LATLL_BYTES // 4 + T.MAX_ROWS * T.WORLD * 2] = sl.view(-1)
 
 
 @pytest.mark.parametrize("ll2", (False, True))

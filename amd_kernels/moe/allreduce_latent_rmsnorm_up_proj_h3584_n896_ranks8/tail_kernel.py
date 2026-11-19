@@ -12,22 +12,23 @@ partial into rank d's inbox slot ``me`` (write-through remote stores), then rais
 peers shows this call's epoch it adds the eight slices of its slice in rank order 0..7 in fp32 (its own from
 registers) and rounds once to bf16 (the latent). It also does the norm's elementwise part once for everyone: hop 2
 pushes ``xn = bf16(latent * w_norm)`` into the ``lat`` buffer of all eight ranks (itself included) and the row's sum of
-squares of its slice into ``lat``'s side array ``ssq[row][me]``, then adds one to each rank's counter C2 (a workgroup
-without rows adds at once). Every rank's C2 grows by 256 per call (32 workgroups x 8 owners), so an up-projection
-workgroup waits for C2 >= 256 e and a finished kernel has the whole reduced, scaled latent in its own ``lat`` and every
-owner has finished reading its inbox, which a peer's next call writes. Epochs are private per workgroup (one word each,
+squares of its slice into ``lat``'s side array ``ssq[row][me]``, then raises F2 (rb, me) at every rank. An
+up-projection workgroup leaves its wait when F2 (rb, o) of every row block and owner shows the epoch, so a finished
+kernel has the whole reduced, scaled latent in its own ``lat`` and every owner has finished reading its inbox, which a
+peer's next call writes. Epochs are private per workgroup (one word each,
 read at the start and written at the end by the same workgroup): every workgroup of the fixed grid runs once per call
 (an idle one bumps its epoch), and every rank makes the same calls, so all epochs equal the call count. No input
 address is exchanged: eager and graph calls are the same.
 
 Up projection. A workgroup owns 16 output columns (n tile ``nt``, 56 tiles) and ``MPG`` 16-token tiles (m group ``g``,
 4 groups) over the whole K; wave w of its 8 takes the 448 K columns [448 w, 448 (w + 1)). The weights are the MFMA A
-operand straight from global memory (16 rows x 4 lane groups, 16 B per lane and 32 K columns per step) and stay in registers; the B operand is ``xn`` straight from ``lat``. The eight waves'
+operand straight from global memory (16 rows x 4 lane groups, 16 B per lane and 32 K columns per step) and stay in
+registers; the B operand is ``xn`` from ``lat`` through LDS (a coalesced 896 B load per row, then fragment reads). The eight waves'
 accumulators meet in LDS, and the epilogue adds the 8 owners' sums of squares (``1 / rms`` commutes with the GEMM) and
 ``shared`` and stores bf16 ``out`` (which may alias ``shared``). No atomic touches an output and nothing leaves the
 workgroup before the epilogue. The four groups of an n tile share an XCD (workgroup id % 8): the weights come from HBM once.
 
-Modes: ``fused`` (above), ``ar`` (only the all-reduce, waiting for all counters) and ``up`` (only the up projection
+Modes: ``fused`` (above), ``ar`` (only the all-reduce, waiting for its flags) and ``up`` (only the up projection
 on a ``lat`` filled by an earlier launch).
 """
 import flydsl.compiler as flyc
@@ -60,8 +61,8 @@ KSTEPS = KW // 32  # 14
 XROW = KW * 2 + 16  # LDS bytes of a staged row slice: 57 packs of 16 B, so 16 rows hit 16 different bank groups
 LINE = 128
 F1 = 0
-C2 = MAX_RB * LINE
-INBOX = C2 + LINE
+F2 = MAX_RB * LINE
+INBOX = 2 * MAX_RB * LINE
 LL_ROW = SL // 4  # 16 B packs of an LL slice row: two payload dwords, each followed by the epoch
 INBOX_BYTES = WORLD * MAX_ROWS * LL_ROW * 16
 BUF_BYTES = INBOX + INBOX_BYTES
@@ -159,10 +160,10 @@ def compile_tail(mode: str, mpg: int, ts: bool = False, ll: bool = False, ll2: b
                 buffer_ops.buffer_store(fx.Int64(t).to(fx.Int32), at(arg_ts, 1 << 26), (bid * NWAVES + wave) * 8 + k,
                                         mask=lane == 0)
 
-        def count_done():
-            """One add to the C2 of every rank (the first eight lanes)."""
+        def send_done(rb, e):
+            """F2 (rb, me) = e at every rank (the first eight lanes): row block ``rb`` of this owner's slice has landed."""
             if (wave == 0) & (lane < WORLD):
-                atomic_add(sel8(lane, bs) + C2, 1)
+                flag_store(sel8(lane, bs) + F2 + fx.Int64(rb) * LINE + fx.Int64(i32_me) * 4, e)
 
         def ar_role(rb):
             e = epoch(rb)
@@ -179,27 +180,29 @@ def compile_tail(mode: str, mpg: int, ts: bool = False, ll: bool = False, ll2: b
                 if const_expr(ll):
                     for d in range_constexpr(WORLD):
                         dest = at(bs[d] + INBOX, INBOX_BYTES)
-                        base = ((i32_me * MAX_ROWS + row) * LL_ROW + 2 * p) * 4
+                        base = ((i32_me * MAX_ROWS + row) * LL_ROW + p) * 4
                         for h in range_constexpr(2):
                             buffer_ops.buffer_store(
                                 Vec.from_elements([mine_pk[d][2 * h], e, mine_pk[d][2 * h + 1], e], fx.Int32), dest,
-                                base + 4 * h, mask=ok & (i32_me != d), cache_modifier=SYS)
+                                base + PK * 4 * h, mask=ok & (i32_me != d), cache_modifier=SYS)
                     stamp(1)
                     inbox = at(mine + INBOX, INBOX_BYTES)
                     pk = []
                     first = []
                     for s in range_constexpr(WORLD):
-                        base = ((s * MAX_ROWS + row) * LL_ROW + 2 * p) * 4
-                        first.append([pack(inbox, base + 4 * h, ok & (i32_me != s), SYS) for h in range_constexpr(2)])
+                        base = ((s * MAX_ROWS + row) * LL_ROW + p) * 4
+                        first.append([pack(inbox, base + PK * 4 * h, ok & (i32_me != s), SYS)
+                                      for h in range_constexpr(2)])
                     for s in range_constexpr(WORLD):
-                        base = ((s * MAX_ROWS + row) * LL_ROW + 2 * p) * 4
+                        base = ((s * MAX_ROWS + row) * LL_ROW + p) * 4
                         a0, a1 = first[s]
                         miss = ok & (i32_me != s) & ((fx.Int32(a0[1]) != e) | (fx.Int32(a0[3]) != e)
                                                      | (fx.Int32(a1[1]) != e) | (fx.Int32(a1[3]) != e))
                         while miss:
+                            fx.rocdl.s_sleep(2)
                             llvm.inline_asm(None, [], "", "~{memory}", has_side_effects=True)
                             a0 = pack(inbox, base, ok, SYS)
-                            a1 = pack(inbox, base + 4, ok, SYS)
+                            a1 = pack(inbox, base + PK * 4, ok, SYS)
                             miss = ((fx.Int32(a0[1]) != e) | (fx.Int32(a0[3]) != e)
                                     | (fx.Int32(a1[1]) != e) | (fx.Int32(a1[3]) != e))
                         got = [a0[0], a0[2], a1[0], a1[2]]
@@ -218,7 +221,7 @@ def compile_tail(mode: str, mpg: int, ts: bool = False, ll: bool = False, ll2: b
                     stamp(2)
                     if peer:
                         flag_store(sel8(lane, bs) + F1 + flags + fx.Int64(i32_me) * 4, e)
-                        spin(mine + F1 + flags + fx.Int64(lane) * 4, e)
+                        spin_load(mine + F1 + flags + fx.Int64(lane) * 4, e)
                     fx.gpu.barrier()
                     stamp(3)
                     inbox = at(mine + INBOX, WORLD * MAX_ROWS * SL * 2)
@@ -246,11 +249,11 @@ def compile_tail(mode: str, mpg: int, ts: bool = False, ll: bool = False, ll2: b
                 if const_expr(ll2):
                     for d in range_constexpr(WORLD):
                         lat = at(lats[d], LAT_ALLOC)
-                        base = row * (LATLL_ROW // 4) + (i32_me * (SL // 4) + 2 * p) * 4
+                        base = row * (LATLL_ROW // 4) + (i32_me * (SL // 4) + p) * 4
                         for h in range_constexpr(2):
                             buffer_ops.buffer_store(
-                                Vec.from_elements([xn_pk[2 * h], e, xn_pk[2 * h + 1], e], fx.Int32), lat, base + 4 * h,
-                                mask=ok, cache_modifier=SYS)
+                                Vec.from_elements([xn_pk[2 * h], e, xn_pk[2 * h + 1], e], fx.Int32), lat,
+                                base + PK * 4 * h, mask=ok, cache_modifier=SYS)
                         buffer_ops.buffer_store(
                             Vec.from_elements([ssq.bitcast(fx.Int32), e], fx.Int32), lat,
                             LATLL_BYTES // 4 + (row * WORLD + i32_me) * 2, mask=(lane == 63) & (row < i32_m),
@@ -266,11 +269,12 @@ def compile_tail(mode: str, mpg: int, ts: bool = False, ll: bool = False, ll2: b
                     fx.gpu.barrier()
                 stamp(5)
             if const_expr(not ll2):
-                count_done()
-                if const_expr(mode == "ar"):
-                    if tx == 0:
-                        spin_load(mine + C2, e * (MAX_RB * WORLD))
-                    fx.gpu.barrier()
+                if rb < i32_nrb:
+                    send_done(rb, e)
+                    if const_expr(mode == "ar"):
+                        if (wave == 0) & (lane < WORLD):
+                            spin_load(mine + F2 + flags + fx.Int64(lane) * 4, e)
+                        fx.gpu.barrier()
             buffer_ops.buffer_store(e, cr, rb, mask=tx == 0)
             stamp(6, True)
 
@@ -300,12 +304,17 @@ def compile_tail(mode: str, mpg: int, ts: bool = False, ll: bool = False, ll2: b
                 stamp(1, True)
                 if const_expr(ll2):
                     if const_expr(mode == "fused"):
-                        if lane == 0:  # the last pack this wave's owner stores of the last row: the rest follows
-                            spin_load(my_lat + (((i32_m - 1) * (LATLL_ROW // 4) + (wave * (SL // 4) + SL // 4 - 1) * 4
+                        if lane < i32_nrb:  # the last pack this wave's owner stores of the last row of a row block
+                            mrow = lane * RB + RB - 1
+                            mrow = (mrow < i32_m).select(mrow, i32_m - 1)
+                            spin_load(my_lat + ((mrow * (LATLL_ROW // 4) + (wave * (SL // 4) + SL // 4 - 1) * 4
                                                  + 3) * 4).to(fx.Int64), e2)
                 elif const_expr(mode == "fused"):
-                    if tx == 0:
-                        spin_load(mine + C2, e2 * (MAX_RB * WORLD))
+                    if wave == 0:  # lane l polls F2 (rb, o) of the pairs l, l + 64, ...: every owner's every row block
+                        for j in range_constexpr(MAX_RB * WORLD // 64):
+                            idx = lane + 64 * j
+                            if idx < i32_nrb * WORLD:
+                                spin_load(mine + F2 + fx.Int64(idx // WORLD) * LINE + fx.Int64(idx % WORLD) * 4, e2)
                     fx.gpu.barrier()
                 stamp(2)
 
@@ -328,16 +337,18 @@ def compile_tail(mode: str, mpg: int, ts: bool = False, ll: bool = False, ll2: b
                     for r in range_constexpr(16):
                         rr = m0 + tt * 16 + r
                         rr = (rr < i32_m).select(rr, i32_m - 1)
-                        base = rr * (LATLL_ROW // 4) + (wave * (SL // 4) + 2 * lane) * 4
-                        first.append((base, pack(latr, base, lane < PK, SYS), pack(latr, base + 4, lane < PK, SYS)))
+                        base = rr * (LATLL_ROW // 4) + (wave * (SL // 4) + lane) * 4
+                        first.append((base, pack(latr, base, lane < PK, SYS),
+                                      pack(latr, base + PK * 4, lane < PK, SYS)))
                     out = []
                     for base, a0, a1 in first:
                         miss = (lane < PK) & ((fx.Int32(a0[1]) != e2) | (fx.Int32(a0[3]) != e2)
                                               | (fx.Int32(a1[1]) != e2) | (fx.Int32(a1[3]) != e2))
                         while miss:
+                            fx.rocdl.s_sleep(2)
                             llvm.inline_asm(None, [], "", "~{memory}", has_side_effects=True)
                             a0 = pack(latr, base, lane < PK, SYS)
-                            a1 = pack(latr, base + 4, lane < PK, SYS)
+                            a1 = pack(latr, base + PK * 4, lane < PK, SYS)
                             miss = ((fx.Int32(a0[1]) != e2) | (fx.Int32(a0[3]) != e2)
                                     | (fx.Int32(a1[1]) != e2) | (fx.Int32(a1[3]) != e2))
                         out.append(Vec.from_elements([a0[0], a0[2], a1[0], a1[2]], fx.Int32))
@@ -354,12 +365,14 @@ def compile_tail(mode: str, mpg: int, ts: bool = False, ll: bool = False, ll2: b
                 tcol = n0 + ((tx % 64) // 16) * 4
                 if const_expr(ll2):
                     sqs = []
+                    srow = (trow < i32_m).select(trow, i32_m - 1)
                     for i in range_constexpr(4):
-                        v = pack(ssr, (trow * WORLD + 2 * i) * 2, ep, SYS)
+                        v = pack(ssr, (srow * WORLD + 2 * i) * 2, ep, SYS)
                         miss = ep & ((fx.Int32(v[1]) != e2) | (fx.Int32(v[3]) != e2))
                         while miss:
+                            fx.rocdl.s_sleep(2)
                             llvm.inline_asm(None, [], "", "~{memory}", has_side_effects=True)
-                            v = pack(ssr, (trow * WORLD + 2 * i) * 2, ep, SYS)
+                            v = pack(ssr, (srow * WORLD + 2 * i) * 2, ep, SYS)
                             miss = ep & ((fx.Int32(v[1]) != e2) | (fx.Int32(v[3]) != e2))
                         sqs += [fx.Int32(v[0]).bitcast(fx.Float32), fx.Int32(v[2]).bitcast(fx.Float32)]
                 else:
