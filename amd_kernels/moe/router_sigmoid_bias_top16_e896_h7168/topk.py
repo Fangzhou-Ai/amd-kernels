@@ -110,12 +110,13 @@ def topk_q_scores(pr, br, lane, tok, i32_m, ks, slab_cm, q):
     return topk_q_keys(acc, br, lane, q)
 
 
-def topk_q_keys(acc, br, lane, q):
+def topk_q_keys(acc, br, lane, q, bv=None):
     """Group ``q``'s summed logits ``acc`` (a vector of 4 fp32 per lane): AITER's sigmoid (rcp(1 + exp2(-log2(e) x)), the
     product in double), the biased score and its order-preserving unsigned key. Returns [(sigmoid, key)] for j = 0..3."""
     dynamic = not isinstance(q, int)
     valid = ((q != NQ - 1) | (lane < 32)) if dynamic else ((lane < 32) if q == NQ - 1 else None)
-    bv = Vec(buffer_ops.buffer_load(br, 256 * q + 4 * lane, vec_width=4, dtype=fx.Float32, mask=valid))
+    if bv is None:
+        bv = Vec(buffer_ops.buffer_load(br, 256 * q + 4 * lane, vec_width=4, dtype=fx.Float32, mask=valid))
     out = []
     for j in range_constexpr(4):
         y = (fx.Float32(acc[j]).to(fx.Float64) * fx.Float64(NEG_LOG2E)).to(fx.Float32)

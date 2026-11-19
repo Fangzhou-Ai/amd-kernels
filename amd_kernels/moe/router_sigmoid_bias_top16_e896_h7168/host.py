@@ -14,8 +14,10 @@ from .reference import E, H, TOPK
 from .topk import compile_router_sigmoid_bias_top16_e896
 
 MAX_M = 16 * MT_MAX
-# row tile (16 rows) -> (K splits, waves along the columns, fragments per column wave)
-CONFIG_BY_MT = {mt: (14, 4, 1) for mt in range(1, MT_MAX + 1)}
+# row tile (16 rows) -> (K splits, waves along the columns, fragments per column wave[, row splits])
+# measured (benchmark_router.py, graph, min of 15): up to 48 rows more K splits to use every CU; above, two row splits of
+# half the K splits (half the slab bytes; the pair of workgroups sharing the weights sits on one XCD)
+CONFIG_BY_MT = {mt: (16, 4, 1) if mt <= 3 else (8, 4, 1, 2) for mt in range(1, MT_MAX + 1)}
 
 
 def supports(w: torch.Tensor, bias: torch.Tensor | None = None) -> bool:
@@ -49,8 +51,8 @@ def m_tile_fragments(m: int) -> int:
 
 
 @functools.cache
-def _router_kernel(mt: int, ks: int, shuf: bool, fused: bool, wn: int, nrw: int, aux: bool):
-    return compile_router_e896_h7168(mt, ks, int(shuf), int(fused), wn, nrw, int(aux))
+def _router_kernel(mt: int, ks: int, shuf: bool, fused: bool, wn: int, nrw: int, aux: bool, ms: int = 1):
+    return compile_router_e896_h7168(mt, ks, int(shuf), int(fused), wn, nrw, int(aux), 0, 0, ms)
 
 
 @functools.cache
@@ -78,12 +80,18 @@ def _workspace(device: torch.device, stream: int, mt: int, config: tuple):
     key = (device.index, stream, mt, config)
     ws = _WORK.get(key)
     if ws is None:
-        ks, wn, _ = config
-        ws = (torch.zeros(partial_bytes(mt, ks, wn), dtype=torch.uint8, device=device),
+        ks, wn, _, ms = _config(mt, config)
+        ws = (torch.zeros(partial_bytes(mt, ks, wn, ms), dtype=torch.uint8, device=device),
               torch.zeros(FLAG_WORDS, dtype=torch.int32, device=device),
               torch.zeros(WORKSPACE_WORDS, dtype=torch.int32, device=device))
         _WORK[key] = ws
     return ws
+
+
+def _config(mt: int, config: tuple | None = None) -> tuple:
+    """(K splits, column waves, fragments per column wave, row splits) of a row tile."""
+    config = config or CONFIG_BY_MT[mt]
+    return tuple(config) + (1,) * (4 - len(config))
 
 
 def _bits(v: float) -> int:
@@ -113,8 +121,8 @@ def _launch(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None, scale: 
     assert supports(w) and x.device == w.device and 1 <= m <= MAX_M
     stream = torch.cuda.current_stream()
     mt = m_tile_fragments(m)
-    ks, wn, nrw = CONFIG_BY_MT[mt]
-    part, counters, aux_ws = _workspace(x.device, stream.cuda_stream, mt, (ks, wn, nrw))
+    ks, wn, nrw, ms = _config(mt)
+    part, counters, aux_ws = _workspace(x.device, stream.cuda_stream, mt, (ks, wn, nrw, ms))
     ptrs = [0] * 8
     cap = zvecs = 0
     if out is None:
@@ -133,7 +141,7 @@ def _launch(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None, scale: 
             ptrs = [aux_ws.data_ptr(), aux["sorted_token_ids"].data_ptr(), aux["sorted_weights"].data_ptr(),
                     aux["sorted_expert_ids"].data_ptr(), aux["num_valid_ids"].data_ptr(), aux["m_indices"].data_ptr(),
                     aux["reverse_sorted"].data_ptr(), 0 if mb is None else mb.data_ptr()]
-    _run(_router_kernel(mt, ks, bool(shuffled), out is not None, wn, nrw, aux is not None), x.data_ptr(), w.data_ptr(),
+    _run(_router_kernel(mt, ks, bool(shuffled), out is not None, wn, nrw, aux is not None, ms), x.data_ptr(), w.data_ptr(),
          part.data_ptr(), counters.data_ptr(), bias_ptr, ow, oid, *ptrs, m, row_stride, _bits(scale), cap, zvecs, stream)
     return part, ks
 
@@ -153,7 +161,7 @@ def router_logits(x: torch.Tensor, w: torch.Tensor, *, shuffled: bool = False) -
         return torch.cat([router_logits(x[i:i + MAX_M], w, shuffled=shuffled) for i in range(0, m, MAX_M)])
     part, ks = _launch(x, w, None, 1.0, None, shuffled)
     mt = m_tile_fragments(m)
-    rows = slab_rows(mt, CONFIG_BY_MT[mt][1])
+    rows = slab_rows(mt, _config(mt)[1], _config(mt)[3])
     slabs = part.view(torch.int32).view(ks, rows, E)[:, :m] & -2  # the fused launch drops each word's lowest bit (parity tag)
     slabs = slabs.view(torch.float32)
     logits = slabs[0].clone()

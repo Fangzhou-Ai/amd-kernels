@@ -13,7 +13,7 @@ from amd_kernels.moe.router_sigmoid_bias_top16_e896_h7168.reference import (E, H
                                                                             top16_reference)
 
 MS = [1, 2, 5, 12, 15, 16, 17, 24, 33, 40, 48, 65, 80, 96, 112, 128, 129, 160, 176, 192, 193, 300]
-CONFIGS = [(ks, 4, 1) for ks in (4, 7, 8, 14, 16)] + [(ks, 4, 2) for ks in (14, 28)] + [(ks, 1, 8) for ks in (14, 28)] + [(14, 2, 4)]
+CONFIGS = [(ks, 4, 1) for ks in (4, 7, 8, 14, 16)] + [(ks, 4, 2) for ks in (14, 28)] + [(ks, 1, 8) for ks in (14, 28)] + [(14, 2, 4), (8, 4, 1, 2), (4, 4, 1, 3), (8, 4, 1, 3), (7, 4, 1, 2), (14, 4, 1, 2), (8, 1, 4, 2), (8, 2, 2, 2)]
 
 
 def aiter_top16(logits, bias, scale=1.0):
@@ -88,9 +88,10 @@ def test_scale(params, m):
 @pytest.mark.parametrize("m", [3, 40, 192])
 def test_every_tile_config(params, monkeypatch, config, m):
     w, ws, bias = params
-    ks, wn, nrw = config
-    if 56 // (wn * nrw) * ks < 16 * host.m_tile_fragments(m) or 16 // (wn * nrw) * ks > 64:
-        pytest.skip("fewer workgroups than tokens, or a group's flags in more than one load")
+    ks, wn, nrw, ms = host._config(1, config)
+    wcnt = 56 // (wn * nrw) * ks
+    if wcnt * ms < 16 * host.m_tile_fragments(m) or wcnt * ms > 256 or (ms > 1 and wcnt % 8):
+        pytest.skip("fewer workgroups than tokens, more than the epoch words, or a row-split pair off one XCD")
     monkeypatch.setitem(host.CONFIG_BY_MT, host.m_tile_fragments(m), config)
     host._WORK.clear()
     x = torch.randn(m, H, device="cuda").to(torch.bfloat16)
