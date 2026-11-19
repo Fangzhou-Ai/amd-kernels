@@ -100,6 +100,8 @@ One line per kernel package. Each package's README has what it does, its entry p
   the end of one Markov draft step: combine, draft id, next row.
 - [`sampling/top_p_mask_f32_v200064`](sampling/top_p_mask_f32_v200064/README.md): top-p mask of <= 64 fp32 logits
   rows in one launch (vLLM's split top-p chain, bit for bit).
+- [`sampling/top_p_mask_f32_v163840`](sampling/top_p_mask_f32_v163840/README.md): top-p mask of <= 64 fp32 logits rows,
+  vocabulary 163840: vLLM's split top-p chain in one launch.
 
 ## Decoder blocks
 
