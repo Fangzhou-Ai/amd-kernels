@@ -127,6 +127,9 @@ One line per kernel package. Each package's README has what it does, its entry p
   sampler output gather.
 - [`collectives/all_gather_i64_c7_ranks4`](collectives/all_gather_i64_c7_ranks4/README.md): draft token ids into batch
   order.
+- [`collectives/handshake_ranks8`](collectives/handshake_ranks8/README.md): the eight-rank flag barrier and small
+  payload exchanges (epoch-tagged words, flag after data, pull) with the shared device helpers
+  (`common/rank8_signal.py`, `common/rank8_comm.py`).
 
 ## Sampling
 
@@ -160,3 +163,4 @@ One line per kernel package. Each package's README has what it does, its entry p
 
 - [`collectives/dcp8_topk_gather_merge_top2048`](collectives/dcp8_topk_gather_merge_top2048/README.md): the DSA score
   all-gather, global top-2048 merge and this rank's CSR KV slots in one launch.
+- [`common/`](common/): buffer ops, launch helpers, the AITER GEMM's XCD swizzle, the HIP runtime binding, the eight-rank flag helpers.

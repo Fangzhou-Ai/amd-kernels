@@ -90,3 +90,6 @@ attention/dcp8_q_bproj_wuk_gather_h96_kv512/test_query_gather.py	8
 attention/dcp8_q_bproj_wuk_gather_h96_kv512/test_compile.py	8
 indexer/mxfp4_prefill_score_d128_h32/test_compile.py	compile
 indexer/mxfp4_prefill_topk_d128_h32_top2048/test_compile.py	compile
+collectives/handshake_ranks8/test_handshake.py	8
+collectives/handshake_ranks8/test_warm_up.py	8
+collectives/handshake_ranks8/test_compile.py	compile
