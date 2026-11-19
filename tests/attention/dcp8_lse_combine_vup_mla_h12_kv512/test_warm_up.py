@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""The first call compiles every token tier; no served token count compiles afterwards."""
+"""The first call of each mode compiles every token tier; no served token count compiles afterwards."""
 import torch
 import torch.distributed as dist
 
 from .harness import run_on_8_gpus
+
+PROBES = (1, 12, 16, 17, 24, 33, 40, 48, 65, 80, 96, 128, 129, 160, 192)
 
 
 def _worker(rank, errors):
@@ -35,7 +37,7 @@ def _worker(rank, errors):
         call(12, gate)
         MlirCompiler.compile = counting
         try:
-            for m in (1, 12, 16, 17, 24, 40, 65, 80, 128, 129, 192):
+            for m in PROBES:
                 call(m, gate)
         finally:
             MlirCompiler.compile = real
