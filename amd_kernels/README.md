@@ -36,6 +36,8 @@ One line per kernel package. Each package's README has what it does, its entry p
   of one Kimi-K3.1 TP8 rank: activation quant, GEMM1 + GEMM2 in one launch, deterministic top-16 sum.
 - [`moe/router_sigmoid_bias_top16_e896_h7168`](moe/router_sigmoid_bias_top16_e896_h7168/README.md): the MoE router,
   bf16 gate GEMM + sigmoid + correction bias + top-16 + renormalisation, two launches.
+- [`moe/layer_tail_k2_h7168_ranks8`](moe/layer_tail_k2_h7168_ranks8/README.md): one decode layer's whole tail in one
+  persistent kernel on 8 ranks: o_proj, AttnRes, router, shared + routed MXFP4 experts, latent norm, up projection.
 
 ## Attention
 

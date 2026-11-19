@@ -73,3 +73,4 @@ gemm/bf16_latent_down_mxfp4_quant_k7168_n3584/test_down_quant.py	1		same
 moe/allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8/test_latent_tail.py	8
 moe/allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8/test_warm_up.py	8
 moe/allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8/test_slots.py	8
+moe/layer_tail_k2_h7168_ranks8/test_layer_tail.py	8
