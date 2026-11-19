@@ -92,6 +92,8 @@ One line per kernel package. Each package's README has what it does, its entry p
 
 - [`decoder/dense_mxfp8_h6144_i3072_ranks4`](decoder/dense_mxfp8_h6144_i3072_ranks4/README.md): the draft's dense
   decoder layers around their attention, four ranks.
+- [`decoder/bf16_dense_mlp_h7168_i1792`](decoder/bf16_dense_mlp_h7168_i1792/README.md): the DSpark drafter's dense MLP shard
+  (gate_up + SwiGLU, down) on packed bf16 operands.
 
 ## Shared code
 
