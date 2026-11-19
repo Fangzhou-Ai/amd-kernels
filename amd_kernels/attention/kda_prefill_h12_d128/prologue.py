@@ -463,7 +463,8 @@ def compile_prologue():
             buffer_ops.buffer_store(Vec.from_elements(lo + hi_, fx.Int32), wsr, (REC_KGT + frag * 16) // 4)
 
 
-        # ---- loads of the q and v bands issued ahead of the Akk matrix phase
+        # ---- loads of the q band issued ahead of the Akk matrix phase
+        q_rows = band_rows(0)
 
         barrier()
 
@@ -515,7 +516,7 @@ def compile_prologue():
         barrier()
 
         # ---- q band and v band
-        q_rows = band_rows(0)
+        v_rows = band_rows(2)
         yp = band_conv(0, q_rows)
         rq = row_scale(yp)
         hc_ = (cg % 4) // 2
@@ -534,7 +535,6 @@ def compile_prologue():
             tok16 = 4 * (run % 4) + r
             frag = ((run // 4) * 4 + cg // 4) * 64 + q_c * 16 + tok16
             buffer_ops.buffer_store(Vec.from_elements(lo + hi_, fx.Int32), wsr, (REC_QG + frag * 16) // 4)
-        v_rows = band_rows(2)
         yp = band_conv(2, v_rows)
         yv = [unp(yp[r]) for r in range_constexpr(4)]
         vb_pk = []
