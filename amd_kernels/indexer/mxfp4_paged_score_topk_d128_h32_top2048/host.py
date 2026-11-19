@@ -61,7 +61,7 @@ def plan(max_query_len: int, batch: int) -> tuple[int, int]:
         return min(max_query_len, _FORCE[0]), _FORCE[1]
     if batch <= 4:
         return min(max_query_len, 2), CHUNKS_TARGET
-    wave = 400 if max_query_len <= 4 else 240  # workgroups of one wave: whole rows of 5 and 6 fill a CU alone
+    wave = 300 if max_query_len <= 4 else 240  # workgroups of one wave: whole rows of 5 and 6 fill a CU alone
     return max_query_len, max(8, min(40, round(wave / batch)))
 
 
