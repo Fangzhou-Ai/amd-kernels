@@ -29,7 +29,7 @@ NUM_CUS = 256
 
 @functools.cache
 def _walk_launcher():
-    return _scan.compile_walk(WALK_WAVES, WALK_NVT)
+    return _scan.compile_scan(WALK_WAVES, WALK_NVT, False, WALK_STAGES)
 
 
 @functools.cache
@@ -77,11 +77,12 @@ def scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_
     common = (ws.data_ptr(), nc, state_cache.data_ptr(), state_cache.stride(0) * 4, state_indices.data_ptr(), has.data_ptr(),
               cu_seqlens.data_ptr(), chunk_offsets.data_ptr(), out.data_ptr(), out.stride(0))
     tail = (g, MIN_CHUNKS, n * NH)
+    full = (*common, gb.data_ptr(), gc.data_ptr(), ga.data_ptr(), sin.data_ptr(), *tail)
     if g > 1:
-        _run_compiled(_chain_launcher(), *common, gb.data_ptr(), gc.data_ptr(), ga.data_ptr(), sin.data_ptr(), *tail, stream)
+        _run_compiled(_chain_launcher(), *full, stream)
         _run_compiled(_fold_launcher(), state_cache.data_ptr(), state_cache.stride(0) * 4, state_indices.data_ptr(), has.data_ptr(),
                       cu_seqlens.data_ptr(), gb.data_ptr(), gc.data_ptr(), ga.data_ptr(), sin.data_ptr(), g, MIN_CHUNKS, n * NH, stream)
-    _run_compiled(_walk_launcher(), *common, sin.data_ptr(), *tail, stream)
+    _run_compiled(_walk_launcher(), *full, stream)
     return out
 
 
