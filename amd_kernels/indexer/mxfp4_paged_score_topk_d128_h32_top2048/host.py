@@ -40,9 +40,14 @@ def cache_views(cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 @functools.cache
-def _scratch(device: torch.device):
-    """Key, position, meta and full-score planes of the chunk lists, one set a device (launches on one stream)."""
+def _scratch_set(device: torch.device, stream: int):
     return tuple(torch.zeros(words, dtype=torch.int32, device=device) for words in scratch_words(MAX_ROWS))
+
+
+def _scratch(device: torch.device):
+    """Key, position, meta, full-score and ready-count planes of the chunk lists: one set a device and stream (two
+    launches on one stream never overlap; launches on different streams may)."""
+    return _scratch_set(device, torch.cuda.current_stream(device).cuda_stream)
 
 
 def plan(max_query_len: int, batch: int) -> tuple[int, int]:

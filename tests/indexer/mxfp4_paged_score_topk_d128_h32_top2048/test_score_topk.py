@@ -68,6 +68,8 @@ SHAPES = [  # (sequences, rows a sequence, width): the served decode batches at 
     (2, 1, 20480),
     (4, 3, 4096),
     (2, 6, 40960),
+    (100, 1, 4096),  # more sequences than a wave's lanes
+    (66, 2, 8192),
 ]
 
 
@@ -179,6 +181,23 @@ def test_repeated_calls_are_stable(kind):
         assert (idx >= 0).sum(1).tolist() == (first[0] >= 0).sum(1).tolist()
         assert torch.equal(val.sort(1).values, first[1].sort(1).values)
     check_selection(first[0], first[1], reference_logits(inputs), rtol=LOGIT_RTOL)
+
+
+def test_two_streams_do_not_share_scratch():
+    """Launches overlapping on two streams (the scratch is a set a stream) select what each would alone."""
+    require_gfx950()
+    ins = [make_inputs(3, 4, 16384, seed=11), make_inputs(5, 3, 24576, seed=12)]
+    outs = [(torch.empty(i["q_payload"].shape[0], TOPK, dtype=torch.int32, device="cuda"),
+             torch.empty(i["q_payload"].shape[0], TOPK, dtype=torch.float32, device="cuda")) for i in ins]
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    torch.cuda.synchronize()
+    for _ in range(10):
+        for inp, (idx, val), stream in zip(ins, outs, streams):
+            with torch.cuda.stream(stream):
+                host._score_topk(**inp, out_indices=idx, out_scores=val)
+        torch.cuda.synchronize()
+        for inp, (idx, val) in zip(ins, outs):
+            check_selection(idx, val, reference_logits(inp), rtol=LOGIT_RTOL)
 
 
 def test_deterministic():
