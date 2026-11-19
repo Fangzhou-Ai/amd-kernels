@@ -26,14 +26,21 @@ follow on the same CTAs. A request whose first slot is the null slot (graph padd
 
 ## Performance
 
-Graph replay of 4 launches over distinct weight sets (360 MB of in_proj, past the LLC), 4 AttnRes blocks, 6-token
-requests, median us a launch; floor = bytes at the measured ceilings (6.5 TB/s read, 6.0 TB/s write) + the 1.57 us
-graph launch gap.
+Graph replay of 4 launches over distinct weight sets (360 MB of in_proj, past the LLC), 4 AttnRes blocks, median us a launch, same harness for
+vLLM's stock K1; floor = bytes at the measured ceilings (6.5 TB/s read, 6.0 TB/s write) + the 1.57 us graph launch gap; skeleton = the same hand-off chain and weight
+stream with no math (analysis report): 21.5 us at 12 rows, 21.2 at 6.
 
-| Rows | us | floor us | % of floor | stock K1 us |
-|---|---|---|---|---|
-| 12 | TBD | TBD | TBD | TBD |
-| 6 | TBD | TBD | TBD | TBD |
+| rows x tokens a request | stock us | this kernel us | speedup | floor us | % of floor |
+|---|---|---|---|---|---|
+| 12 x 6 (CI c4) | 45.4 | 30.5 | 1.49x | 17.5 | 57% |
+| 6 x 6 (graph pad) | 35.5 | 28.1 | 1.26x | 16.5 | 59% |
+| 4 x 4 | 33.0 | 26.3 | 1.26x | 16.2 | 62% |
+| 8 x 4 | 35.5 | 28.1 | 1.26x | 16.9 | 60% |
+| 8 x 8 | 37.1 | 30.0 | 1.24x | 16.8 | 56% |
+| 16 x 4 (4 requests: two task rounds) | 54.8 | 37.3 | 1.47x | 18.3 | 49% |
+| 16 x 8 | 49.7 | 33.7 | 1.48x | 18.1 | 54% |
+
+The weight stream lands at ~6.3 TB/s (the measured ceiling); the kernel is that stream plus a ~15 us dependent tail (reduce / hand-offs / conv / gates / recurrence / norm).
 
 ## Tests
 
