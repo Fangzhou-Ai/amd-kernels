@@ -72,6 +72,8 @@ def compile_decode_kt(nhg: int = 6, timing: bool = False, opts: tuple = ()):
     NW = 8 if "w8" in opts else 4
     NB = 2 if "nb2" in opts else 3
     PQ = "pq" in opts
+    KP = "kp" in opts
+    RP = "rp" in opts
     NOQK = "noqk" in opts
     NOPV = "nopv" in opts
     NODMA = "nodma" in opts
@@ -134,6 +136,14 @@ def compile_decode_kt(nhg: int = 6, timing: bool = False, opts: tuple = ()):
 
                 def _s(_k=k):
                     lse_t.store(n_q * HEADS + u * 16 + _k, _now())
+
+                _guarded(tid == 0, _s)
+
+        def tstamp(tile, k):
+            if const_expr(timing):
+
+                def _s(_tile=tile, _k=k):
+                    lse_t.store(n_q * HEADS + units * 16 + u * 64 + fx.Int32(_tile) * 8 + _k, _now())
 
                 _guarded(tid == 0, _s)
 
@@ -242,7 +252,7 @@ def compile_decode_kt(nhg: int = 6, timing: bool = False, opts: tuple = ()):
         vtok = 16 * (vi // 4) + 4 * g + vi % 4
         v_off = (vtok // 2) * ISTR + (vtok % 2) * 512 + (t % 2) * 8
 
-        def softmax_slot(sacc, m_old, l_old, pos0):
+        def softmax_slot(sacc, m_old, l_old, pos0, tile=None):
             sl = []
             tmax = neg_inf
             for s in range_constexpr(4):
@@ -251,7 +261,11 @@ def compile_decode_kt(nhg: int = 6, timing: bool = False, opts: tuple = ()):
                     x = ((pos0 + 16 * s + 4 * g + r) < r_len).select(x, neg_inf)
                     sl.append(x)
                     tmax = _fmax(tmax, x)
+            if tile is not None:
+                tstamp(tile, 5)
             tmax = _xmax(tmax)
+            if tile is not None:
+                tstamp(tile, 6)
             upd = tmax > m_old + THR
             m_new = upd.select(tmax, m_old)
             alpha = (m_old - m_new).exp2(fastmath="afn")
@@ -261,6 +275,8 @@ def compile_decode_kt(nhg: int = 6, timing: bool = False, opts: tuple = ()):
             for x in pl:
                 psum = psum + x
             l_new = l_old * alpha + psum
+            if tile is not None:
+                tstamp(tile, 7)
             return m_new, l_new, alpha, pl
 
         def p_store(hl, pl, alpha):
@@ -270,20 +286,32 @@ def compile_decode_kt(nhg: int = 6, timing: bool = False, opts: tuple = ()):
                 _lds_store(hv, T.i32, base + P_OFF + (hl * 2 + kk) * 1024 + lane * 16, 16)
             _lds_store(Vec.from_elements([alpha], fx.Float32), T.f32, base + AL_OFF + (hl * 16 + t) * 4, 4)
 
-        def qk_slot(bb, q8, qs, q8l, qsl, qr, m_old, l_old, pos0, ses):
+        def qk_slot(bb, q8, qs, q8l, qsl, qr, m_old, l_old, pos0, ses, tile=None):
             sa = [Vec.filled(4, 0.0, fx.Float32) for _ in range(4)]
             if const_expr(not NOQK):
+                def rope_reads():
+                    out = []
+                    for s in range_constexpr(4):
+                        tk = 16 * s + t
+                        ra = bb + ROPE_OFF + (tk // 8) * ISTR + (tk % 8) * 128 + 16 * g
+                        out.append([_lds_load(T.i32, 4, ra + 64 * i, 16) for i in range(2)])
+                    return out
+
+                rope = rope_reads() if RP else None
+                kr_n = [kread(bb, s, 0) for s in range(4)] if KP else None
                 for j in range_constexpr(4):
-                    kr = [kread(bb, s, j) for s in range(4)]
+                    kr = kr_n if KP else [kread(bb, s, j) for s in range(4)]
+                    if const_expr(KP and j < 3):
+                        kr_n = [kread(bb, s, j + 1) for s in range(4)]
                     for s in range_constexpr(4):
                         acc = _mfma_fp8(kr[s], q8[j], sa[s], ses[s], qs)
                         sa[s] = _mfma_fp8(kr[s], q8l[j], acc, ses[s], qsl)
+                if not RP:
+                    rope = rope_reads()
                 for s in range_constexpr(4):
-                    tk = 16 * s + t
-                    ra = bb + ROPE_OFF + (tk // 8) * ISTR + (tk % 8) * 128 + 16 * g
                     for i in range_constexpr(2):
-                        sa[s] = _mfma_bf16(_lds_load(T.i32, 4, ra + 64 * i, 16), qr[i], sa[s])
-            return softmax_slot(sa, m_old, l_old, pos0)
+                        sa[s] = _mfma_bf16(rope[s][i], qr[i], sa[s])
+            return softmax_slot(sa, m_old, l_old, pos0, tile)
 
         init = [_raw(neg_inf.ir_value()), _raw(fx.Float32(0.0).ir_value())]
         if const_expr(TWO):
@@ -317,6 +345,7 @@ def compile_decode_kt(nhg: int = 6, timing: bool = False, opts: tuple = ()):
                     rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
             stamp(6)
+            tstamp(tli, 0)
 
             ixnn = ld_idx((tli + NB) * TT + lane)
             if const_expr(not NODMA):
@@ -325,6 +354,7 @@ def compile_decode_kt(nhg: int = 6, timing: bool = False, opts: tuple = ()):
                     lambda _i=ixn, _b=base + ((tli + (NB - 1)) % NB) * BUF: dma_tile(_i, _b),
                 )
 
+            tstamp(tli, 1)
             ses = []
             for s in range_constexpr(4):
                 scg = fx.Int32(
@@ -336,18 +366,20 @@ def compile_decode_kt(nhg: int = 6, timing: bool = False, opts: tuple = ()):
             alpha_a = fx.Float32(1.0)
             if const_expr(GUARD_QK):
                 if w < NH:
-                    m_a, l_a, alpha_a, pl_a = qk_slot(bb, q8a, qsa, q8la, qsla, qr_a, m_a, l_a, pos0, ses)
+                    m_a, l_a, alpha_a, pl_a = qk_slot(bb, q8a, qsa, q8la, qsla, qr_a, m_a, l_a, pos0, ses, tli)
                     p_store(hl_a, pl_a, alpha_a)
             else:
-                m_a, l_a, alpha_a, pl_a = qk_slot(bb, q8a, qsa, q8la, qsla, qr_a, m_a, l_a, pos0, ses)
+                m_a, l_a, alpha_a, pl_a = qk_slot(bb, q8a, qsa, q8la, qsla, qr_a, m_a, l_a, pos0, ses, tli)
                 p_store(hl_a, pl_a, alpha_a)
             if const_expr(TWO):
                 m_b, l_b, alpha_b, pl_b = qk_slot(bb, q8b, qsb, q8lb, qslb, qr_b, m_b, l_b, pos0, ses)
                 p_store(hl_b, pl_b, alpha_b)
             stamp(7)
+            tstamp(tli, 2)
             rocdl.s_waitcnt(lgkmcnt=0)
             gpu.barrier()
             stamp(8)
+            tstamp(tli, 3)
 
             # PV: wave w owns dim chunks CPW*w .. CPW*w + CPW - 1 (16 dims each) of all NH head groups
             alphas = [
@@ -383,6 +415,7 @@ def compile_decode_kt(nhg: int = 6, timing: bool = False, opts: tuple = ()):
                     for hl in range_constexpr(NH):
                         o[hl * CPW + d] = _mfma_f16(a, pfk[hl], o[hl * CPW + d])
             stamp(9)
+            tstamp(tli, 4)
             fin_state = [m_a, l_a]
             if const_expr(TWO):
                 fin_state += [m_b, l_b]

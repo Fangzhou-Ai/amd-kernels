@@ -25,10 +25,10 @@ def make_cache(slots, gen, device="cuda"):
     return torch.full((slots, RECORD_BYTES), NAN_BYTE, dtype=torch.uint8, device=device)
 
 
-def fill_slots(cache, slots, gen):
+def fill_slots(cache, slots, gen, exp_range=(-4, 4)):
     """Valid records in ``slots``: N(0, 2) latent as e4m3 with a random power-of-two scale per 128 dims, bf16 rope."""
     n = slots.numel()
-    scale = torch.exp2(torch.randint(-4, 4, (n, 4), generator=gen).float())
+    scale = torch.exp2(torch.randint(exp_range[0], exp_range[1], (n, 4), generator=gen).float())
     latent = (torch.randn(n, 4, 128, generator=gen) * 2 / scale[:, :, None]).clamp(-448, 448)
     rec = torch.empty(n, RECORD_BYTES, dtype=torch.uint8)
     rec[:, :512] = latent.view(n, 512).to(torch.float8_e4m3fn).view(torch.uint8)
@@ -37,7 +37,7 @@ def fill_slots(cache, slots, gen):
     cache[slots.long()] = rec.to(cache.device)
 
 
-def make_batch(counts, gen, pages=4096, device="cuda", spec=SPEC, q_scale=0.5):
+def make_batch(counts, gen, pages=4096, device="cuda", spec=SPEC, q_scale=0.5, exp_range=(-4, 4)):
     """Rows with ``counts[r]`` keys each. Rows of one request (``spec`` consecutive) share most of their keys.
 
     Returns (q, cache, indptr, slots).
@@ -64,7 +64,7 @@ def make_batch(counts, gen, pages=4096, device="cuda", spec=SPEC, q_scale=0.5):
     flat = torch.cat(chosen) if chosen else torch.zeros(0, dtype=torch.int32)
     indptr = torch.zeros(rows + 1, dtype=torch.int32)
     indptr[1:] = torch.tensor(counts, dtype=torch.int64).cumsum(0).int()
-    fill_slots(cache, torch.unique(flat), gen)
+    fill_slots(cache, torch.unique(flat), gen, exp_range)
     q = (torch.randn(rows, H, D, generator=gen) * q_scale).bfloat16()
     return q.to(device), cache, indptr.to(device), flat.to(device)
 

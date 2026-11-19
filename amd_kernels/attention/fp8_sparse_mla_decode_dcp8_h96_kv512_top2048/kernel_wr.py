@@ -10,6 +10,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.kernels.dpp_utils import dpp_xor_f32
 from aiter.ops.flydsl.kernels.tensor_shim import buf_load_scalar
 from amd_kernels.warm_up import launcher
 
@@ -30,7 +31,9 @@ from .kernel import (
     _global_i32,
     _global_llvm_ptr,
     _guarded,
+    _e8m0_for,
     _imin,
+    _quant,
     _lds_llvm_ptr,
     _lds_load,
     _lds_store,
@@ -55,6 +58,12 @@ P_OFF = LAT_B
 SC_OFF = P_OFF + KKN * 1024
 EX_OFF = SC_OFF + 4 * RT * 2
 LDS_BYTES = max(EX_OFF + 1024, P_OFF + 16384)
+
+
+def _aux(v):
+    from flydsl._mlir import ir
+
+    return ir.IntegerAttr.get(ir.IntegerType.get_signless(32), v)
 
 
 def _now():
@@ -92,14 +101,27 @@ def q_staged_frags(base, q_off, t, g):
     return q8, q8l
 
 
+def q_hi_frags(base, off, t, g):
+    """Operands of this lane's head from a staged 512-B record (head t at ``off + 512 t``, chunk c at c ^ t)."""
+    a0 = t * 512 + (((8 * (g // 2) + g % 2) ^ t) << 4)
+    out = []
+    for j in range(4):
+        a = base + off + (a0 ^ (32 * j))
+        out.append(_cat(_lds_load(T.i32, 4, a, 16), _lds_load(T.i32, 4, a + 256, 16), 4))
+    return out
+
+
 @launcher
 def compile_decode_wr(timing: bool = False, opts: tuple = ()):
     H = HG_HEADS
-    PQ = "pq" in opts or "qs" in opts
+    PQ = "pq" in opts or "qs" in opts or "qq" in opts
     NOG = "nog" in opts
     SX = "sx" in opts
     QL = "ql" in opts
     QS = "qs" in opts
+    QQ = "qq" in opts
+    STG = "stg" in opts
+    AUX = next((int(o[3:]) for o in opts if o.startswith("cpl") and o[3:].isdigit()), 0)
     NW = 8 if "w8" in opts else 4
     NSLOT = (NSUB + NW - 1) // NW
     CPW = 32 // NW
@@ -182,6 +204,10 @@ def compile_decode_wr(timing: bool = False, opts: tuple = ()):
             if const_expr(NOQ):
                 z8 = Vec.filled(8, 0, fx.Int32)
                 return [z8] * 4, fx.Int32(120), [z8] * 4, fx.Int32(115), [Vec.filled(4, 0, fx.Int32)] * 2, None
+            if const_expr(QQ):
+                q_row = (qi * stride_q + hq * stride_qh) // 2
+                qr_ = [Vec(q_t.load(q_row + (_L + 32 * i) // 2 + g * 4, vec_size=4)) for i in range_constexpr(2)]
+                return None, None, None, None, qr_, None
             if const_expr(QS):
                 q_row8 = (qi * stride_q + hq * stride_qh) // 4
                 sw = fx.Int32(q_t[q_row8 + 288])
@@ -195,6 +221,42 @@ def compile_decode_wr(timing: bool = False, opts: tuple = ()):
             raw_q = _q_load(q_t, q_row, g)
             qr = [Vec(q_t.load(q_row + (_L + 32 * i) // 2 + g * 4, vec_size=4)) for i in range_constexpr(2)]
             return None, None, None, None, qr, raw_q
+
+        def quant_stage():
+            """Quantize this wave's (head, block) units of q (8 lanes each) into the staged hi record; lo stays in regs."""
+            held = []
+            for r in range_constexpr(8 // NW):
+                uid = (w + NW * r) * 8 + (lane >> 3)
+                head = uid >> 2
+                blk = uid & 3
+                sub = lane & 7
+                off = (qi * stride_q + (hg * H + head) * stride_qh) // 2 + blk * 64 + sub * 8
+                va = Vec(q_t.load(off, vec_size=4))
+                vb = Vec(q_t.load(off + 4, vec_size=4))
+                vals = []
+                for v in (va, vb):
+                    vals += [fx.Float32(x) for x in Vec(v.bitcast(fx.BFloat16)).to(fx.Float32)]
+                am = fx.Float32(0.0)
+                for x in vals:
+                    am = _fmax(am, _fmax(x, fx.Float32(0.0) - x))
+                for o_ in (1, 2, 4):
+                    am = _fmax(am, dpp_xor_f32(am, o_))
+                s8, inv = _e8m0_for(am)
+                hi, lo = _quant(vals, inv)
+                _lds_store(
+                    Vec.from_elements(hi, fx.Int32),
+                    T.i32,
+                    base + P_OFF + head * 512 + (((blk * 8 + sub) ^ head) << 4),
+                    16,
+                )
+                _guarded(
+                    sub == 0,
+                    lambda _h=head, _b=blk, _s=s8: _lds_store(
+                        Vec.from_elements([fx.Int32(_s)], fx.Int32).to(fx.Int8), T.i8, base + P_OFF + 8192 + _h * 4 + _b, 1
+                    ),
+                )
+                held.append((lo, head, blk, sub))
+            return held
 
         def stage_q():
             for k in range_constexpr(16 // NW):
@@ -253,7 +315,7 @@ def compile_decode_wr(timing: bool = False, opts: tuple = ()):
 
         def dma_group(s, addrs):
             for m in range_constexpr(8):
-                rocdl.global_load_lds(_global_llvm_ptr(addrs[m]), _lds_llvm_ptr(base + (16 * s + 2 * m) * 512), 16, 0)
+                rocdl.global_load_lds(_global_llvm_ptr(addrs[m]), _lds_llvm_ptr(base + (16 * s + 2 * m) * 512), 16, 0, **({"aux": _aux(AUX)} if AUX else {}))
 
         def side_loads(ixs):
             row = kv_base + fx.Int64(ixs) * RECORD_BYTES
@@ -309,6 +371,33 @@ def compile_decode_wr(timing: bool = False, opts: tuple = ()):
                 ixs_l = [ld_idx(cb + 16 * ssl[k] + t) for k in range(NSLOT)]
                 addrs = [dma_addrs(ssl[k], ixs_l[k]) for k in range(NSLOT)]
             stamp(9)
+            if const_expr(STG):
+                # the optional last slot first, then per slot its DMA and its side loads (wave-uniform op counts)
+                if const_expr(SX):
+                    ixs_l = [ld_idx(cb + 16 * ssl[k] + t) for k in range(NSLOT)]
+                scs_d, rps_d = {}, {}
+
+                def one_slot(k):
+                    maybe(vals[k], lambda _s=ssl[k], _a=addrs[k]: dma_group(_s, _a))
+                    scl_k = fx.Int32(0x3F800000)
+                    rp_k = [Vec.filled(4, 0, fx.Int32), Vec.filled(4, 0, fx.Int32)]
+                    if const_expr(vals[k] is None):
+                        scl_k, rp_k = side_loads(ixs_l[k])
+                    else:
+                        if vals[k]:
+                            scl_k, rp_k = side_loads(ixs_l[k])
+                    scs_d[k] = scl_k
+                    rps_d[k] = rp_k
+                    rocdl.sched_barrier(0)
+
+                one_slot(NSLOT - 1)
+                for k in range_constexpr(NSLOT - 1):
+                    one_slot(k)
+                stamp(10)
+                scs = [scs_d[k] for k in range(NSLOT)]
+                rps = [x for k in range(NSLOT) for x in rps_d[k]]
+                stamp(11)
+                return scs, rps
             if const_expr(LD):
                 data = [[_global_i32(addrs[k][m], 4) for m in range(8)] for k in range(NSLOT)]
                 for k in range_constexpr(NSLOT):
@@ -347,6 +436,25 @@ def compile_decode_wr(timing: bool = False, opts: tuple = ()):
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
             q8, q8l = q_staged_frags(base, P_OFF, t, g)
+        if const_expr(QQ):
+            held = quant_stage()
+            rocdl.s_waitcnt(lgkmcnt=0)
+            gpu.barrier()
+            q8 = q_hi_frags(base, P_OFF, t, g)
+            sw_ = fx.Int32(fx.ptr_load(_ptr(T.i32, base + P_OFF + 8192 + t * 4, 4), result_type=T.i32))
+            qs = (sw_ >> (8 * g)) & 0xFF
+            qsl = _lo_scale(qs)
+            gpu.barrier()
+            for lo, head, blk, sub in held:
+                _lds_store(
+                    Vec.from_elements(lo, fx.Int32),
+                    T.i32,
+                    base + P_OFF + head * 512 + (((blk * 8 + sub) ^ head) << 4),
+                    16,
+                )
+            rocdl.s_waitcnt(lgkmcnt=0)
+            gpu.barrier()
+            q8l = q_hi_frags(base, P_OFF, t, g)
         if const_expr(not PQ and not NOQ):
             q8, qs, q8l, qsl = _q_prologue(raw_q, g)
         stamp(3)
@@ -364,11 +472,14 @@ def compile_decode_wr(timing: bool = False, opts: tuple = ()):
             cb = fx.Int32(pas) * RT
             len_p, vals = pass_vals(cb)
 
-            rocdl.s_waitcnt(vmcnt=0)
+            if const_expr(not STG):
+                rocdl.s_waitcnt(vmcnt=0)
             stamp(4)
 
             sacc_all = []
             for k in range_constexpr(NSLOT):
+                if const_expr(STG and k < NSLOT - 1):
+                    rocdl.s_waitcnt(vmcnt=11 * (NSLOT - 2 - k))
                 sacc_k = Vec.filled(4, 0.0, fx.Float32)
                 if const_expr(vals[k] is None):
                     sacc_k = qk_subtile(ssl[k], scs[k], rps[2 * k : 2 * k + 2])
@@ -377,6 +488,8 @@ def compile_decode_wr(timing: bool = False, opts: tuple = ()):
                         sacc_k = qk_subtile(ssl[k], scs[k], rps[2 * k : 2 * k + 2])
                 sacc_all.append(sacc_k)
             stamp(5)
+            if const_expr(STG):
+                rocdl.s_waitcnt(vmcnt=0)
 
             tmax = neg_inf
             sl = []

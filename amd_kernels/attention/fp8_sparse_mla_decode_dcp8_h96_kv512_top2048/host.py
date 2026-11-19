@@ -18,8 +18,8 @@ D_QK = KV_LORA_RANK + QK_ROPE_HEAD_DIM
 _MAX_SLOTS = 1 << 29
 
 # rows -> (kind, head groups per workgroup, options); first entry whose bound holds wins
-_PLAN_BF16 = ((48, "wr", 1, ("nog",)), (1 << 30, "v1", 0, ()))
-_PLAN_PQ = ((48, "wr", 1, ("nog", "pq", "w8", "ql")), (1 << 30, "v1", 0, ()))
+_PLAN_BF16 = ((48, "wr", 1, ("nog", "w8")), (1 << 30, "kt", 3, ()))
+_PLAN_PQ = ((48, "wr", 1, ("nog", "w8", "pq")), (1 << 30, "kt", 3, ("pq",)))
 
 
 def _plan(rows, pq):
@@ -141,10 +141,6 @@ def fp8_sparse_mla_decode(q, kv_cache, indptr, slots, sm_scale, out=None, q8=Non
     if nnz == 0:
         slots = torch.zeros(1, dtype=torch.int32, device=qt.device)
     kind, nh, opts = _plan(rows, q8 is not None)
-    if q8 is not None and kind == "v1":
-        from .reference import dequantize_q
-
-        qt = dequantize_q(q8)
     _run_compiled(
         _launcher(kind, nh, opts),
         qt,
