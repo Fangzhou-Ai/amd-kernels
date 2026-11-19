@@ -50,19 +50,20 @@ def _scratch(device: torch.device):
 
 
 def plan(max_query_len: int, batch: int) -> tuple[int, int, int]:
-    """``(rows, chunks, min chunk)``: query rows of a sequence a chunk workgroup scores, and the chunks a sequence is cut into
-    (the chunk size follows from the longest row bound at launch, none shorter than the minimum). A workgroup is resident one or two a CU, so the
-    work is about ``batch * tiles * chunks`` workgroups: few sequences are cut finely into row pairs to fill the
-    machine, many take whole rows (at most four, or threes) and about one wave of workgroups (cold-page sweeps)."""
+    """``(rows, chunks, min chunk)``: the query rows of a sequence a chunk workgroup scores, the chunks a sequence is cut
+    into and the shortest chunk (the chunk size follows from the longest row bound at launch). Workgroups are resident
+    one or two a CU: few sequences are cut finely into row pairs to fill the machine, many take whole rows (at most four;
+    threes for five and six) and about one wave of workgroups. Chosen on cold pages (README)."""
     if not 1 <= max_query_len <= QMAX:
         raise ValueError(f"1 - {QMAX} query rows a sequence, got {max_query_len}")
-    if _FORCE is not None:  # experiments: (rows, chunks)
+    if _FORCE is not None:  # experiments: (rows, chunks[, min chunk])
         return min(max_query_len, _FORCE[0]), _FORCE[1], (_FORCE[2] if len(_FORCE) > 2 else 512)
     if batch <= 4:
         return min(max_query_len, 2), CHUNKS_TARGET, 512
-    if max_query_len >= 5:  # rows of 3 (two tiles): two workgroups a CU, a chunk selected on two waves
-        return 3, 12, 512
-    return max_query_len, max(8, min(40, round(300 / batch))), (1024 if batch > 16 else 512)  # whole rows, a wave of workgroups
+    min_chunk = 1024 if batch > 16 else 512
+    if max_query_len >= 5:  # rows of 3: two workgroups a CU, a chunk selected on two waves
+        return 3, 12, min_chunk
+    return max_query_len, (20 if batch <= 32 else 10), min_chunk
 
 
 @functools.cache
