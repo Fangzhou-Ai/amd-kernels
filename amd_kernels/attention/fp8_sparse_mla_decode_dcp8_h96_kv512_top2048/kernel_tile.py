@@ -73,11 +73,10 @@ TT = 64
 THR = 3.0
 MARGIN = 6.0
 SHIFT = 5.0
-ISTR = 1056
-LAT_B = (TT // 2) * ISTR
+LAT_B = TT * 512
 SCL_OFF = LAT_B
 ROPE_OFF = SCL_OFF + 4 * TT * 4
-BUF = ROPE_OFF + (TT // 8) * ISTR
+BUF = ROPE_OFF + TT * 128
 CPW = 8
 P_BUF = NH * 2 * 1024
 AL_BUF = NH * 16 * 4
@@ -170,22 +169,12 @@ def compile_decode_tile(pre_quantized: bool = False, timing: bool = False):
         lds = fx.SharedAllocator().allocate(Smem).peek()
         base = _readfirstlane(fx.ptrtoint(lds.raw.ptr))
 
-        r_beg = _readfirstlane(ip_t[qi])
-        r_end = _readfirstlane(ip_t[qi + 1])
-        r_len = r_end - r_beg
-        r_len = (r_len < 0).select(fx.Int32(0), r_len)
-        nt = _readfirstlane((r_len + (TT - 1)) // TT)
-
-        raw0 = fx.Int32(idx_t[r_beg + lane])
-        first_slot = _readfirstlane(raw0)
-
-        def ld_idx(p):
-            ix = fx.Int32(idx_t[r_beg + p])
-            return (p < r_len).select(ix, first_slot)
-
-        ix0 = (lane < r_len).select(raw0, first_slot)
-        ix1 = ld_idx(TT + lane)
-        stamp(1)
+        def row_bounds():
+            r_beg = _readfirstlane(ip_t[qi])
+            r_end = _readfirstlane(ip_t[qi + 1])
+            r_len = r_end - r_beg
+            r_len = (r_len < 0).select(fx.Int32(0), r_len)
+            return r_beg, r_len, _readfirstlane((r_len + (TT - 1)) // TT)
 
         def dma_tile(ixs, bbase):
             """The 44 DMA operations of a tile (32 latent, 8 rope, 4 scale), all by the DMA wave."""
@@ -193,14 +182,17 @@ def compile_decode_tile(pre_quantized: bool = False, timing: bool = False):
             for i in range_constexpr(32):
                 x = 2 * i + (lane >> 5)
                 ix = fx.Int32(rocdl.ds_bpermute(T.i32, _raw(x * 4), _raw(ixs)))
-                ops.append((kv_base + fx.Int64(ix) * RECORD_BYTES + fx.Int64((lane & 31) * 16), bbase + i * ISTR, 16))
+                fs = (x & 15) ^ ((x >> 1) & 8)
+                ops.append(
+                    (kv_base + fx.Int64(ix) * RECORD_BYTES + fx.Int64(((lane & 31) ^ fs) * 16), bbase + i * 1024, 16)
+                )
             for kk in range_constexpr(8):
                 x = 8 * kk + (lane >> 3)
                 ix = fx.Int32(rocdl.ds_bpermute(T.i32, _raw(x * 4), _raw(ixs)))
                 ops.append(
                     (
-                        kv_base + fx.Int64(ix) * RECORD_BYTES + fx.Int64(_L + 16 + (lane & 7) * 16),
-                        bbase + ROPE_OFF + kk * ISTR,
+                        kv_base + fx.Int64(ix) * RECORD_BYTES + fx.Int64(_L + 16 + ((lane & 7) ^ (lane >> 3)) * 16),
+                        bbase + ROPE_OFF + kk * 1024,
                         16,
                     )
                 )
@@ -215,19 +207,10 @@ def compile_decode_tile(pre_quantized: bool = False, timing: bool = False):
             for src, dst, size in ops:
                 rocdl.global_load_lds(_global_llvm_ptr(src), _lds_llvm_ptr(dst), size, 0)
 
-        _guarded((w == DMA_WAVE) & (nt > 0), lambda: dma_tile(ix0, base))
-        stamp(2)
-
-        def stage_top(i, ixn):
-            """Wait for the tile, sync all waves, load the index of tile i + 2 and issue the DMA of tile i + 1 (DMA wave)."""
+        def sync_tile():
+            """Wait for the landed tile and sync all waves."""
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
-            ixnn = ld_idx((i + 2) * TT + lane)
-            _guarded(
-                (w == DMA_WAVE) & (i + 1 < nt),
-                lambda _i=ixn, _b=base + ((i + 1) % NB) * BUF: dma_tile(_i, _b),
-            )
-            return ixnn
 
         neg_inf = fx.Float32(-1.0e30)
 
@@ -241,11 +224,11 @@ def compile_decode_tile(pre_quantized: bool = False, timing: bool = False):
                 qr = [Vec(q_t.load(q_row + (_L + 32 * i) // 2 + g * 4, vec_size=4)) for i in range_constexpr(2)]
                 q8, qs, q8l, qsl = _q_prologue(raw_q, g)
             stamp(3)
+            _, r_len, nt = row_bounds()
 
             def kread(bb, s, j):
-                tk = 16 * s + t
                 c1 = 8 * (g // 2) + 2 * j + g % 2
-                a1 = bb + (tk // 2) * ISTR + (tk % 2) * 512 + (c1 << 4)
+                a1 = bb + (16 * s + t) * 512 + ((c1 ^ (t ^ ((s & 1) << 3))) << 4)
                 return _cat(_lds_load(T.i32, 4, a1, 16), _lds_load(T.i32, 4, a1 + 256, 16), 4)
 
             def qk_softmax(bb, m_old, l_old, pos0):
@@ -262,9 +245,9 @@ def compile_decode_tile(pre_quantized: bool = False, timing: bool = False):
                         sa[s] = _mfma_fp8(kr[s], q8l[j], acc, ses[s], qsl)
                 for s in range_constexpr(4):
                     tk = 16 * s + t
-                    ra = bb + ROPE_OFF + (tk // 8) * ISTR + (tk % 8) * 128 + 16 * g
+                    ra = bb + ROPE_OFF + (tk // 8) * 1024 + (t % 8) * 128
                     for i in range_constexpr(2):
-                        sa[s] = _mfma_bf16(_lds_load(T.i32, 4, ra + 64 * i, 16), qr[i], sa[s])
+                        sa[s] = _mfma_bf16(_lds_load(T.i32, 4, ra + (((g + 4 * i) ^ (t % 8)) << 4), 16), qr[i], sa[s])
                 sl = []
                 tmax = neg_inf
                 for s in range_constexpr(4):
@@ -292,19 +275,18 @@ def compile_decode_tile(pre_quantized: bool = False, timing: bool = False):
                     Vec.from_elements([alpha], fx.Float32), T.f32, base + AL_OFF + pb * AL_BUF + (w * 16 + t) * 4, 4
                 )
 
-            init = [_raw(neg_inf.ir_value()), _raw(fx.Float32(0.0).ir_value()), _raw(fx.Int32(ix1).ir_value())]
+            init = [_raw(neg_inf.ir_value()), _raw(fx.Float32(0.0).ir_value())]
             for tl, st in range(0, nt + 1, 1, init=init):
                 m_a = fx.Float32(st[0])
                 l_a = fx.Float32(st[1])
-                ixn = fx.Int32(st[2])
                 i = fx.Int32(tl)
-                ixnn = stage_top(i, ixn)
+                sync_tile()
                 tstamp(i, 0)
                 if i < nt:
                     m_a, l_a, alpha_a, pl_a = qk_softmax(base + (i % NB) * BUF, m_a, l_a, i * TT)
                     p_store(i & 1, pl_a, alpha_a)
                 tstamp(i, 2)
-                fin = yield [m_a, l_a, ixnn]
+                fin = yield [m_a, l_a]
             l_tot = _xsum(fx.Float32(fin[1]))
             _lds_store(Vec.from_elements([l_tot], fx.Float32), T.f32, base + L_OFF + (w * 16 + t) * 4, 4)
             has_l = l_tot > fx.Float32(0.0)
@@ -316,16 +298,16 @@ def compile_decode_tile(pre_quantized: bool = False, timing: bool = False):
 
         def pv_role():
             pw = w - 4
+            _, _, nt = row_bounds()
             vi = t // 2
             vtok = 16 * (vi // 4) + 4 * g + vi % 4
-            v_off = (vtok // 2) * ISTR + (vtok % 2) * 512 + (t % 2) * 8
+            fv = (4 * g + vi % 4) ^ (8 * (vi // 4))
+            v_off = vtok * 512 + (((CPW * pw) ^ fv) << 4) + (t % 2) * 8
             init = [_raw(Vec.filled(4, 0.0, fx.Float32).ir_value()) for _ in range(NH * CPW)]
-            init += [_raw(fx.Int32(ix1).ir_value())]
             for tl, st in range(0, nt + 1, 1, init=init):
                 o = [Vec(st[k]) for k in range(NH * CPW)]
-                ixn = fx.Int32(st[NH * CPW])
                 i = fx.Int32(tl)
-                ixnn = stage_top(i, ixn)
+                sync_tile()
                 tstamp(i, 3, 4)
                 if i >= 1:
                     tt_ = i - 1
@@ -359,33 +341,53 @@ def compile_decode_tile(pre_quantized: bool = False, timing: bool = False):
                         for hl in range_constexpr(NH):
                             pf = _lds_load(T.i32, 4, base + P_OFF + pb * P_BUF + (hl * 2 + kk) * 1024 + lane * 16, 16)
                             pfk.append((Vec(pf).bitcast(fx.Float16) * scv[kk]).bitcast(fx.Int32))
-                        rd = [_tr8(bT + v_off + (CPW * pw + d) * 16, kk * 16 * ISTR) for d in range(CPW)]
+                        rd = [_tr8(bT + (v_off ^ (d * 16)), kk * 16384) for d in range(CPW)]
                         for d in range_constexpr(CPW):
                             a = _cvt_v8(rd[d])
                             for hl in range_constexpr(NH):
                                 o[hl * CPW + d] = _mfma_f16(a, pfk[hl], o[hl * CPW + d])
                 tstamp(i, 4, 4)
-                fin = yield o + [ixnn]
+                fin = yield o
             rocdl.s_waitcnt(lgkmcnt=0)
             gpu.barrier()
             for hl in range_constexpr(NH):
                 lv = fx.Float32(fx.ptr_load(_f32_ptr(base + L_OFF + (hl * 16 + t) * 4), result_type=T.f32))
                 inv_l = (lv > fx.Float32(0.0)).select(fx.Float32(1.0) / lv, fx.Float32(0.0))
+                o_row = (qi * stride_o + ((hg0 + hl) * H + t) * stride_oh) >> 1
                 for d in range_constexpr(CPW):
                     ov = Vec(fin[hl * CPW + d])
                     bf = Vec.from_elements([fx.Float32(ov[j]) * inv_l for j in range(4)], fx.Float32).to(fx.BFloat16)
                     o_t.store(
-                        (qi * stride_o + ((hg0 + hl) * H + t) * stride_oh + 16 * (CPW * pw + d) + 4 * g) // 2,
+                        o_row + 8 * (CPW * pw + d) + 2 * g,
                         bf.bitcast(fx.Int32),
                         vec_size=2,
                     )
             stamp(10)
 
         def dma_role():
+            r_beg, r_len, nt = row_bounds()
+            raw0 = fx.Int32(idx_t[r_beg + lane])
+            first_slot = _readfirstlane(raw0)
+
+            def ld_idx(p):
+                ix = fx.Int32(idx_t[r_beg + p])
+                return (p < r_len).select(ix, first_slot)
+
+            ix0 = (lane < r_len).select(raw0, first_slot)
+            ix1 = ld_idx(TT + lane)
+            stamp(1)
+            _guarded(nt > 0, lambda: dma_tile(ix0, base))
+            stamp(2)
             init = [_raw(fx.Int32(ix1).ir_value())]
             for tl, st in range(0, nt + 1, 1, init=init):
                 ixn = fx.Int32(st[0])
-                ixnn = stage_top(fx.Int32(tl), ixn)
+                i = fx.Int32(tl)
+                sync_tile()
+                ixnn = ld_idx((i + 2) * TT + lane)
+                _guarded(
+                    i + 1 < nt,
+                    lambda _i=ixn, _b=base + ((i + 1) % NB) * BUF: dma_tile(_i, _b),
+                )
                 fin = yield [ixnn]
             gpu.barrier()
 

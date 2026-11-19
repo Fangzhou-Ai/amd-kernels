@@ -431,11 +431,12 @@ def compile_decode_row(pre_quantized: bool = False, timing: bool = False):
         l_fin = fx.Float32(fin[1])
         has_l = l_fin > fx.Float32(0.0)
         inv_l = has_l.select(fx.Float32(1.0) / l_fin, fx.Float32(0.0))
+        o_row = (qi * stride_o + (hg * H + t) * stride_oh) >> 1
         for d in range_constexpr(CPW):
             ov = Vec(fin[2 + d])
             bf = Vec.from_elements([fx.Float32(ov[j]) * inv_l for j in range(4)], fx.Float32).to(fx.BFloat16)
             o_t.store(
-                (qi * stride_o + (hg * H + t) * stride_oh + 16 * (CPW * w + d) + 4 * g) // 2,
+                o_row + 8 * (CPW * w + d) + 2 * g,
                 bf.bitcast(fx.Int32),
                 vec_size=2,
             )
