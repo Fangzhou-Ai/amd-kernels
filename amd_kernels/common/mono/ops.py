@@ -454,3 +454,20 @@ def dma_wait():
     """This wave's DMAs (and loads) landed, then the CTA's after the barrier."""
     llvm.inline_asm(None, [], "s_waitcnt vmcnt(0)", "", has_side_effects=True)
     gpu.barrier()
+
+
+def sld_i32(addr, i):
+    """Word ``i`` of an i32 buffer through scalar memory (wave-uniform ``i``):
+    no vector registers, no place in the wave's vector-memory order."""
+    i128 = ir.IntegerType.get_signless(128)
+    v4i32 = ir.VectorType.get([4], T.i32)
+    desc = llvm.bitcast(v4i32, llvm.ptrtoint(i128, rsrc(addr)))
+    return fx.Int32(
+        llvm.call_intrinsic(
+            T.i32,
+            "llvm.amdgcn.s.buffer.load.i32",
+            [desc, (fx.Int32(i) * 4).ir_value(), fx.Int32(0).ir_value()],
+            [],
+            [],
+        )
+    )

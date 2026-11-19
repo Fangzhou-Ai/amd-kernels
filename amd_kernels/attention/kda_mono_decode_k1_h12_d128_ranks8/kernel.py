@@ -55,6 +55,7 @@ from amd_kernels.common.mono.ops import (
     hw_exp2,
     hw_rsq,
     ld_i32,
+    sld_i32,
     lds_dma,
     dma_wait,
     mfma_bf16,
@@ -323,12 +324,10 @@ def stage_attn(c, t):
             sq = sq + sj
             dt = dt + dj
         parts += [wave_sum(sq), wave_sum(dt)]
-    stamp(c["on"], c["tls"], tid, 12)
     if lane == 0:
         for k in range_constexpr(2 * ns):
             fx.ptr_store(parts[k], red + (wave * 2 * ns + k))
     gpu.barrier()
-    stamp(c["on"], c["tls"], tid, 13)
     if wave == 0:
         src = fx.min(lane, ns - 1)
         sq = fx.ptr_load(red + src * 2)
@@ -347,7 +346,6 @@ def stage_attn(c, t):
         if lane == 0:
             fx.ptr_store(den, red + (WGT0 + ns))
     gpu.barrier()
-    stamp(c["on"], c["tls"], tid, 14)
     wt = [fx.ptr_load(red + (WGT0 + s)) for s in range(ns)]
     den = fx.ptr_load(red + (WGT0 + ns))
     mixed = []
@@ -366,7 +364,6 @@ def stage_attn(c, t):
     if lane == 0:
         fx.ptr_store(msq, red + (MSQ0 + wave))
     gpu.barrier()
-    stamp(c["on"], c["tls"], tid, 22)
     tot = fx.ptr_load(red + MSQ0)
     for w in range_constexpr(1, WAVES):
         tot = tot + fx.ptr_load(red + (MSQ0 + w))
@@ -487,14 +484,12 @@ def vm_wait(n):
     llvm.inline_asm(None, [], f"s_waitcnt vmcnt({n})", "", has_side_effects=True)
 
 
-@traced
-def stage_gemv(c, lr_a, ops_a, lr_b, n_b, ops_b, xd):
-    """Logical rows ``lr_a`` .. + 16 and ``lr_b`` .. + ``n_b`` of in_proj against
-    the S x rows (each B operand read once for both) -> bf16 PROJ."""
-    tid, lane, wave, red = c["tid"], c["lane"], c["wave"], c["red"]
+def gemv_mfma(c, ops_a, ops_b, xd):
+    """The weights ``ops_a`` / ``ops_b`` against the S x rows (each B operand read
+    once for both) -> this wave's two 16x16 accumulators."""
+    lane, wave = c["lane"], c["wave"]
     g = lane // ROWS
-    n = c["S"]
-    t = fx.min(lane % ROWS, n - 1)
+    t = fx.min(lane % ROWS, c["S"] - 1)
     nb = c["XB"]
     acc_a = fx.Vector.filled(4, 0.0, fx.Float32)
     acc_b = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -518,15 +513,24 @@ def stage_gemv(c, lr_a, ops_a, lr_b, n_b, ops_b, xd):
             xb = xb.bitcast(fx.BFloat16)
             acc_a = mfma_bf16(ops_a[i][q].bitcast(fx.BFloat16), xb, acc_a)
             acc_b = mfma_bf16(ops_b[i][q].bitcast(fx.BFloat16), xb, acc_b)
+    return acc_a, acc_b
+
+
+@traced
+def gemv_put(c, accs, lr_a, n_a, lr_b, n_b):
+    """The waves' accumulators summed -> bf16 PROJ rows (``n_a`` / ``n_b`` rows
+    from logical rows ``lr_a`` / ``lr_b``; none for a CTA without weights)."""
+    tid, lane, wave, red = c["tid"], c["lane"], c["wave"], c["red"]
     gpu.barrier()  # every wave done reading x: ``red`` shares its LDS
-    fx.ptr_store(acc_a, red + (wave * 64 + lane) * 4)
-    fx.ptr_store(acc_b, c["red2"] + (wave * 64 + lane) * 4)
+    fx.ptr_store(accs[0], red + (wave * 64 + lane) * 4)
+    fx.ptr_store(accs[1], c["red2"] + (wave * 64 + lane) * 4)
     gpu.barrier()
     r = tid % ROWS
     tt = tid // ROWS
-    if tid < ROWS * n:
-        v = bf16r(row_sum(red, r, tt))
-        c["put"](c["proj"], tt * NPROJ + proj_row(lr_a + r), v)
+    if tid < ROWS * c["S"]:
+        if (r < n_a) & (lr_a + r < NPROJ):
+            v = bf16r(row_sum(red, r, tt))
+            c["put"](c["proj"], tt * NPROJ + proj_row(lr_a + r), v)
         if (r < n_b) & (lr_b + r < NPROJ):
             vb = bf16r(row_sum(c["red2"], r, tt))
             c["put"](c["proj"], tt * NPROJ + proj_row(lr_b + r), vb)
@@ -537,20 +541,41 @@ def stage_gemv(c, lr_a, ops_a, lr_b, n_b, ops_b, xd):
 NCONV = 2 * HD + VCH  # conv channels a task computes: its head's q and k, its v chunk
 
 
-def kda_stage(c, req, h, ch):
-    """The task's inputs that need no hand-off, issued before its first poll:
-    metadata, the conv channels' window / weights, the initial state rows, the
-    f_b rows of this wave and the per-head constants."""
+def kda_meta(c):
+    """This CTA's task (the CTAs past the token CTAs take one each, in order) and
+    its request's metadata: scalar loads, issued first (``kda_stage`` uses them)."""
+    s, L, a = c["S"], c["L"], c["args"]
+    ntasks = (s // L) * NH * NVCH
+    task = first_task(c["bid"], s)
+    valid = task < ntasks
+    t = fx.min(task, ntasks - 1)
+    m = {"valid": valid, "req": t // (NH * NVCH), "h": (t // NVCH) % NH, "ch": t % NVCH}
+    req = m["req"]
+    m["acc_idx"] = sld_i32(a["num_acc"], req) - 1
+    slots = [sld_i32(a["st_idx"], req * a["st_stride"] + j) for j in range(L)]
+    m["slots"] = slots
+    m["slot_c"] = slots[0]
+    slot0 = slots[0]
+    for j in range(1, L):
+        slot0 = (m["acc_idx"] == j).select(slots[j], slot0)
+    m["slot0"] = slot0
+    return m
+
+
+def kda_stage(c):
+    """The task's inputs that need no hand-off, issued before its first poll: the
+    conv channels' window / weights, the initial state rows, the f_b rows of this
+    wave and the per-head constants."""
     L, sl, tid, lane, wave = c["L"], c["SL"], c["tid"], c["lane"], c["wave"]
     a = c["args"]
-    k = {}
-    # every value a buffer resource is built on wave-uniform (else a waterfall)
-    k["acc_idx"] = uniform(ld_i32(a["num_acc"], req)) - 1
-    k["slot_c"] = uniform(ld_i32(a["st_idx"], req * a["st_stride"]))
-    k["slot0"] = uniform(ld_i32(a["st_idx"], req * a["st_stride"] + k["acc_idx"]))
-    k["slots"] = [
-        uniform(ld_i32(a["st_idx"], req * a["st_stride"] + j)) for j in range(L)
-    ]
+    m = c["tk"]
+    h, ch = m["h"], m["ch"]
+    k = {
+        "acc_idx": m["acc_idx"],
+        "slot_c": m["slot_c"],
+        "slot0": m["slot0"],
+        "slots": m["slots"],
+    }
     # conv: thread < NCONV owns a channel: q / k channel d of the head, or v
     # channel d of this task's chunk
     tc = fx.min(tid, NCONV - 1)
@@ -650,6 +675,7 @@ def kda_gates(c, k, req, h):
     L, tid, lane, wave = c["L"], c["tid"], c["lane"], c["wave"]
     t = fx.min(lane % 16, L - 1)
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    stamp(c["on"], c["tls"], tid, 17)
     for q in range_constexpr(4):
         kb = (lane // 16) * 32 + 8 * q
         xs = [fx.ptr_load(c["fa"] + (t * HD + kb + e)) for e in range(8)]
@@ -661,6 +687,7 @@ def kda_gates(c, k, req, h):
         gate = fx.Float32(c["lb"]) * sigmoid(k["aa"] * g)
         if lane % 16 < L:
             fx.ptr_store(hw_exp2(gate * fx.Float32(LOG2E)), c["decay"] + (t * HD + kk))
+    stamp(c["on"], c["tls"], tid, 18)
     # l2norm: q / k row r (2 L rows of 128) on wave r % 8
     for rr in range_constexpr((2 * L + WAVES - 1) // WAVES):
         row = fx.min(wave + WAVES * rr, 2 * L - 1)
@@ -685,16 +712,20 @@ def kda_recur(c, k, req, h, ch):
     k0 = (tid % 32) * 4
     live0 = k["slot0"] > 0
     stv = [live0.select(k["st"][e], fx.Float32(0.0)) for e in range(4)]
+    stamp(c["on"], c["tls"], tid, 12)
+    # every token's LDS operands first: the chain below is then ALU and DPP only
+    qv = [[fx.ptr_load(c["qkl"] + ((2 * j) * HD + k0 + e)) for e in range(4)] for j in range(L)]
+    kv = [[fx.ptr_load(c["qkl"] + ((2 * j + 1) * HD + k0 + e)) for e in range(4)] for j in range(L)]
+    dk = [[fx.ptr_load(c["decay"] + (j * HD + k0 + e)) for e in range(4)] for j in range(L)]
+    vl = [fx.ptr_load(c["vloc"] + (j * VCH + v)) for j in range(L)]
+    bt = [fx.ptr_load(c["beta"] + j) for j in range(L)]
     for j in range_constexpr(L):
-        qv = [fx.ptr_load(c["qkl"] + ((2 * j) * HD + k0 + e)) for e in range(4)]
-        kv = [fx.ptr_load(c["qkl"] + ((2 * j + 1) * HD + k0 + e)) for e in range(4)]
-        dk = [fx.ptr_load(c["decay"] + (j * HD + k0 + e)) for e in range(4)]
-        stv = [stv[e] * dk[e] for e in range(4)]
-        p = stv[0] * kv[0] + stv[1] * kv[1] + stv[2] * kv[2] + stv[3] * kv[3]
+        stv = [stv[e] * dk[j][e] for e in range(4)]
+        p = stv[0] * kv[j][0] + stv[1] * kv[j][1] + stv[2] * kv[j][2] + stv[3] * kv[j][3]
         p = butterfly(p, (16, 8, 4, 2, 1))
-        vn = (fx.ptr_load(c["vloc"] + (j * VCH + v)) - p) * fx.ptr_load(c["beta"] + j)
-        stv = [stv[e] + vn * kv[e] for e in range(4)]
-        o = stv[0] * qv[0] + stv[1] * qv[1] + stv[2] * qv[2] + stv[3] * qv[3]
+        vn = (vl[j] - p) * bt[j]
+        stv = [stv[e] + vn * kv[j][e] for e in range(4)]
+        o = stv[0] * qv[j][0] + stv[1] * qv[j][1] + stv[2] * qv[j][2] + stv[3] * qv[j][3]
         o = bf16r(butterfly(o, (16, 8, 4, 2, 1)))
         o = live0.select(o, fx.Float32(0.0))
         slot = k["slots"][j]
@@ -708,6 +739,9 @@ def kda_recur(c, k, req, h, ch):
             )
         if lane % 32 == 0:
             fx.ptr_store(o, c["ol"] + (j * VCH + v))
+        if const_expr(j == 0):
+            stamp(c["on"], c["tls"], tid, 13)
+    stamp(c["on"], c["tls"], tid, 14)
     gpu.barrier()
     if tid < L:
         ss = fx.Float32(0.0)
@@ -716,6 +750,7 @@ def kda_recur(c, k, req, h, ch):
             ss = ss + x * x
         c["put"](c["onrm"], ((req * NH + h) * L + tid) * NVCH + ch, ss)
     gpu.barrier()
+    stamp(c["on"], c["tls"], tid, 15)
 
 
 @traced
@@ -732,6 +767,7 @@ def kda_norm(c, req, h, ch):
             [(c["onrm"], ((req * NH + h) * L + j) * NVCH + q, 1) for q in range(NVCH)]
             + [(c["proj"], (req * L + j) * NPROJ + G2_0 + h * HD + vr, 1)]
         )
+        stamp(c["on"], c["tls"], tid, 16)
         ss = sum_polled(got[:NVCH])
         r = hw_rsq(ss * fx.Float32(1.0 / HD) + fx.Float32(c["onorm_eps"]))
         y = (
@@ -744,25 +780,6 @@ def kda_norm(c, req, h, ch):
             y.to(fx.BFloat16), rsrc(a["core_out"]), (req * L + j) * PROJ + h * HD + vr
         )
     gpu.barrier()
-
-
-@traced
-def kda_tasks(c, on, tls):
-    s, L, tid, bid = c["S"], c["L"], c["tid"], c["bid"]
-    for task in range(first_task(bid, s), (s // L) * NH * NVCH, BLOCKS):
-        req = task // (NH * NVCH)
-        h = (task // NVCH) % NH
-        ch = task % NVCH
-        k = kda_stage(c, req, h, ch)
-        stamp(on, tls, tid, 7)
-        kda_inputs(c, k, req, h)
-        stamp(on, tls, tid, 8)
-        kda_gates(c, k, req, h)
-        stamp(on, tls, tid, 9)
-        kda_recur(c, k, req, h, ch)
-        stamp(on, tls, tid, 10)
-        kda_norm(c, req, h, ch)
-        stamp(on, tls, tid, 11)
 
 
 # ---------------------------------------------------------------- kernel
@@ -918,27 +935,41 @@ def build(key: KdaPreBuild):
         on, tls = key.timeline, lds.tls.ptr
         c["on"], c["tls"] = on, tls
         stamp_begin(on, tls, tid, TL_POINTS)
+        c["tk"] = kda_meta(c)
         if bid < s:
             stage_attn(c, bid)
-        if bid >= s:
-            gi = bid - s
-            ng = BLOCKS - s
-            rows_b = -(-(NPROJ - ROWS * ng) // ng)
-            lr_a = ROWS * gi
-            lr_b = ROWS * ng + rows_b * gi
-            n_b = fx.max(fx.min(fx.Int32(rows_b), NPROJ - lr_b), 0)
-            ops_a = gemv_loads(c, lr_a, ROWS, range(PER_WAVE))
-            ops_b = gemv_loads(c, lr_b, n_b, range(PER_WAVE))
-            wait_x(c)
-            stamp(on, tls, tid, 4)
-            load_x(c)
-            xd = x_direct(c)
-            vm_wait(0)
-            gpu.barrier()
-            stamp(on, tls, tid, 5)
-            stage_gemv(c, lr_a, ops_a, lr_b, n_b, ops_b, xd)
-            stamp(on, tls, tid, 21)
-        kda_tasks(c, on, tls)
+        gi = bid - s
+        ng = BLOCKS - s
+        rows_b = -(-(NPROJ - ROWS * ng) // ng)
+        isg = bid >= s
+        lr_a = ROWS * gi
+        n_a = isg.select(fx.Int32(ROWS), fx.Int32(0))
+        lr_b = ROWS * ng + rows_b * gi
+        n_b = isg.select(fx.max(fx.min(fx.Int32(rows_b), NPROJ - lr_b), 0), fx.Int32(0))
+        ops_a = gemv_loads(c, lr_a, n_a, range(PER_WAVE))
+        ops_b = gemv_loads(c, lr_b, n_b, range(PER_WAVE))
+        wait_x(c)
+        stamp(on, tls, tid, 4)
+        load_x(c)
+        xd = x_direct(c)
+        vm_wait(0)
+        gpu.barrier()
+        stamp(on, tls, tid, 5)
+        accs = gemv_mfma(c, ops_a, ops_b, xd)
+        k = kda_stage(c)
+        gemv_put(c, accs, lr_a, n_a, lr_b, n_b)
+        stamp(on, tls, tid, 21)
+        tk = c["tk"]
+        if tk["valid"]:
+            stamp(on, tls, tid, 7)
+            kda_inputs(c, k, tk["req"], tk["h"])
+            stamp(on, tls, tid, 8)
+            kda_gates(c, k, tk["req"], tk["h"])
+            stamp(on, tls, tid, 9)
+            kda_recur(c, k, tk["req"], tk["h"], tk["ch"])
+            stamp(on, tls, tid, 10)
+            kda_norm(c, tk["req"], tk["h"], tk["ch"])
+            stamp(on, tls, tid, 11)
         stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
 
     @flyc.jit
