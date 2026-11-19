@@ -74,7 +74,7 @@ def linear_shard(x_packed: torch.Tensor, w_packed: torch.Tensor, slab: torch.Ten
     return slab
 
 
-def _mode(comm, x_packed, w_packed, norm_weight, rows, eps=1e-6, out=None):
+def _mode(comm, x_packed, w_packed, norm_weight, rows, eps=1e-5, out=None):
     return ()
 
 
@@ -82,14 +82,14 @@ def _sizes(mode):
     return [limit for limit, _ in TIERS]
 
 
-def _inputs(mode, n, comm, x_packed, w_packed, norm_weight, rows, eps=1e-6, out=None):
+def _inputs(mode, n, comm, x_packed, w_packed, norm_weight, rows, eps=1e-5, out=None):
     xp = packed_rows_buffer(n, w_packed.device)
     return (comm, xp, w_packed, norm_weight, n, eps), {}
 
 
 @warm_up.entry(NAME, mode=_mode, sizes=_sizes, inputs=_inputs)
 def context_proj_gather_norm(comm: ProjComm, x_packed: torch.Tensor, w_packed: torch.Tensor,
-                             norm_weight: torch.Tensor, rows: int, eps: float = 1e-6,
+                             norm_weight: torch.Tensor, rows: int, eps: float = 1e-5,
                              out: torch.Tensor | None = None) -> torch.Tensor:
     """``RMSNorm(x @ W^T)`` of the full [rows, 7168] projection on every rank (see reference.py).
 

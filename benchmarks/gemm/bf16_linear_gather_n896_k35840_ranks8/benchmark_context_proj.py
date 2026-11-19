@@ -70,7 +70,7 @@ def worker(rank, world, port, rows_list, rounds):
     packed = [host.pack_weight(w) for w in shards]
     full = [(torch.randn(N_FULL, K, device=dev, generator=g) * 0.02).bfloat16() for _ in range(2)]
     nw = (torch.rand(N_FULL, device=dev, generator=g) + 0.5).bfloat16()
-    n = 12
+    n = 24
     table = []
     for rows in rows_list:
         aux = [(torch.randn(rows, K // 5, device=dev, generator=g) * 0.4).bfloat16() for _ in range(5)]
@@ -82,13 +82,13 @@ def worker(rank, world, port, rows_list, rounds):
         def replicated(i):
             y = gemm(x, full[i % 2])
             o = torch.empty_like(y)
-            ops.rms_norm(o, y, nw, 1e-6)
+            ops.rms_norm(o, y, nw, 1e-5)
             return o
 
         def sharded(i):
             y = ca.custom_all_gather(gemm(x, shards[i % nc]), dim=-1)
             o = torch.empty_like(y)
-            ops.rms_norm(o, y, nw, 1e-6)
+            ops.rms_norm(o, y, nw, 1e-5)
             return o
 
         def new(i):

@@ -114,6 +114,9 @@ def compile_reduce_gather(split: int):
         empty = Vec.from_elements([fx.Int32(EMPTY)] * 4, fx.Int32)
         la = [(mine_ok & (i32_me != s)).select(mine + slot(s) + fx.Int64(c) * 16, mine) for s in range_constexpr(WORLD)]
         got = [vload(la[s]) for s in range_constexpr(WORLD)]
+        wres = buffer_ops.create_buffer_resource_from_addr(arg_w, num_records_bytes=N_FULL * 2)
+        wts = [_unpack(Vec(buffer_ops.buffer_load(wres, (s * N_SHARD + c * 8) // 2, vec_width=4, dtype=fx.Int32,
+                                                  mask=mine_ok))) for s in range_constexpr(WORLD)]
         ssq = fx.Float32(0.0)
         vals = []
         for s in range_constexpr(WORLD):
@@ -136,11 +139,9 @@ def compile_reduce_gather(split: int):
         fx.gpu.barrier()
         total = smem.ss.ptr[0] + smem.ss.ptr[1]
         rstd = rsq(total * fx.Float32(1.0 / N_FULL) + i32_eps.bitcast(fx.Float32))
-        wres = buffer_ops.create_buffer_resource_from_addr(arg_w, num_records_bytes=N_FULL * 2)
         ores = buffer_ops.create_buffer_resource_from_addr(arg_out, num_records_bytes=fx.Int64(i32_rows) * (N_FULL * 2))
         for s in range_constexpr(WORLD):
-            w = Vec(buffer_ops.buffer_load(wres, (s * N_SHARD + c * 8) // 2, vec_width=4, dtype=fx.Int32, mask=mine_ok))
-            wf = _unpack(w)
+            wf = wts[s]
             o = Vec.from_elements([pk_bf16(vals[s][2 * i] * rstd * wf[2 * i], vals[s][2 * i + 1] * rstd * wf[2 * i + 1])
                                    for i in range_constexpr(4)], fx.Int32)
             buffer_ops.buffer_store(o, ores, (row * N_FULL + s * N_SHARD + c * 8) // 2, mask=mine_ok)
