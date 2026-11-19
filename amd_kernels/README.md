@@ -86,6 +86,8 @@ One line per kernel package. Each package's README has what it does, its entry p
   the DSA decode indexer: MXFP4 paged MQA scores of 32 heads and each row's top-2048 keys, the logits never stored.
 - [`indexer/mxfp4_prefill_score_d128_h32`](indexer/mxfp4_prefill_score_d128_h32/README.md): the DSA prefill indexer's MXFP4 MQA
   logits of ragged rows (32 heads, head dim 128) over staged key pages, eight rows per workgroup sharing each key page.
+- [`indexer/mxfp4_prefill_topk_d128_h32_top2048`](indexer/mxfp4_prefill_topk_d128_h32_top2048/README.md): the DSA prefill indexer's
+  exact top-2048 select over each row's ragged key window of the FP4 scorer's logits.
 
 ## Embedding and activation
 
