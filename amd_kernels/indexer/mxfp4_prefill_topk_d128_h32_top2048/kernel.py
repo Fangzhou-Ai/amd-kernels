@@ -21,7 +21,7 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm  # noqa: F401
 from flydsl.expr import rocdl
 from flydsl.expr.primitive import range_constexpr
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, as_ir_value
 
 from amd_kernels.common import buffer_ops
 from amd_kernels.warm_up import launcher
@@ -60,6 +60,12 @@ def _ballot(pred):
 
 def _popc(mask):
     return I(fx.math.ctpop(mask).to(I))
+
+
+def _lane_prefix(mask):
+    lo = mask.to(I)
+    hi = (mask >> I64(32)).to(I)
+    return I(rocdl.mbcnt_hi(T.i32, as_ir_value(hi), as_ir_value(I(rocdl.mbcnt_lo(T.i32, as_ir_value(lo), as_ir_value(I(0)))))))
 
 
 def _key_to_float(key):
@@ -200,10 +206,10 @@ def _thresholds(smem, tx, lane, wave, nt, keys, wts, t_mid, t_a, t_c, full=True)
         kk = keys[t]
         _hist_add(smem, (kk != INT_MIN).select(_lsr(kk - pmin, sh), I(NBIN) + lane), wts[t // 4])
     fx.gpu.barrier()
-    b0, ab0, pp0 = _scan_hist(smem, lane, t_mid)
+    b0, ab0, _ = _scan_hist(smem, lane, t_mid)
     if full:
-        ba, aba, ppa = _scan_hist(smem, lane, t_a)
-        bc, abc, ppc = _scan_hist(smem, lane, t_c)
+        ba, _, _ = _scan_hist(smem, lane, t_a)
+        bc, _, _ = _scan_hist(smem, lane, t_c)
     fx.gpu.barrier()
     sh1 = fx.max(sh - 12, I(0))
     _zero_hist(smem, tx, nt)
@@ -213,7 +219,7 @@ def _thresholds(smem, tx, lane, wave, nt, keys, wts, t_mid, t_a, t_c, full=True)
         mem = (kk != INT_MIN) & (_lsr(kk - pmin, sh) == b0)
         _hist_add(smem, mem.select(_lsr(kk - pmin, sh1) - (b0 << (sh - sh1)), I(NBIN) + lane), wts[t // 4])
     fx.gpu.barrier()
-    b1, ab1, pp1 = _scan_hist(smem, lane, t_mid - ab0)
+    b1, _, _ = _scan_hist(smem, lane, t_mid - ab0)
     fx.gpu.barrier()
     thr_mid = _key_to_float(pmin + (((b0 << (sh - sh1)) + b1) << sh1))
     if full:
@@ -273,7 +279,7 @@ def compile_threshold(NT=512, CAP=8192):
 # K2: one stream pass at the threshold of K1
 # =====================================================================================================================
 @launcher
-def compile_stream(NT=512, V=4, CAP=8192, NC_ST=2):
+def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
     NW = NT // 64
     CH = NT * 4 * V
     SW = V * 256
@@ -380,7 +386,7 @@ def compile_stream(NT=512, V=4, CAP=8192, NC_ST=2):
 # K2b: retry passes of the rows whose first pass count fell outside [2048, CAP]
 # =====================================================================================================================
 @launcher
-def compile_retry(NT=512, V=4, CAP=8192, NC_ST=2):
+def compile_retry(NT=512, V=4, CAP=6144, NC_ST=2):
     NW = NT // 64
     CH = NT * 4 * V
     SW = V * 256

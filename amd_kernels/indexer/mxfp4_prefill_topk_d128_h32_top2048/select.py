@@ -26,10 +26,14 @@ from .kernel import (
     F,
     I,
     K,
+    _ballot,
     _blk_reduce,
     _float_to_key,
     _hist_add,
+    _lane_prefix,
     _lsr,
+    _popc,
+    _readlane,
     _scan_hist,
     _sts,
     _uniform,
@@ -42,7 +46,7 @@ from .kernel import (
 # K3: exact select over the candidate list (registers), exact fallback for rows whose list is unusable
 # =====================================================================================================================
 @launcher
-def compile_select(NT=256, CAP=8192, POPMAX=64):
+def compile_select(NT=256, CAP=6144, POPMAX=64):
     NW = NT // 64
     PER = CAP // NT
     NCH = NT * 4
@@ -51,6 +55,7 @@ def compile_select(NT=256, CAP=8192, POPMAX=64):
     class Shared:
         hist: fx.Array[fx.Int32, HSZA]
         lidx: fx.Array[fx.Int32, CAP + 64]
+        wc: fx.Array[fx.Int32, (CAP // NT) * (NT // 64) + 64]
         tmp: fx.Array[fx.Int32, POPMAX + 64]
         wred: fx.Array[fx.Int32, 64]
         wsum: fx.Array[fx.Int32, 16]
@@ -80,22 +85,22 @@ def compile_select(NT=256, CAP=8192, POPMAX=64):
         ks_al = ks & I(-64)
         exact = L <= CAP
         good = exact | ((count >= K) & (count <= CAP))
+        raw = []
+        for q in range_constexpr(PER):
+            raw.append(fx.Vector(buffer_ops.buffer_load(cand_r, (row * i32_cstride + q * NT + tx) * 2, vec_width=2, dtype=I,
+                                                        mask=(q * NT + tx) < i32_cstride)))
 
         if good:
             N = fx.min(fx.min(count, I(CAP)), i32_cstride)
             need0 = fx.min(N, I(K))
-            per = (N + (NT - 1)) // NT
             keys = []
             for q in range_constexpr(PER):
-                jq = tx * per + q
-                okq = (q < per) & (jq < N)
-                pr = fx.Vector(buffer_ops.buffer_load(cand_r, (row * i32_cstride + jq) * 2, vec_width=2, dtype=I, mask=okq))
-                keys.append(okq.select(_float_to_key(I(pr[1]).bitcast(F)), I(INT_MIN)))
-                if okq:
-                    _sts(smem.lidx, jq, I(pr[0]) - ks)
+                okq = (q * NT + tx) < N
+                keys.append(okq.select(_float_to_key(I(raw[q][1]).bitcast(F)), I(INT_MIN)))
+                _sts(smem.lidx, q * NT + tx, I(raw[q][0]) - ks)
 
             def load_idx(q):
-                return I(smem.lidx.ptr[tx * per + q])
+                return I(smem.lidx.ptr[q * NT + tx])
             all_sel = N <= K
             kt = I(INT_MIN)
             need_eq = I(0)
@@ -159,7 +164,7 @@ def compile_select(NT=256, CAP=8192, POPMAX=64):
                         kt = kmin + b0
                         need_eq = n0
                     else:
-                        kt, need_eq, eq_total = brute(b0, sh0, n0, p0)
+                        kt, need_eq, _ = brute(b0, sh0, n0, p0)
                     fin = I(1)
                 if fin == 0:
                     sh1 = fx.max(sh0 - 12, I(0))
@@ -171,41 +176,47 @@ def compile_select(NT=256, CAP=8192, POPMAX=64):
                             kt = kmin + r1
                             need_eq = n1
                         else:
-                            kt, need_eq, eq_total = brute(r1, sh1, n1, p1)
+                            kt, need_eq, _ = brute(r1, sh1, n1, p1)
                         fin = I(1)
                     if fin == 0:
-                        b2, a2, p2 = do_round(I(0), sh1, r1, n1, False)
+                        b2, a2, _ = do_round(I(0), sh1, r1, n1, False)
                         kt = kmin + ((r1 << sh1) + b2)
                         need_eq = n1 - a2
             if all_sel:
                 for q in range_constexpr(PER):
-                    jq = tx * per + q
-                    buffer_ops.buffer_store(load_idx(q), out_r, row * i32_out_stride + jq, mask=(q < per) & (jq < N))
+                    jq = q * NT + tx
+                    buffer_ops.buffer_store(load_idx(q), out_r, row * i32_out_stride + jq, mask=jq < N)
             else:
-                gtc = I(0)
-                eqc = I(0)
+                mgs, mes = [], []
                 for q in range_constexpr(PER):
-                    gtc = gtc + (keys[q] > kt).select(I(1), I(0))
-                    eqc = eqc + (keys[q] == kt).select(I(1), I(0))
-                packed = gtc + (eqc << 16)
-                incl5 = _wave_scan(packed, "add")
-                if lane == 63:
-                    _sts(smem.wsum, wave, incl5)
+                    mg = _ballot(keys[q] > kt)
+                    me = _ballot(keys[q] == kt)
+                    mgs.append(mg)
+                    mes.append(me)
+                    _sts(smem.wc, q * NW + wave, _popc(mg) + (_popc(me) << 16))
                 fx.gpu.barrier()
-                prior5 = I(0)
-                for w in range_constexpr(NW):
-                    prior5 = prior5 + (wave > w).select(I(smem.wsum.ptr[w]), I(0))
-                pk = incl5 - packed + prior5
-                gb = pk & 0xFFFF
-                eb = (pk >> 16) & 0xFFFF
+                nflat = PER * NW
+                incl_c = []
+                carry = I(0)
+                for ch in range_constexpr((nflat + 63) // 64):
+                    vch = I(smem.wc.ptr[lane + 64 * ch])
+                    ich = _wave_scan(vch, "add") + carry
+                    incl_c.append(ich)
+                    carry = _readlane(ich, 63)
                 for q in range_constexpr(PER):
+                    f = q * NW + wave
+                    fm1 = fx.max(f - 1, I(0))
+                    pfx = _readlane(incl_c[0], fx.min(fm1, I(63)))
+                    for ch in range_constexpr(1, len(incl_c)):
+                        pfx = (fm1 >= 64 * ch).select(_readlane(incl_c[ch], fx.min(fx.max(fm1 - 64 * ch, I(0)), I(63))), pfx)
+                    pk = (f == 0).select(I(0), pfx)
+                    gb = (pk & 0xFFFF) + _lane_prefix(mgs[q])
+                    eb = ((pk >> 16) & 0xFFFF) + _lane_prefix(mes[q])
                     is_gt = keys[q] > kt
                     is_eq = keys[q] == kt
                     pos6 = gb + fx.min(eb, need_eq)
                     selv = is_gt | (is_eq & (eb < need_eq))
                     buffer_ops.buffer_store(load_idx(q), out_r, row * i32_out_stride + pos6, mask=selv)
-                    gb = gb + is_gt.select(I(1), I(0))
-                    eb = eb + is_eq.select(I(1), I(0))
             for i7 in range_constexpr(K // NT + 1):
                 p7 = need0 + tx + NT * i7
                 buffer_ops.buffer_store(I(-1), out_r, row * i32_out_stride + p7, mask=p7 < K)
@@ -263,9 +274,9 @@ def compile_select(NT=256, CAP=8192, POPMAX=64):
                             else:
                                 idx = (valid & (_lsr(u, 8) == pref)).select(u & 0xFF, I(NBIN) + lane)
                             hist_add1(idx)
-                    rr = yield [nxt[v] for v in range_constexpr(VF)]
+                    yield [nxt[v] for v in range_constexpr(VF)]
                 fx.gpu.barrier()
-                d, above, pop = scan_hist_(need)
+                d, above, _ = scan_hist_(need)
                 fx.gpu.barrier()
                 need = need - above
                 ds.append(d)
