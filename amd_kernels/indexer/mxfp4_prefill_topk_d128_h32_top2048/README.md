@@ -27,7 +27,24 @@ Four launches, one workgroup per row, no host sync:
 
 ## Performance
 
-(table from benchmarks/indexer/mxfp4_prefill_topk_d128_h32_top2048/benchmark_topk.py)
+Graph replay over logits tiles larger than the LLC, one MI355X, min of 15 (us), one causal request unless noted. The floor is a
+read-only kernel streaming the same windows (one workgroup per row, nontemporal 16-byte loads: the ceiling of this layout); TB/s is
+window bytes over our time; the stream launch alone runs at 6.1 TB/s at 715 x 500K (234 of the 277 us), the rest is the fixed latency
+of the threshold, retry-check and select launches.
+
+| rows x keys | AITER `stable=False` | AITER `stable=True` | ours | speedup | floor | TB/s | % of 6.5 TB/s | % of floor |
+|---|---|---|---|---|---|---|---|---|
+| 256 x 150K | 62 | 118 | 52 | 1.2x | 26 | 2.9 | 45% | 49% |
+| 512 x 150K | 104 | 127 | 84 | 1.2x | 50 | 3.7 | 56% | 59% |
+| 715 x 150K | 148 | 181 | 118 | 1.3x | 67 | 3.6 | 56% | 57% |
+| 2048 x 150K | 373 | 529 | 316 | 1.2x | 190 | 3.9 | 59% | 60% |
+| 512 x 500K | 331 | 359 | 192 | 1.7x | 155 | 5.3 | 82% | 81% |
+| 715 x 500K | 477 | 515 | 277 | 1.7x | 208 | 5.2 | 79% | 75% |
+| 715 x 790K | 753 | 784 | 407 | 1.9x | 346 | 5.5 | 85% | 85% |
+| 715 x 500K, several short requests (mean window 42K) | 68 | 90 | 80 | 0.8x | 30 | 1.5 | 23% | 37% |
+
+Short windows are latency-bound (four launches, ~40 us of threshold / check / select chains): below a mean window of ~60K keys AITER's
+single launch is faster.
 
 ## Tests
 
