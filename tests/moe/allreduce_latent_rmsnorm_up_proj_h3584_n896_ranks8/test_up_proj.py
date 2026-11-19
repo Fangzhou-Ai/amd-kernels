@@ -21,8 +21,9 @@ def run(m, runs=3):
     ssq = lat_buf[T.MAX_ROWS * K: T.MAX_ROWS * K + 2 * T.MAX_ROWS * T.WORLD].view(torch.float32).view(T.MAX_ROWS, T.WORLD)
     table = torch.tensor([0] * 8 + [lat_buf.data_ptr()] * 8, dtype=torch.int64, device=dev)
     counts = torch.zeros(T.CNT_WORDS, dtype=torch.int32, device=dev)
-    mpg = T.mpg_of((m + 15) // 16)
-    kernel = T.compile_tail("up", mpg, T.rb_of(m))
+    groups = T.groups_of((m + 15) // 16)
+    mpg = T.mpg_of((m + 15) // 16, groups)
+    kernel = T.compile_tail("up", mpg, T.rb_of(m), False, groups, T.nsub_of((m + 15) // 16))
     for r in range(runs):
         x = rand((T.MAX_ROWS, K), 10 * r + m, dev, 1.5)
         nw = (1 + rand((K,), 10 * r + 1, dev, 0.1)).bfloat16()

@@ -4,7 +4,8 @@
 RMSNorm(3584) and the up projection of this rank's 896-column hidden shard, ``out = shared + rmsnorm(sum_r lat_r) @ W^T``.
 
 Roles (512-thread workgroups). Workgroups 0..127 are the all-reduce: workgroup ``rb`` handles rows RB rb .. RB rb + RB - 1
-(one wave per row, RB = 2, 4 or 8 by row count) when ``rb < nrb``, the others only bump their epoch; the other 224 are
+(one wave per row, RB = 2, 4 or 8 by row count: 40 active all-reduce workgroups next to 168 up-projection ones
+make the last up-projection workgroups wait for a CU) when ``rb < nrb``, the others only bump their epoch; the other 224 are
 the up projection. Both start at once: an up-projection workgroup loads its weights, waits for the reduced latent, and
 runs.
 
@@ -20,14 +21,16 @@ in its own ``lat`` and every owner has finished reading its inbox, which a peer'
 workgroup): every workgroup of the fixed grid runs once per call and every rank makes the same calls, so all epochs equal
 the call count. No input address is exchanged: eager and graph calls are the same.
 
-Up projection. A workgroup owns 16 output columns (n tile ``nt``, 56 tiles) and ``MPG`` 16-token tiles (m group ``g``,
-4 groups) over the whole K; wave w of its 8 takes the 448 K columns [448 w, 448 (w + 1)). The weights are the MFMA A
-operand straight from global memory (16 rows x 4 lane groups, 16 B per lane and 32 K columns per step) and stay in
-registers; the B operand is ``xn`` from ``lat`` through LDS (a coalesced 896 B load per row, then fragment reads). The
-eight waves' accumulators meet in LDS, and the epilogue adds the 8 owners' sums of squares (``1 / rms`` commutes with
-the GEMM) and ``shared`` and stores bf16 ``out`` (which may alias ``shared``). No atomic touches an output and nothing
-leaves the workgroup before the epilogue. The four groups of an n tile share an XCD (workgroup id % 8): the weights
-come from HBM once.
+Up projection. A workgroup owns 16 x NSUB output columns (n tile ``nt``; NSUB is 1 up to 64 rows, else 2) and ``MPG`` 16-token
+tiles (m group ``g``; groups_of(rows) groups, so 224 workgroups at most) over the whole K; wave w of its 8 takes the 448 K
+columns [448 w, 448 (w + 1)). The weights are the MFMA A operand straight from global memory (16 rows x 4 lane groups, 16 B
+per lane and 32 K columns per step) and stay in registers; the B operand is ``xn`` from ``lat`` through LDS (a coalesced
+896 B load per row, staged in two halves of 7 K steps, then fragment reads), shared by the NSUB n tiles so that the
+activation bytes a CU reads per MFMA halve. The eight waves' accumulators meet in LDS, and the epilogue adds the 8 owners'
+sums of squares (``1 / rms`` commutes with the GEMM) and ``shared`` and stores bf16 ``out`` (which may alias ``shared``).
+No atomic touches an output and nothing leaves the workgroup before the epilogue. The groups of an n tile share an XCD
+(workgroup id % 8): the weights come from HBM once per XCD. The grid is 128 all-reduce slots + 224 up-projection slots for
+every call (slots beyond the call's tiles only advance their epoch word), which keeps all epoch words equal.
 
 Modes: ``fused`` (above), ``ar`` (only the all-reduce, waiting for its flags) and ``up`` (only the up projection on a
 ``lat`` filled by an earlier launch).
@@ -54,12 +57,17 @@ MAX_ROWS = 256
 MAX_RB = MAX_ROWS // RB_MIN  # all-reduce workgroup slots
 MAX_MT = MAX_ROWS // 16
 NTILES = N // 16  # 56 n tiles
-GROUPS = 4  # m groups
-UP_WGS = NTILES * GROUPS
+GROUPS = 4  # m groups (default)
+WCM = 0  # cache modifier of the weight loads
+NSUB = 2  # 16-column n tiles per workgroup (default)
+K2_WGS = 224  # up-projection workgroups of every call
+WPE = 0  # waves per SIMD hint (0 = none)
 NWAVES = 8
 KW = K // NWAVES  # K columns per wave
 KSTEPS = KW // 32  # 14
-XROW = KW * 2 + 16  # LDS bytes of a staged row slice: 57 packs of 16 B, so 16 rows hit 16 different bank groups
+HALF = KSTEPS // 2  # K steps staged at a time (two rounds per tile keep the workgroup's LDS at ~66 KB: two workgroups per CU)
+HPK = PK // 2  # 28 packs
+XROW = HPK * 16 + 16  # LDS bytes of a staged half row slice: 29 packs of 16 B, so 16 rows hit 16 different bank groups
 LINE = 128
 F1 = 0  # F1 (row, source): MAX_ROWS x WORLD words
 F2 = MAX_RB * LINE  # F2 (row, owner): MAX_ROWS x WORLD words
@@ -76,12 +84,24 @@ UP_EPOCH0 = MAX_RB
 def rb_of(m: int) -> int:
     """Rows per all-reduce workgroup of a call of ``m`` rows: fewer rows keep a workgroup's memory pipe short, but the
     active all-reduce and up-projection workgroups must stay within the 256 CUs (one workgroup each)."""
-    return 2 if m <= 96 else 4 if m <= 128 else 8
+    return 2 if m <= 64 else 4 if m <= 128 else 8
 
 
-def mpg_of(mt: int) -> int:
+def nsub_of(mt: int) -> int:
+    """16-column n tiles per workgroup: one for small calls (less weight traffic per CU before the flags arrive), two
+    when the activation rows read per CU dominate."""
+    return 1 if mt <= 4 else 2
+
+
+def groups_of(mt: int) -> int:
+    """m groups of a call of ``mt`` 16-token tiles: an even count (the XCD mapping splits 28 n tiles x groups evenly over 8
+    XCDs), at most 8 (224 workgroups), so a workgroup reads few activation rows; the weights it needs are 2 x 114 KB."""
+    return 4 if mt <= 4 else 6 if mt <= 6 else 8
+
+
+def mpg_of(mt: int, groups: int = GROUPS) -> int:
     """16-token tiles of an m group for a call of ``mt`` tiles."""
-    return (mt + GROUPS - 1) // GROUPS
+    return (mt + groups - 1) // groups
 
 
 def _lds_ptr(byte_addr):
@@ -105,16 +125,17 @@ def mfma_wait(v):
 
 
 @launcher
-def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False):
+def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False, groups: int = GROUPS, nsub: int = NSUB):
     """``mpg``: 16-token tiles of an m group (rows <= 64 mpg); ``ts``: each workgroup stores ``s_memrealtime`` (10 ns) stamps
     of its phases into ``arg_ts`` ([workgroup][wave][8] words, a profiling build)."""
-    assert mode in ("fused", "ar", "up") and 1 <= mpg <= (MAX_MT + GROUPS - 1) // GROUPS and rb in (2, 4, 8)
+    assert mode in ("fused", "ar", "up") and groups % 2 == 0 and groups * (NTILES // nsub) <= K2_WGS and 1 <= mpg <= (MAX_MT + groups - 1) // groups and rb in (2, 4, 8)
     do_ar, do_up = mode != "up", mode != "ar"
+    nt2 = NTILES // nsub  # workgroup n tiles of 16 * nsub columns
     RB = rb
     UP0 = MAX_RB if mode == "fused" else 0  # first up-projection workgroup
-    LDS = NWAVES * 16 * XROW + NWAVES * mpg * 1024
-    name = f"latent_tail_h3584_n896_{mode}_mpg{mpg}_rb{rb}" + ("_ts" if ts else "")
-    grid = (MAX_RB if do_ar else 0) + (UP_WGS if do_up else 0)
+    LDS = NWAVES * 16 * XROW + NWAVES * mpg * nsub * 1024
+    name = f"latent_tail_h3584_n896_{mode}_mpg{mpg}_rb{rb}_g{groups}_n{nsub}" + ("_ts" if ts else "")
+    grid = (MAX_RB if do_ar else 0) + (nt2 * (K2_WGS // nt2) if do_up else 0)  # the grid is the same for every call: all epoch words advance together
 
     @fx.struct
     class Shared:
@@ -163,7 +184,7 @@ def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False):
                 if const_expr(wait):
                     fx.rocdl.s_waitcnt(vmcnt=0)
                 t = llvm.inline_asm(T.i64, [], "s_memrealtime $0\n\ts_waitcnt lgkmcnt(0)", "=s", has_side_effects=True)
-                buffer_ops.buffer_store(fx.Int64(t).to(fx.Int32), at(arg_ts, 1 << 26), (bid * NWAVES + wave) * 8 + k,
+                buffer_ops.buffer_store(fx.Int64(t).to(fx.Int32), at(arg_ts, 1 << 26), (bid * NWAVES + wave) * 16 + k,
                                         mask=lane == 0)
 
         def send_done(row, e):
@@ -235,9 +256,10 @@ def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False):
             l16 = lane % 16
             xcd = bid2 % 8
             r8 = bid2 // 8
-            nt = xcd * (NTILES // 8) + r8 // GROUPS
-            mg = r8 % GROUPS
-            n0 = nt * 16
+            lin = xcd * (nt2 * groups // 8) + r8  # the groups of an n tile share an XCD (the weights' L2)
+            nt = lin // groups
+            mg = lin % groups
+            n0 = nt * (16 * nsub)
             kb = wave * KW + g * 8  # K column of this lane's pack at step 0; step s adds 32 s
             e2 = epoch(UP_EPOCH0 + bid2)
             m0 = mg * mpg * 16
@@ -245,7 +267,8 @@ def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False):
             def body():
                 stamp(0)
                 wr = at(arg_w, N * K * 2)
-                a_op = [pack(wr, ((n0 + l16) * K + kb + 32 * s) // 2, None, NT) for s in range_constexpr(KSTEPS)]
+                a_op = [[pack(wr, ((n0 + 16 * u + l16) * K + kb + 32 * s) // 2, None, WCM) for s in range_constexpr(KSTEPS)]
+                        for u in range_constexpr(nsub)]
                 latr = at(my_lat, LAT_BYTES)
                 ssr = at(my_lat + LAT_BYTES, SSQ_BYTES)
                 shr = at(arg_shared, i32_m * (i32_ssh * 2))
@@ -291,15 +314,17 @@ def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False):
                         out.append(pack(latr, (rr * K + wave * KW) // 2 + lane * 4, lane < PK))
                     return out
 
-                def put_x(v):
-                    if lane < PK:
+                def put_x(v, h):
+                    if (lane >= HPK * h) & (lane < HPK * (h + 1)):
                         for r in range_constexpr(16):
-                            llvm.StoreOp(fx.as_ir_value(v[r]), _lds_ptr(stage + r * XROW + lane * 16), alignment=16)
+                            llvm.StoreOp(fx.as_ir_value(v[r]), _lds_ptr(stage + r * XROW + (lane - HPK * h) * 16),
+                                         alignment=16)
 
                 nxt = load_x(0)
-                ep = tx < mpg * 64
-                trow = m0 + (tx // 64) * 16 + (tx % 16)
-                tcol = n0 + ((tx % 64) // 16) * 4
+                ep = tx < nsub * mpg * 64
+                sub = tx // (mpg * 64)
+                trow = m0 + ((tx // 64) % mpg) * 16 + (tx % 16)
+                tcol = n0 + sub * 16 + ((tx % 64) // 16) * 4
                 sq0 = Vec(buffer_ops.buffer_load(ssr, trow * WORLD, vec_width=4, dtype=fx.Float32, mask=ep,
                                                  cache_modifier=SYS))
                 sq1 = Vec(buffer_ops.buffer_load(ssr, trow * WORLD + 4, vec_width=4, dtype=fx.Float32, mask=ep,
@@ -310,26 +335,31 @@ def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False):
                 stamp(3, True)
                 for tt in range_constexpr(mpg):
                     cur = nxt
-                    if tt + 1 < mpg:
-                        nxt = load_x(tt + 1)
-                    put_x(cur)
-                    accs = [Vec.filled(4, zero, fx.Float32), Vec.filled(4, zero, fx.Float32)]
-                    frags = [Vec(llvm.load(T.vec(4, T.i32), _lds_ptr(stage + l16 * XROW + 64 * s + 16 * g),
-                                           alignment=16)) for s in range_constexpr(KSTEPS)]
-                    for s in range_constexpr(KSTEPS):
-                        accs[s % 2] = mfma(a_op[s], frags[s], accs[s % 2])
-                    acc = mfma_wait(accs[0]) + mfma_wait(accs[1])
-                    llvm.StoreOp(fx.as_ir_value(acc), _lds_ptr(red + ((wave * mpg + tt) * 64 + lane) * 16),
-                                 alignment=16)
+                    accs = [[Vec.filled(4, zero, fx.Float32), Vec.filled(4, zero, fx.Float32)] for u in range_constexpr(nsub)]
+                    for h in range_constexpr(2):
+                        put_x(cur, h)
+                        if const_expr(h == 1 and tt + 1 < mpg):
+                            nxt = load_x(tt + 1)  # issued once this tile's registers are in LDS
+                        frags = [Vec(llvm.load(T.vec(4, T.i32), _lds_ptr(stage + l16 * XROW + 64 * s + 16 * g),
+                                               alignment=16)) for s in range_constexpr(HALF)]
+                        for s in range_constexpr(HALF):
+                            for u in range_constexpr(nsub):
+                                accs[u][s % 2] = mfma(a_op[u][HALF * h + s], frags[s], accs[u][s % 2])
+                    for u in range_constexpr(nsub):
+                        acc = mfma_wait(accs[u][0]) + mfma_wait(accs[u][1])
+                        llvm.StoreOp(fx.as_ir_value(acc), _lds_ptr(red + (((wave * mpg + tt) * nsub + u) * 64 + lane) * 16),
+                                     alignment=16)
                 stamp(4)
                 fx.gpu.barrier()
                 stamp(5)
                 if ep:
-                    tt = tx // 64
+                    slot = tx // 64  # (tile, sub) block of the accumulators: tx // (64) = sub * mpg + tt
                     ln = tx % 64
-                    tot = Vec(llvm.load(T.vec(4, T.f32), _lds_ptr(red + (tt * 64 + ln) * 16), alignment=16))
+                    tt = slot % mpg
+                    tot = Vec(llvm.load(T.vec(4, T.f32), _lds_ptr(red + (((tt) * nsub + sub) * 64 + ln) * 16), alignment=16))
                     for w2 in range_constexpr(1, NWAVES):
-                        tot = tot + Vec(llvm.load(T.vec(4, T.f32), _lds_ptr(red + ((w2 * mpg + tt) * 64 + ln) * 16),
+                        tot = tot + Vec(llvm.load(T.vec(4, T.f32),
+                                                  _lds_ptr(red + ((((w2 * mpg + tt) * nsub) + sub) * 64 + ln) * 16),
                                                   alignment=16))
                     sq = ((sqs[0] + sqs[1]) + (sqs[2] + sqs[3])) + ((sqs[4] + sqs[5]) + (sqs[6] + sqs[7]))
                     inv = rsq(sq * fx.Float32(1.0 / K) + eps)
@@ -339,7 +369,7 @@ def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False):
                     buffer_ops.buffer_store(ov, outr, trow * (i32_sout // 2) + tcol // 2, mask=trow < i32_m)
                 stamp(6, True)
 
-            if m0 < i32_m:
+            if (bid2 < nt2 * groups) & (m0 < i32_m):
                 body()
             buffer_ops.buffer_store(e2, cr, UP_EPOCH0 + bid2, mask=tx == 0)
 
@@ -361,5 +391,5 @@ def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False):
                arg_out, i32_sout, i32_eps, i32_zero, arg_ts).launch(grid=(grid, 1, 1), block=(512, 1, 1), stream=stream)
 
     launch.kernel_name = name
-    launch.compile_hints = PRELOAD_HINTS
+    launch.compile_hints = {**PRELOAD_HINTS, **({"waves_per_eu": WPE} if WPE else {})}
     return launch

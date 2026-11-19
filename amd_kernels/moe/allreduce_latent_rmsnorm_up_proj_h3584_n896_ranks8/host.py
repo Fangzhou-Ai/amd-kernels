@@ -19,8 +19,15 @@ MAX_ROWS = T.MAX_ROWS
 
 
 @functools.cache
-def _kernel(mode, mpg, rb, ts=False):
-    return T.compile_tail(mode, mpg, rb, ts)
+def _kernel(mode, mpg, rb, ts=False, groups=T.GROUPS, nsub=T.NSUB):
+    return T.compile_tail(mode, mpg, rb, ts, groups, nsub)
+
+
+def replicated_partial_buffer(rows: int, device, hidden: int = 7168):
+    """Persistent ``[rows, hidden]`` bf16 partial buffer of the replicated-shared layout: the kernel writes only this
+    rank's 896 columns, the rest stays -0.0 (bit pattern 0x8000), so the final all-reduce adds seven -0.0 to every
+    value and returns it bit for bit (x + -0.0 = x for every x, +0.0 would turn a real -0.0 into +0.0)."""
+    return torch.full((rows, hidden), -0.0, dtype=torch.bfloat16, device=device)
 
 
 def _release(ptr, peer):
@@ -81,6 +88,7 @@ class LatentTailComm:
         lats = [self.lat_buf.data_ptr() if r == rank else next(opened) + lat_peers[r][1] for r in range(WORLD)]
         self.buf_table = torch.tensor(self.bufs + lats, dtype=torch.int64, device=device)
         self.counts = torch.zeros(T.CNT_WORDS, dtype=torch.int32, device=device)
+        self.groups_override = 0
         self.rb_override = 0  # experiments: rows per all-reduce workgroup (2, 4 or 8) instead of ``tail_kernel.rb_of``
         self.ts = None  # a [workgroup, wave, 8] int32 tensor of phase stamps (a profiling build), set by the caller
         torch.cuda.synchronize(device)
@@ -103,14 +111,16 @@ class LatentTailComm:
         if tuple(shared.shape) != (m, N) or tuple(out.shape) != (m, N):
             raise ValueError(f"shared and out must be [{m}, {N}]")
         stream = torch.cuda.current_stream()
-        mpg = T.mpg_of((m + 15) // 16)
+        nsub = T.nsub_of((m + 15) // 16)
+        groups = self.groups_override or T.groups_of((m + 15) // 16)
+        mpg = T.mpg_of((m + 15) // 16, groups)
         rb = self.rb_override or T.rb_of(m)
         ts = 0 if self.ts is None else self.ts.data_ptr()
         args = (m, (m + rb - 1) // rb, self.rank, self.buf_table.data_ptr(), self.counts.data_ptr(), x.data_ptr(),
                 x.stride(0), norm_weight.data_ptr(), w.data_ptr(), shared.data_ptr(), shared.stride(0),
                 out.data_ptr(), out.stride(0), f32_bits(eps), 0, ts, stream)
         for mode in modes or (("fused",) if self.fused else ("ar", "up")):
-            run_compiled(_kernel(mode, mpg, rb, bool(ts)), *args)
+            run_compiled(_kernel(mode, mpg, rb, bool(ts), groups, nsub), *args)
         return out
 
     def close(self):

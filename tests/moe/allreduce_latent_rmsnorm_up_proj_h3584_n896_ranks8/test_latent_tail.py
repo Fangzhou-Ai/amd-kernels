@@ -3,7 +3,7 @@
 """Eight-rank contract at the served row counts: eager and graph calls, replayed and changed inputs, determinism."""
 import torch
 import torch.distributed as dist
-from amd_kernels.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8 import LatentTailComm
+from amd_kernels.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8 import LatentTailComm, replicated_partial_buffer
 from amd_kernels.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8 import allreduce_latent_rmsnorm_up_proj as call
 from amd_kernels.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8.reference import latent_tail_reference
 
@@ -68,7 +68,7 @@ def split_and_replicated(rank, dev):
     c = LatentTailComm(rank, dist.group.WORLD, dev, fused=False)
     for m in (12, 80, 192):
         parts, nw, w, shared0 = make(m, 7000 + m, dev, rank)
-        full = torch.zeros(m, 7168, dtype=torch.bfloat16, device=dev)  # persistent zero-padded partial buffer
+        full = replicated_partial_buffer(m, dev)  # persistent -0.0 padded partial buffer
         out = full[:, rank * 896:(rank + 1) * 896]
         for it in range(3):
             call(c, parts[rank], nw, w, shared0, out)
@@ -76,9 +76,9 @@ def split_and_replicated(rank, dev):
             check(out, parts, nw, w, shared0, ("split", m, it))
             for x in parts:
                 x.mul_(-1.0)
-        other = full.clone()
-        other[:, rank * 896:(rank + 1) * 896] = 0
-        assert not bool(other.any()), ("columns outside the shard were written", m)
+        other = full.clone().view(torch.int16)
+        other[:, rank * 896:(rank + 1) * 896] = -32768
+        assert bool((other == -32768).all()), ("columns outside the shard were written", m)
     c.close()
 
 

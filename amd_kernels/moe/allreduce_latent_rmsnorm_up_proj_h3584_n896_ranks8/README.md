@@ -23,17 +23,18 @@ module docstring of `tail_kernel.py`.
 ## Performance
 Eight ranks, graph replay, 24 rotating weight sets, slowest rank, us (quiet runs under gpurun). Stock = AITER
 all-reduce + Triton norm/up-proj. Floor = launch 1.57 + 2 hops (0.7 flag + xGMI bytes at 430 GB/s) + x read + MFMA
-+ drain (model in `benchmark_tail.py`); the measured ceiling is NOT reached: fused is 41-51% of it, not within 10%.
++ drain (model in `benchmark_tail.py`); the measured ceiling is NOT reached: fused is 47-55% of it, not within 10%.
 
 | rows | stock AR+up | fused | speedup | floor | floor / fused |
 |---|---|---|---|---|---|
-| 12 | 13.8 | 11.5 | 1.20x | 5.3 | 46% |
-| 24 | 13.4 | 11.3 | 1.19x | 5.7 | 50% |
-| 40 | 13.7 | 12.1 | 1.13x | 6.1 | 51% |
-| 65 | 16.8 | 16.6 | 1.01x | 6.9 | 41% |
-| 80 | 17.9 | 18.9 | 0.95x | 7.3 | 39% |
-| 128 | 20.7 | 19.0 | 1.09x | 9.4 | 50% |
-| 192 | 26.0 | 23.4 | 1.11x | 11.3 | 48% |
+| 12 | 12.2 | 11.3 | 1.08x | 5.3 | 47% |
+| 24 | 13.2 | 11.6 | 1.14x | 5.7 | 49% |
+| 40 | 13.5 | 12.3 | 1.09x | 6.1 | 50% |
+| 65 | 16.7 | 14.2 | 1.17x | 6.9 | 48% |
+| 80 | 17.2 | 14.9 | 1.15x | 7.3 | 49% |
+| 96 | 18.2 | 15.6 | 1.16x | 7.8 | 50% |
+| 128 | 20.0 | 17.3 | 1.16x | 9.4 | 55% |
+| 192 | 25.2 | 21.4 | 1.18x | 11.3 | 53% |
 
 Each hop costs 1.5-2x its isolated primitive (flag RTT, 7-destination store acks, poll after barrier); see the report.
 
