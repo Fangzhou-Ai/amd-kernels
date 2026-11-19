@@ -13,8 +13,12 @@ from . import prologue as _prologue
 from . import scan as _scan
 from .reference import D, NH, RECORD_BYTES
 
-SCAN_WAVES = 4
-SCAN_NVT = 1
+WALK_WAVES = 4
+WALK_NVT = 1
+CHAIN_WAVES = 4
+CHAIN_NVT = 1
+CHAIN_STAGES = 3
+WALK_STAGES = 2
 FOLD_WAVES = 1
 FOLD_NVT = 1
 FOLD_STAGES = 3
@@ -25,12 +29,12 @@ NUM_CUS = 256
 
 @functools.cache
 def _walk_launcher():
-    return _scan.compile_scan(SCAN_WAVES, SCAN_NVT, False)
+    return _scan.compile_walk(WALK_WAVES, WALK_NVT)
 
 
 @functools.cache
 def _chain_launcher():
-    return _scan.compile_scan(SCAN_WAVES, SCAN_NVT, True)
+    return _scan.compile_scan(CHAIN_WAVES, CHAIN_NVT, True, CHAIN_STAGES)
 
 
 @functools.cache
@@ -46,7 +50,7 @@ def _norm_launcher(w_f32):
 def plan_groups(num_seqs, num_chunks):
     """Chunk groups per sequence: as many as fill the walk kernel's grid on the CUs, each at least ``MIN_CHUNKS`` long."""
     per_seq = num_chunks // max(num_seqs, 1)
-    fill = NUM_CUS // (num_seqs * NH * (8 // (SCAN_WAVES * SCAN_NVT)))
+    fill = NUM_CUS // (num_seqs * NH * (8 // (WALK_WAVES * WALK_NVT)))
     return max(1, min(fill, per_seq // MIN_CHUNKS, MAX_GROUPS))
 
 
@@ -71,13 +75,13 @@ def scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_
         gb = gc = ga = sin = ws
     stream = torch.cuda.current_stream()
     common = (ws.data_ptr(), nc, state_cache.data_ptr(), state_cache.stride(0) * 4, state_indices.data_ptr(), has.data_ptr(),
-              cu_seqlens.data_ptr(), chunk_offsets.data_ptr(), out.data_ptr(), out.stride(0), gb.data_ptr(), gc.data_ptr(),
-              ga.data_ptr(), sin.data_ptr(), g, MIN_CHUNKS, n * NH)
+              cu_seqlens.data_ptr(), chunk_offsets.data_ptr(), out.data_ptr(), out.stride(0))
+    tail = (g, MIN_CHUNKS, n * NH)
     if g > 1:
-        _run_compiled(_chain_launcher(), *common, stream)
+        _run_compiled(_chain_launcher(), *common, gb.data_ptr(), gc.data_ptr(), ga.data_ptr(), sin.data_ptr(), *tail, stream)
         _run_compiled(_fold_launcher(), state_cache.data_ptr(), state_cache.stride(0) * 4, state_indices.data_ptr(), has.data_ptr(),
                       cu_seqlens.data_ptr(), gb.data_ptr(), gc.data_ptr(), ga.data_ptr(), sin.data_ptr(), g, MIN_CHUNKS, n * NH, stream)
-    _run_compiled(_walk_launcher(), *common, stream)
+    _run_compiled(_walk_launcher(), *common, sin.data_ptr(), *tail, stream)
     return out
 
 
