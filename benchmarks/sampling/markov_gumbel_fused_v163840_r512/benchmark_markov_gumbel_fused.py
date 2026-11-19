@@ -13,6 +13,7 @@ import argparse
 import statistics
 
 import torch
+from skeleton import run_stream
 
 from amd_kernels.sampling.markov_gumbel_fused_v163840_r512 import (
     RANK,
@@ -20,7 +21,6 @@ from amd_kernels.sampling.markov_gumbel_fused_v163840_r512 import (
     markov_gumbel_fused,
     scratch_dwords,
 )
-from skeleton import run_stream
 
 TRAFFIC_TBPS = 6.1  # measured: base-logit read + cache write mix
 CONFIGS = ((8, 4), (13, 4), (20, 3), (48, 3))  # (requests, steps): c16, c24, c32, c48

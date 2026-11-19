@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Rule 4 in compile-only mode: the served row counts (1-48) reach exactly the three step-kernel variants (16 / 32 / 48
-row tiles); the step kernel serves every step, temperature and cache layout."""
+"""Rule 4 in compile-only mode: the served row counts (1-48) at one step count reach exactly the three chain-kernel
+variants (16 / 32 / 48 row tiles); a chain kernel serves every temperature and cache layout."""
 
 import pytest
 import torch

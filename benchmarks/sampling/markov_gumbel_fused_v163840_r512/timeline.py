@@ -15,7 +15,13 @@ os.environ["AMD_KERNELS_MARKOV_TS"] = "1"
 import numpy as np
 import torch
 
-from amd_kernels.sampling.markov_gumbel_fused_v163840_r512 import RANK, V, kernel, markov_gumbel_fused, scratch_dwords
+from amd_kernels.sampling.markov_gumbel_fused_v163840_r512 import (
+    RANK,
+    V,
+    kernel,
+    markov_gumbel_fused,
+    scratch_dwords,
+)
 
 
 def main():

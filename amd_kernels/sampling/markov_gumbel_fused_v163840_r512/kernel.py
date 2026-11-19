@@ -49,6 +49,7 @@ ERR_OFF = 8  # dword of the scratch that a timed-out wait sets
 TILES = V // 16 // (NWG * NW)  # 16-column tiles of a wave
 NT = 2  # non-temporal: the base-logit read and the cache write must not push ``w2`` lines out of L2 / the infinity cache
 RES_TILES = {1: (2, 2, 2, 1), 2: (2, 1, 1, 1), 3: (0, 0, 0, 0)}  # tiles per wave kept in LDS across the steps, by row tiles
+AFR_LDS = {1: True, 2: False, 3: True}  # the MFMA operand of the w1 rows read from LDS a k step ahead, not held in registers
 RES_LO = 1  # their first tile index
 TS = bool(int(__import__("os").environ.get("AMD_KERNELS_MARKOV_TS", "0")))  # per-workgroup timestamps into the scratch
 TS_OFF = SCRATCH_DW
@@ -267,7 +268,7 @@ def compile_markov_chain(mt: int, ksteps: int):
         has_map = arg_rowmap != 0
 
         def stamp(s, stage):
-            if TS:
+            if TS:  # noqa: SIM102
                 if tx == 0:
                     t64 = fx.Int64(_llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
                     buffer_ops.buffer_store(t64.to(fx.Int32), sy_r, TS_OFF + (bid * K + s) * 24 + stage)
@@ -373,6 +374,9 @@ def compile_markov_chain(mt: int, ksteps: int):
             return out
 
         def finish_step(smem, s, noisy, divide, afr, temps, h0s, cur):
+            def afr_at(m, k):
+                return a_frag(m, k) if AFR_LDS[MT] else afr[m * KSTEPS + k]
+
             best_v = [F(NEG_INF) for _ in range(MT)]
             best_i = [I(0) for _ in range(MT)]
             rev = s & 1  # odd steps sweep the tiles backwards: the last tiles read (still in L2) are the first needed
@@ -395,11 +399,14 @@ def compile_markov_chain(mt: int, ksteps: int):
                     if first & (ti >= RES_LO) & (ti < RES_LO + rw):
                         res_write(smem, rslot0 + ti - RES_LO, wv)
                     acc = [Vec.filled(4, 0.0, F) for _ in range(MT)]
+                    cur_a = [afr_at(m, 0) for m in range_constexpr(MT)]
                     for k in range_constexpr(KSTEPS):
+                        nxt_a = [afr_at(m, k + 1) for m in range_constexpr(MT)] if k + 1 < KSTEPS else None
                         for m in range_constexpr(MT):
                             acc[m] = Vec(fx.rocdl.mfma_f32_16x16x32_bf16(
                                 Vec.make_type(4, F), [wv[k].bitcast(fx.BFloat16),
-                                                      afr[m * KSTEPS + k].bitcast(fx.BFloat16), acc[m], 0, 0, 0]))
+                                                      cur_a[m].bitcast(fx.BFloat16), acc[m], 0, 0, 0]))
+                        cur_a = nxt_a
                     cl = ti * 16 + (lane // 16) * 4  # this lane's first column inside the wave's slab
                     c0 = n0 + cl
                     for m in range_constexpr(MT):
@@ -497,7 +504,7 @@ def compile_markov_chain(mt: int, ksteps: int):
             fx.rocdl.s_waitcnt(lgkmcnt=0)
             fx.gpu.barrier()
             stamp(s, 1)
-            afr = [a_frag(m, k) for m in range_constexpr(MT) for k in range_constexpr(KSTEPS)]
+            afr = None if AFR_LDS[MT] else [a_frag(m, k) for m in range_constexpr(MT) for k in range_constexpr(KSTEPS)]
             temps = [I(smem.st.ptr[(s * 3 + 1) * 64 + lane % 16 + 16 * m]).bitcast(F) for m in range_constexpr(MT)]
             h0s = [I(smem.st.ptr[(s * 3 + 0) * 64 + lane % 16 + 16 * m]) for m in range_constexpr(MT)]
             flag = I(0)
@@ -543,7 +550,7 @@ def compile_markov_chain(mt: int, ksteps: int):
                     def bad_of(rs):
                         b = I(0)
                         for r_ in rs:
-                            b = b | (I(r_[2]) != tag).select(I(1), I(0))
+                            b = b | (I(r_[2]) != tag).select(I(1), I(0))  # noqa: B023
                         return b
                     rs = rd()
                     bad = _wave_or(bad_of(rs), upper16, upper32)
@@ -572,7 +579,7 @@ def compile_markov_chain(mt: int, ksteps: int):
                                                           cache_modifier=SC1, mask=okl))
 
                     def bad_res(rv):
-                        return (okl & (I(rv[2]) != tag)).select(I(1), I(0))
+                        return (okl & (I(rv[2]) != tag)).select(I(1), I(0))  # noqa: B023
                     rv = rdres()
                     bad2 = _wave_or(bad_res(rv), upper16, upper32)
                     spins2 = I(0)
@@ -585,7 +592,7 @@ def compile_markov_chain(mt: int, ksteps: int):
                         buffer_ops.buffer_store(I(1), sy_r, ERR_OFF, cache_modifier=SC1)
                     tok_v = ((I(rv[1]) >= 0) & (I(rv[1]) < V)).select(I(rv[1]), I(0))
                     smem.tk.ptr[lane] = tok_v
-                    if bid == 0:
+                    if bid == 0:  # noqa: SIM102
                         if okl:
                             buffer_ops.buffer_store(Vec.from_elements([tok_v, I(0)], I), tok_r,
                                                     (lane * i32_tok_stride + s) * 2)
@@ -594,7 +601,7 @@ def compile_markov_chain(mt: int, ksteps: int):
             fx.gpu.barrier()
             tok_l = I(smem.tk.ptr[lane])
             yield [v.ir_value() for v in nxt] + [tok_l.ir_value()]
-        if bid == 0:
+        if bid == 0:  # noqa: SIM102
             if tx == 0:
                 buffer_ops.buffer_store(gen + K, sy_r, 0, cache_modifier=SC1)
 

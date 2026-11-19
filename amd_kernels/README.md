@@ -86,7 +86,7 @@ One line per kernel package. Each package's README has what it does, its entry p
 - [`sampling/gumbel_combine_markov_embed_v200064_r256`](sampling/gumbel_combine_markov_embed_v200064_r256/README.md):
   the end of one Markov draft step: combine, draft id, next row.
 - [`sampling/markov_gumbel_fused_v163840_r512`](sampling/markov_gumbel_fused_v163840_r512/README.md): the Kimi-K3.1
-  DSpark Markov draft chain, one launch per step: bias GEMV, logits cache, Gumbel draw, argmax.
+  DSpark Markov draft chain in one persistent launch: bias GEMV, logits cache, Gumbel draw, argmax, k steps.
 - [`sampling/top_p_mask_f32_v200064`](sampling/top_p_mask_f32_v200064/README.md): top-p mask of <= 64 fp32 logits
   rows in one launch (vLLM's split top-p chain, bit for bit).
 
