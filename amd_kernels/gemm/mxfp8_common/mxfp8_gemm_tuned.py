@@ -4,14 +4,14 @@
 string, so the package carries no data file.
 
 Measured rows: QKV
-2560 x 6144 at 385-1536 (except 513-576), 1537-4096, gate_up / down 6144 x 6144 at 257-320,
-385-448 and 641-1280, o_proj 6144 x 2048 at 33-48, 65-80, 129-160,
+2560 x 6144 at 385-1536 (except 513-576), 1537-2048 and 3073-4096, o_proj 6144 x 2048 at 33-48, 65-80, 129-160,
 161-192, 257-320, 385-448 and 1281-3328, o_proj 6144 x 8192 at 417-4095; the bf16 rows of the shared expert
 gate_up 1536 x 6144 and down 6144 x 768 at 1-256; every bf16 row of 3072 x 6144, 6144 x 1536, 4608 x 6144 and
-12288 x 6144 (sweep: benchmarks/gemm/mxfp8_common/sweep_rows.py). The split-K decode rows (6144 x 6144 at 33-256,
-3072 x 6144 and 4608 x 6144 at 33-256, 12288 x 6144 at 49-224, 2-4% slower at 225-256) beat the rows they replaced
-at every multiple of 8 and window start, 6144 x 6144 at every row count; its 225-256 row looks 2 W steps ahead (3
-spills a VGPR, 1% slower) (benchmarks/gemm/mxfp8_common/benchmark_decode_splitk.py). The 4992 x 6144 and 6144 x 4096 rows (``min_m``
+12288 x 6144 (sweep: benchmarks/gemm/mxfp8_common/sweep_rows.py). The split-K decode rows (3072 x 6144 and
+4608 x 6144 at 33-256, 12288 x 6144 at 49-224, 2-4% slower at 225-256) beat the rows they replaced at every multiple
+of 8 and window start (benchmarks/gemm/mxfp8_common/benchmark_decode_splitk.py). 6144 x 6144 has two callers with
+their own rows: the gate_up rows here, the dense down projection's in ``decoder.dense_mxfp8_h6144_i6144_ranks2``
+(``gemm.tuned_rows``). The 4992 x 6144 and 6144 x 4096 rows (``min_m``
 65536) only list those shapes in ``gemm.tuned_shapes``; their folders' ``host.select`` picks the rows.
 Graph-replay tuned on one MI355X with pointer-distinct rotating weights above the
 LLC. One row per (M upper bound, N, K, output dtype): ``M`` is an inclusive upper
@@ -240,7 +240,7 @@ M,N,K,out_dtype,kernel,tile_m,tile_n,tile_k,waves_m,waves_n,waves_per_eu,xcd_swi
 1408,2560,6144,bf16,decode,176,80,128,3,0,0,0,1,,,,0
 1536,2560,6144,bf16,decode,192,80,128,3,0,0,0,1,,,,0
 2048,2560,6144,bf16,4wave,128,256,128,2,2,1,1,1,,
-3072,2560,6144,bf16,4wave_nt,256,128,128,2,2,1,1,1,,
+3072,2560,6144,bf16,4wave_nt,128,256,128,2,2,1,1,1,,
 4096,2560,6144,bf16,4wave_nt,256,256,128,2,2,1,1,1,,
 10240,2560,6144,bf16,4wave_nt,256,256,128,2,2,1,1,1,,
 65536,2560,6144,bf16,4wave,256,256,128,2,2,1,1,1,,
@@ -263,20 +263,18 @@ M,N,K,out_dtype,kernel,tile_m,tile_n,tile_k,waves_m,waves_n,waves_per_eu,xcd_swi
 8,6144,6144,bf16,decode_fq,8,32,128,2,0,0,0,1,6,3
 16,6144,6144,bf16,decode,16,32,128,1,0,0,0,1,7,7
 32,6144,6144,bf16,decode,32,32,128,1,0,0,0,1,,
-64,6144,6144,bf16,decode_splitk,32,96,128,3,3,0,0,2,3,0,,
-96,6144,6144,bf16,decode_splitk,48,96,128,3,3,0,0,2,3,0,,
-128,6144,6144,bf16,decode_splitk,64,96,128,3,3,0,0,2,3,0,,
-160,6144,6144,bf16,decode_splitk,80,96,128,3,3,0,0,2,3,0,,
-192,6144,6144,bf16,decode_splitk,96,96,128,3,3,0,0,2,3,0,,
-224,6144,6144,bf16,decode_splitk,112,96,128,3,3,0,0,2,3,0,,
-256,6144,6144,bf16,decode_splitk,128,96,128,3,3,0,0,2,2,0,,
-320,6144,6144,bf16,decode,48,96,128,2,0,0,0,1,,,,0
+64,6144,6144,bf16,decode,64,32,128,3,0,0,0,1,,
+80,6144,6144,bf16,decode,48,48,128,3,0,0,0,1,,
+96,6144,6144,bf16,decode,96,32,128,3,0,0,0,1,,
+128,6144,6144,bf16,decode,64,48,128,3,0,0,0,1,,
+192,6144,6144,bf16,decode,96,48,128,4,0,0,0,1,,
+224,6144,6144,bf16,decode,112,48,128,3,0,0,0,1,,
+256,6144,6144,bf16,decode,128,48,128,3,0,0,0,1,,
 384,6144,6144,bf16,decode,96,96,128,3,0,0,0,1,,
-448,6144,6144,bf16,decode,64,96,128,2,0,0,0,1,,,,0
 512,6144,6144,bf16,decode,128,96,128,4,0,0,0,1,,
 640,6144,6144,bf16,decode,160,96,128,3,0,0,0,1,,
-1024,6144,6144,bf16,decode,128,96,128,2,0,0,0,1,,,,0
-1280,6144,6144,bf16,4wave_nt,256,128,128,2,2,1,1,1,,
+768,6144,6144,bf16,decode,96,96,128,1,0,0,0,1,,
+1280,6144,6144,bf16,4wave,128,256,128,2,2,1,1,1,,
 65536,6144,6144,bf16,4wave_nt,256,256,128,2,2,1,1,1,,
 8,6144,2048,bf16,decode_fq,8,32,128,2,0,0,0,1,,
 16,6144,2048,bf16,decode_fq,16,32,128,2,0,0,0,1,,

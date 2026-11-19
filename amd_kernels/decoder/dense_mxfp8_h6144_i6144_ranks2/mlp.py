@@ -3,11 +3,14 @@
 """The dense MLP block on its gate_up input codes: gate_up GEMM -> SwiGLU-OAI + MXFP8 quant -> down GEMM (TP
 partial), or at 1-16 rows the fused gate_up + SwiGLU kernel -> down on its bf16 output. The row-count dispatch and
 the code layouts (``gemm.mxfp8_common.prequant_code_tile_rows`` of each GEMM) live here; the GEMM calls are the ones
-``gemm.mxfp8_common``'s linear integration makes for codes / bf16 inputs, so the bits equal the per-kernel chain."""
+``gemm.mxfp8_common``'s linear integration makes for codes / bf16 inputs, so the bits equal the per-kernel chain;
+every config choice of the block reads the down projection's own rows (``gemm_rows.DOWN_ROWS``)."""
 
 import torch
 
 from amd_kernels.warm_up import entry
+
+from .gemm_rows import DOWN_ROWS
 
 H, I = 6144, 6144
 FUSED_GATEUP_MAX_ROWS = 16  # gemm.mxfp8_gateup_swiglu_n12288_k6144_i6144's rows (one 16-row code block)
@@ -44,15 +47,16 @@ def _mlp(q, s, m, gate_up_w, gate_up_ws, down_w, down_ws, alpha, beta, limit, fo
 
     assert 1 <= m <= MAX_ROWS and form in MXFP8_SWIGLU_FORMS
     assert tuple(gate_up_w.shape) == (2 * I, H) and tuple(down_w.shape) == (H, I)
-    if m <= FUSED_GATEUP_MAX_ROWS and q.shape[0] == 16:
-        from amd_kernels.gemm.mxfp8_gateup_swiglu_n12288_k6144_i6144 import mxfp8_gateup_swiglu_bf16
+    with G.tuned_rows(DOWN_ROWS):
+        if m <= FUSED_GATEUP_MAX_ROWS and q.shape[0] == 16:
+            from amd_kernels.gemm.mxfp8_gateup_swiglu_n12288_k6144_i6144 import mxfp8_gateup_swiglu_bf16
 
-        act = mxfp8_gateup_swiglu_bf16(q, s, gate_up_w, gate_up_ws, m, alpha, beta, limit, form=form)
-        return G.mxfp8_linear(act.reshape(-1, I), down_w, down_ws, torch.bfloat16).reshape(m, H)
-    h = _gemm_codes(q, s, gate_up_w, gate_up_ws, m)
-    tile = G.prequant_code_tile_rows(m, H, I, torch.bfloat16)
-    qd, sd = swiglu_oai_mxfp8(h, alpha, beta, limit, tile, form=form)
-    return _gemm_codes(qd, sd, down_w, down_ws, m)
+            act = mxfp8_gateup_swiglu_bf16(q, s, gate_up_w, gate_up_ws, m, alpha, beta, limit, form=form)
+            return G.mxfp8_linear(act.reshape(-1, I), down_w, down_ws, torch.bfloat16).reshape(m, H)
+        h = _gemm_codes(q, s, gate_up_w, gate_up_ws, m)
+        tile = G.prequant_code_tile_rows(m, H, I, torch.bfloat16)
+        qd, sd = swiglu_oai_mxfp8(h, alpha, beta, limit, tile, form=form)
+        return _gemm_codes(qd, sd, down_w, down_ws, m)
 
 
 def _mode(q, s, m, gate_up_w, gate_up_ws, down_w, down_ws, alpha, beta, limit, form="bf16_chain"):

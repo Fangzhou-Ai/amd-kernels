@@ -9,6 +9,7 @@ the workgroups of one b % 8 run on one XCD (the partials stay in that XCD's L2),
 kernel; calls on two streams at once and next to a concurrent kernel give the isolated bytes; the epoch counters stay
 multiples of ``EPOCH``."""
 
+import contextlib
 import glob
 import os
 import subprocess
@@ -18,6 +19,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from amd_kernels.decoder.dense_mxfp8_h6144_i6144_ranks2.gemm_rows import DOWN_ROWS
 from amd_kernels.gemm.mxfp8_common import gemm as G
 from amd_kernels.gemm.mxfp8_common import mxfp8_gemm_decode_splitk as SK
 from amd_kernels.gemm.mxfp8_common.reference import mxfp8_gemm_reference, quantize_mxfp8
@@ -33,15 +35,26 @@ def _shapes():
     return sorted(set(G.tuned_shapes(BF16)) | hosts)
 
 
+# callers' own rows (``gemm.tuned_rows``): 6144 x 6144's split-K rows are the dense down projection's
+CALLER_ROWS = {(6144, 6144): DOWN_ROWS}
+
+
+def _caller(n, k):
+    """The block a call of (n, k) runs in: its caller's rows, else the table's."""
+    text = CALLER_ROWS.get((n, k))
+    return G.tuned_rows(text) if text else contextlib.nullcontext()
+
+
 def _rows():
     """{(n, k, config): [first M, last M]} of every split-K row the bf16 / codes entries select."""
     rows = {}
     for n, k in _shapes():
-        for m in range(1, MAX_M + 1):
-            for config in (G._select_config(m, n, k, BF16), G._select_prequant_config(m, n, k, BF16)):
-                if config.kernel == G._DECODE_SPLITK_KERNEL:
-                    lo, hi = rows.setdefault((n, k, config), [m, m])
-                    rows[(n, k, config)] = [min(lo, m), max(hi, m)]
+        with _caller(n, k):
+            for m in range(1, MAX_M + 1):
+                for config in (G._select_config(m, n, k, BF16), G._select_prequant_config(m, n, k, BF16)):
+                    if config.kernel == G._DECODE_SPLITK_KERNEL:
+                        lo, hi = rows.setdefault((n, k, config), [m, m])
+                        rows[(n, k, config)] = [min(lo, m), max(hi, m)]
     return rows
 
 
@@ -113,32 +126,33 @@ def test_rows_contract(n, k, m):
     bytes, bitwise repeats, graph replay over a NaN-poisoned output and changed inputs."""
     require_gfx950()
     qw, sw, w, ws = _spread_weight(n, k)
-    gen = torch.Generator(device="cuda").manual_seed(m + n)
-    x = _spread((m, k), gen).bfloat16()
-    x[m // 2].zero_()
-    out = G.mxfp8_linear(x, w, ws, BF16)
-    exact = mxfp8_gemm_reference(*quantize_mxfp8(x), qw, sw, accumulate=torch.float64).double()
-    live = exact.norm(dim=1) > 0
-    got = out.double()
-    cos = torch.nn.functional.cosine_similarity(got[live], exact[live], dim=1)
-    rel = (got[live] - exact[live]).norm(dim=1) / exact[live].norm(dim=1)
-    assert cos.min() >= 0.99999 and rel.max() <= 1e-3 and not out[m // 2].any(), (float(cos.min()), float(rel.max()))
-    q, s = G.mxfp8_e4m3_quantize_shuffled(x, G.prequant_code_tile_rows(m, n, k))
-    call = lambda: G.mxfp8_gemm_prequant(q, s, w, ws, BF16, m)  # noqa: E731
-    for _ in range(3):
-        assert torch.equal(call().view(torch.int16), out.view(torch.int16))
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        captured = call()
-    captured.fill_(float("nan"))
-    g.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(captured.view(torch.int16), out.view(torch.int16))
-    q.copy_(G.mxfp8_e4m3_quantize_shuffled(_spread((m, k), gen).bfloat16(), q.shape[0])[0])
-    g.replay()
-    eager = call()
-    torch.cuda.synchronize()
-    assert torch.equal(captured.view(torch.int16), eager.view(torch.int16))
+    with _caller(n, k):
+        gen = torch.Generator(device="cuda").manual_seed(m + n)
+        x = _spread((m, k), gen).bfloat16()
+        x[m // 2].zero_()
+        out = G.mxfp8_linear(x, w, ws, BF16)
+        exact = mxfp8_gemm_reference(*quantize_mxfp8(x), qw, sw, accumulate=torch.float64).double()
+        live = exact.norm(dim=1) > 0
+        got = out.double()
+        cos = torch.nn.functional.cosine_similarity(got[live], exact[live], dim=1)
+        rel = (got[live] - exact[live]).norm(dim=1) / exact[live].norm(dim=1)
+        assert cos.min() >= 0.99999 and rel.max() <= 1e-3 and not out[m // 2].any(), (float(cos.min()), float(rel.max()))
+        q, s = G.mxfp8_e4m3_quantize_shuffled(x, G.prequant_code_tile_rows(m, n, k))
+        call = lambda: G.mxfp8_gemm_prequant(q, s, w, ws, BF16, m)  # noqa: E731
+        for _ in range(3):
+            assert torch.equal(call().view(torch.int16), out.view(torch.int16))
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            captured = call()
+        captured.fill_(float("nan"))
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured.view(torch.int16), out.view(torch.int16))
+        q.copy_(G.mxfp8_e4m3_quantize_shuffled(_spread((m, k), gen).bfloat16(), q.shape[0])[0])
+        g.replay()
+        eager = call()
+        torch.cuda.synchronize()
+        assert torch.equal(captured.view(torch.int16), eager.view(torch.int16))
 
 
 @pytest.mark.parametrize("shape", SHAPES, ids=[f"n{n}_k{k}" for n, k in SHAPES])
@@ -150,24 +164,25 @@ def test_no_compile_after_warmup(shape, monkeypatch):
     require_gfx950()
     n, k = shape
     _, _, w, ws = _spread_weight(n, k)
-    G.warmup_mxfp8_gemm_weight(w, ws, MAX_M, BF16)
-    torch.cuda.synchronize()
-    compiled = []
-    real = MlirCompiler.compile
+    with _caller(n, k):
+        G.warmup_mxfp8_gemm_weight(w, ws, MAX_M, BF16)
+        torch.cuda.synchronize()
+        compiled = []
+        real = MlirCompiler.compile
 
-    def counting(self, *a, **kw):
-        compiled.append(1)
-        return real(self, *a, **kw)
+        def counting(self, *a, **kw):
+            compiled.append(1)
+            return real(self, *a, **kw)
 
-    monkeypatch.setattr(MlirCompiler, "compile", counting)
-    x = torch.zeros((MAX_M, k), device="cuda", dtype=BF16)
-    ms = sorted({m for (n_, k_, _), (lo, hi) in ROWS.items() if (n_, k_) == shape for m in range(lo, hi + 1)})
-    for m in ms:
-        G.mxfp8_linear(x[:m], w, ws, BF16)
-        q, s = G.mxfp8_e4m3_quantize_shuffled(x[:m], G.prequant_code_tile_rows(m, n, k))
-        G.mxfp8_gemm_prequant(q, s, w, ws, BF16, m)
-    torch.cuda.synchronize()
-    assert not compiled, len(compiled)
+        monkeypatch.setattr(MlirCompiler, "compile", counting)
+        x = torch.zeros((MAX_M, k), device="cuda", dtype=BF16)
+        ms = sorted({m for (n_, k_, _), (lo, hi) in ROWS.items() if (n_, k_) == shape for m in range(lo, hi + 1)})
+        for m in ms:
+            G.mxfp8_linear(x[:m], w, ws, BF16)
+            q, s = G.mxfp8_e4m3_quantize_shuffled(x[:m], G.prequant_code_tile_rows(m, n, k))
+            G.mxfp8_gemm_prequant(q, s, w, ws, BF16, m)
+        torch.cuda.synchronize()
+        assert not compiled, len(compiled)
 
 
 def _wide(shape, gen):
