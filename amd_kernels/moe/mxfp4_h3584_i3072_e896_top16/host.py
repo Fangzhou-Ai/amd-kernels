@@ -114,18 +114,21 @@ def _run(exe, *args):
 
 
 def _experts(x_codes: torch.Tensor, x_scales: torch.Tensor, weights: MoeWeights, sort: Sort,
-             out: torch.Tensor | None = None, *, fused: bool = True) -> torch.Tensor:
+             out: torch.Tensor | None = None, *, fused: bool = True, reduce: bool = True) -> torch.Tensor:
     """The routed experts of ``m`` tokens (M <= 192): ``x_codes`` u8/fp4x2 [m, 1792], ``x_scales`` e8m0/u8 [m, 112]
     (row-major MXFP4 of the bf16 activations, ``quantize_activations``), ``sort`` of the router's top-16 -> BF16
     [m, 3584]. Slot k of a token = router weight x down(SiTUv2(gate, up)) rounded once to BF16 in the sorted-row slot
     buffer; the output sums the 16 slots in slot order in fp32 and rounds once: no atomics, bitwise repeatable, graph
-    replay = eager. GEMM1 and GEMM2 run in one launch (``fused``) or two; the sum is a third launch."""
+    replay = eager. GEMM1 and GEMM2 run in one launch (``fused``) or two; the sum is a third launch.
+    ``reduce=False`` skips the sum and returns the slot buffer (bf16 [sort_capacity(192), 3584], one persistent workspace per
+    device and stream, valid until the next call on that stream): row ``sort.reverse_sorted[t * 16 + k]`` is token t's slot k,
+    already multiplied by its router weight; the caller sums k = 0..15 in fp32 and rounds once."""
     m = x_codes.shape[0]
     assert 1 <= m <= MAX_M and x_codes.shape[1] == H // 2 and x_scales.shape == (m, H // 32)
     dev = x_codes.device
-    if out is None:
+    if out is None and reduce:
         out = torch.empty(m, H, dtype=torch.bfloat16, device=dev)
-    assert out.shape == (m, H) and out.dtype == torch.bfloat16 and out.is_contiguous()
+    assert not reduce or out.shape == (m, H) and out.dtype == torch.bfloat16 and out.is_contiguous()
     cap = sort_capacity(m)
     assert sort.sorted_token_ids.numel() >= cap and sort.sorted_expert_ids.numel() >= cap // BM
     assert sort.reverse_sorted.numel() >= m * TOPK
@@ -142,6 +145,8 @@ def _experts(x_codes: torch.Tensor, x_scales: torch.Tensor, weights: MoeWeights,
              ids, eids, nv, m, cap, stream)
         _run(compile_gemm2(), ws["q"].view(-1), ws["qs"].view(-1), weights.w2.view(-1), weights.s2.view(-1),
              ws["slots"].view(-1), ids, wt, eids, nv, m, cap, stream)
+    if not reduce:
+        return ws["slots"]
     _run(compile_reduce(), ws["slots"].view(-1), out.view(-1), sort.reverse_sorted, m, cap, stream)
     return out
 
@@ -158,18 +163,18 @@ def _quantize(x: torch.Tensor, codes: torch.Tensor | None = None, scales: torch.
     return codes, scales
 
 
-def _mode(x_codes, x_scales, weights, sort, out=None, *, fused=True):
-    return (bool(fused),)
+def _mode(x_codes, x_scales, weights, sort, out=None, *, fused=True, reduce=True):
+    return (bool(fused), bool(reduce))
 
 
-def _inputs(mode, n, x_codes, x_scales, weights, sort, out=None, *, fused=True):
+def _inputs(mode, n, x_codes, x_scales, weights, sort, out=None, *, fused=True, reduce=True):
     dev = x_codes.device
     cap = sort_capacity(n)
     z = lambda k, dt: torch.zeros(k, dtype=dt, device=dev)
     s = Sort(z(cap, torch.int32), z(cap, torch.float32), z(cap // BM, torch.int32), z(2, torch.int32),
              z(n * TOPK, torch.int32))
     return (torch.zeros(n, H // 2, dtype=torch.uint8, device=dev), torch.zeros(n, H // 32, dtype=torch.uint8, device=dev),
-            weights, s), {"fused": fused}
+            weights, s), {"fused": fused, "reduce": reduce}
 
 
 mxfp4_moe_experts = entry("moe/mxfp4_h3584_i3072_e896_top16", mode=_mode, sizes=lambda mode: [MAX_M],

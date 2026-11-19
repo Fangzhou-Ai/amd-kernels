@@ -103,3 +103,19 @@ def test_hot_experts_many_blocks(ckpt, weights):
     ref, _ = R.moe_ref(x, ids, tw, *ckpt)
     assert rel(out, ref) < 2e-2
     assert torch.equal(out, mxfp4_moe(x, weights, ids, tw, fused=False))
+
+
+def test_slots_export(weights):
+    """reduce=False: the slot rows, summed by the caller in slot order, equal the entry's output."""
+    m = 40
+    x = make_activation(m, seed=8)
+    ids, tw = make_routing(m, "zipf")
+    codes, scales = quantize_activations(x)
+    sort = moe_sort(ids, tw)
+    out = mxfp4_moe_experts(codes, scales, weights, sort)
+    slots = mxfp4_moe_experts(codes, scales, weights, sort, reduce=False)
+    rows = slots[sort.reverse_sorted.long()].view(m, 16, -1).float()
+    acc = rows[:, 0].clone()
+    for k in range(1, 16):
+        acc = acc + rows[:, k]
+    assert torch.equal(acc.to(torch.bfloat16), out)
