@@ -8,44 +8,45 @@ bf16 rounding: the GEMV), `logits = bf16(base[r, s] + bias)` stored into the dra
 `DraftLogitsCache.row_mapping`), then vLLM's Gumbel draw (murmur3 uniform of (seed ^ (s << 32), sample_pos - 1 + 2^30,
 column), `-log(-log1p_neg_stable(u))`, `logits / T` with IEEE division, T = 0 plain argmax, invalid rows plain argmax and
 no cache write) and the argmax (first column on ties) into `draft_tokens[r, s]`, which is the next step's `prev`. One
-launch per step in place of the stock ~9 (embedding gather, GEMV, add, Gumbel kernel, argmax, gather, copy): the
-`markov_w2` rows (163840 x 512 bf16, 168 MB, read once a step for all rows) are the only large traffic besides the
-base-logit read and cache write (2 x n x 327 KB). Shapes: 1-48 requests, any step count, vocab 163840, rank 512,
-`markov_w1` / `markov_w2` bf16 contiguous. Caller: the K3.1 DSpark speculator at c16-c48 (8 / 13 / 20 / 48 requests,
-4 / 4 / 3 / 3 steps). Contract (`reference.py`): bit for bit vLLM's `gumbel_sample` on the cached logits (checked
-outside this repository, 434 draws, 0 mismatches); the bias sum order differs from the GEMV's (a few logits one bf16
-ulp, 1.5e-6 of elements); inputs finite.
+persistent launch for all k steps in place of the stock ~9 launches a step: 256 workgroups (one per CU, all resident) of
+four waves stream the 168 MB `markov_w2` once a step for all rows, synchronise per step with agent-scope records (no
+atomics into outputs), keep 5-7 weight tiles a workgroup in LDS and alternate the sweep direction so that the last tiles
+read are still in L2. Shapes: 1-48 requests, 1-8 steps, bf16 `markov_w1` / `markov_w2` [163840, 512] contiguous. Caller:
+the K3.1 DSpark speculator at c16-c48 (8 / 13 / 20 / 48 requests, 4 / 4 / 3 / 3 steps). Contract (`reference.py`): bit for
+bit vLLM's `gumbel_sample` on the cached logits (434 draws against the real op, 0 mismatches); the bias sum order differs
+from the GEMV's (a few logits one bf16 ulp); inputs finite.
 
 ## Entry points
 
-- `markov_gumbel_fused`: the k steps over `base` [n, k, 163840] into `draft_tokens` and the cache, graph safe, warms its
-  three row-tile variants up on its first call; the speculator's call site replaces its `for i in range(n_spec)` loop.
-- `scratch_dwords`: size of the int32 scratch (ticket counter + per-workgroup pairs), zeroed once by the caller.
+- `markov_gumbel_fused`: all k steps over `base` [n, k, 163840] into `draft_tokens` and the cache, graph safe, warms its
+  three row-tile variants up on its first call. The 256 workgroups must be co-resident: nothing else may hold CUs of the
+  device while it runs (a wait that never ends is abandoned after about 3 s: wrong draft tokens, not a hung GPU).
+- `scratch_dwords`: size of the int32 scratch (generation, results, rank counters, records), zeroed once, never reset.
 - `available`: gfx950 with FlyDSL importable.
-
-`host.py` picks the variant by row count (16 / 32 / 48 rows); one compiled step kernel serves every step and temperature.
 
 ## Performance
 
-One MI355X, graph replay, 3 rotated `markov_w2` copies, 8 input sets (HBM-cold), T 1.0,
-median of 5 alternated rounds of 10 replays, us per chain. Baseline = vLLM's loop in the same harness.
+One MI355X, graph replay, 3 rotated `markov_w2` copies, 8 input sets (HBM-cold), T 1.0, median of alternated rounds, us per
+chain. Ceiling A = k launches of the pure `markov_w2` stream (the previous per-step design's floor); ceiling B = one
+persistent launch of k stream passes without step synchronisation; both plus the base read / cache write at 6.1 TB/s.
 
 | requests / steps (conf) | 8 / 4 (c16) | 13 / 4 (c24) | 20 / 3 (c32) | 48 / 3 (c48) |
 |---|---|---|---|---|
-| vLLM loop | 238.0 | 276.9 | 202.7 | 307.6 |
-| this entry | 138.8 | 141.8 | 117.3 | 140.1 |
-| measured ceiling (streaming skeleton + extra bytes) | 115 | 118 | 90 | 100 |
-| % of the measured ceiling | 83% | 83% | 77% | 71% |
+| vLLM loop | 238.1 | 286.3 | 202.0 | 305.1 |
+| this entry | 109.1 | 112.8 | 95.8 | 115.1 |
+| speedup | 2.18x | 2.54x | 2.11x | 2.65x |
+| % of ceiling A (115.1 / 117.1 / 89.6 / 98.6 us) | 105% | 104% | 94% | 86% |
+| % of ceiling B (100.3 / 102.3 / 77.7 / 86.6 us) | 92% | 91% | 81% | 75% |
 
-Ceiling: a FlyDSL skeleton with this kernel's weight-load pattern and no math reads `markov_w2` in 28.0 us (6.0 TB/s, grid / depth /
-cache-hint / interleave variants 27.3-29.5 us; includes launch), plus 2 x n x 327 KB a step at 6.1 TB/s, per step. Not in the
-ceiling and the remaining gap: the prologue (previous-token gather, `w1` rows, request state: 3.3 us at 16 rows, 6.8 us at 48; the
-weight stream cannot start before the loads of that chain without delaying them), the ticket tail (2.7 us at 16 rows, 5.7 us at 48)
-and ~5 us of spread between the workgroups' finish times. At T 0 (no noise): 129.5 / 133.4 / 117.5 / 137.7.
+T 0.7: 111.3 / 114.4 / 96.4 / 120.2 us; T 0 (no noise): 105.9 / 108.4 / 90.9 / 105.9 us. Per step (timestamps, `timeline.py`): 0.8 us prologue (tokens, `w1` rows, operand), the tile
+loop (20.8 us median at 8 rows), 2-5 us between the first and the last workgroup finishing, 2.7-3.8 us for the two
+cross-XCD hops of the argmax (0.54 us a hop measured) and the broadcast. Limits, ceilings and the attempts log:
+`analysis/kernels/markov_gumbel_fused_v163840_r512.md`.
 
 ## Tests
 
 ```bash
 python3 -m pytest tests/sampling/markov_gumbel_fused_v163840_r512 -q
-python3 benchmarks/sampling/markov_gumbel_fused_v163840_r512/benchmark_markov_gumbel_fused.py [--temp 0.7]
+python3 benchmarks/sampling/markov_gumbel_fused_v163840_r512/benchmark_markov_gumbel_fused.py [--temp 0.7] [--rounds 9]
+python3 benchmarks/sampling/markov_gumbel_fused_v163840_r512/timeline.py 8 4   # per-step timestamps
 ```
