@@ -35,6 +35,12 @@ CASES = [
     ("two_rows", 2, [1000, 1500], 0),
     ("one_row", 1, [1000, 1500], 0),
 ]
+# (id, query rows, local key counts, cp rank, cp world)
+WORLDS = [
+    ("w1", 4, [1100, 700, 2000], 0, 1),
+    ("w2", 3, [900, 1300], 1, 2),
+    ("w4", 4, [64, 1700, 400], 3, 4),
+]
 NSETS = 85
 
 
@@ -81,15 +87,15 @@ def scales():
     return _SCALES["s"]
 
 
-def launch(batch, qlen, rank, out=None, lse=None):
+def launch(batch, qlen, rank, out=None, lse=None, world=8):
     q, pool, ip, idx, gip = batch
     qs, ks = scales()
-    return fp8_dense_mla_decode(q, pool, ip, idx, gip, qs, ks, SM_SCALE, qlen, rank, 8, out, lse)
+    return fp8_dense_mla_decode(q, pool, ip, idx, gip, qs, ks, SM_SCALE, qlen, rank, world, out, lse)
 
 
-def check(out, lse, batch, qlen, rank):
+def check(out, lse, batch, qlen, rank, world=8):
     q, pool, ip, idx, gip = batch
-    ref_o, ref_l = fp8_dense_mla_decode_ref(q, pool, ip, idx, gip, Q_SCALE, KV_SCALE, SM_SCALE, qlen, 8, rank)
+    ref_o, ref_l = fp8_dense_mla_decode_ref(q, pool, ip, idx, gip, Q_SCALE, KV_SCALE, SM_SCALE, qlen, world, rank)
     empty = ~torch.isfinite(ref_l)
     assert torch.equal(torch.isfinite(lse), ~empty)
     assert not torch.isnan(out.float()).any()
@@ -114,6 +120,35 @@ def test_decode(name, qlen, lens, rank):
     torch.cuda.synchronize()
     assert torch.equal(out.view(torch.int16), out2.view(torch.int16)) and torch.equal(lse, lse2)
     check(out, lse, batch, qlen, rank)
+
+
+@pytest.mark.parametrize("name,qlen,lens,rank,world", WORLDS, ids=[c[0] for c in WORLDS])
+@torch.inference_mode()
+def test_cp_world(name, qlen, lens, rank, world):
+    require_gfx950()
+    batch = make_batch(qlen, lens, rank, seed=11, cp_world=world)
+    out, lse = launch(batch, qlen, rank, world=world)
+    check(out, lse, batch, qlen, rank, world)
+
+
+@torch.inference_mode()
+def test_cache_above_4_gib():
+    """Key rows past the 32-bit byte offset of a 4 GiB cache."""
+    require_gfx950()
+    rows = (5 << 30) // QK_DIM
+    free = torch.cuda.mem_get_info()[0]
+    if free < (6 << 30):
+        pytest.skip("needs 6 GiB free")
+    batch = list(make_batch(4, [700, 900], 2, seed=5))
+    small = batch[1]
+    big = torch.zeros((rows, QK_DIM), dtype=FP8, device="cuda")
+    n = small.shape[0]
+    big[rows - n :] = small
+    batch[1] = big
+    batch[3] = batch[3] + (rows - n)
+    out, lse = launch(batch, 4, 2)
+    ref_batch = (batch[0], small, batch[2], batch[3] - (rows - n), batch[4])
+    check(out, lse, ref_batch, 4, 2)
 
 
 @pytest.mark.parametrize("qlen,lens,rank", [(4, [1200, 800, 0, 0], 3), (3, [3000, 40], 0)], ids=["q4", "q3"])
