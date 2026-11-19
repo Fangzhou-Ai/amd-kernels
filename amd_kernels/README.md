@@ -38,6 +38,9 @@ One line per kernel package. Each package's README has what it does, its entry p
   sliding-window decode attention over an fp8 KV cache.
 - [`attention/norm_rope_fp8_insert_d128_rot64`](attention/norm_rope_fp8_insert_d128_rot64/README.md): the draft's
   norm + RoPE + fp8 KV insert.
+- [`attention/kda_mono_decode_k1_h12_d128_ranks8`](attention/kda_mono_decode_k1_h12_d128_ranks8/README.md): one
+  persistent launch of a KDA layer's decode (AttnRes, in_proj, conv, delta-rule recurrence, gated norm) for a
+  spec-verify step of up to 16 rows.
 
 ## Indexer
 

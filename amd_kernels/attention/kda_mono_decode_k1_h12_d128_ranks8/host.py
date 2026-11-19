@@ -9,7 +9,7 @@ import torch
 from amd_kernels import warm_up
 
 from . import kernel as K
-from .kernel import MAX_S, KdaPreBuild
+from .kernel import BLOCKS, MAX_S, KdaPreBuild
 
 NAME = "attention/kda_mono_decode_k1_h12_d128_ranks8"
 HIDDEN, PROJ, NPROJ, NH, HD = K.HIDDEN, K.PROJ, K.NPROJ, K.NH, K.HD
@@ -62,9 +62,10 @@ class Workspace:
 
 def _mode(ws, layer, prefix, delta, blocks, ares_nw, ares_qk, in_nw, w_in, w_fb, conv_w, conv_state, a_log, dt_bias,
           on_w, rstate, st_idx, num_acc, *, qlen, nblocks, write_idx=-1, eps=1e-5, out_eps=1e-5, onorm_eps=1e-5,
-          lower_bound=-5.0):
+          lower_bound=-5.0, timeline=None):
     """What a call fixes about its kernel besides the token count (``amd_kernels.warm_up``)."""
-    return (qlen, nblocks, delta is not None, write_idx, conv_state.size(-1), eps, out_eps, onorm_eps, lower_bound)
+    return (qlen, nblocks, delta is not None, write_idx, conv_state.size(-1), eps, out_eps, onorm_eps, lower_bound,
+            timeline is not None)
 
 
 def _sizes(mode):
@@ -74,7 +75,7 @@ def _sizes(mode):
 
 def _inputs(mode, n, ws, layer, prefix, delta, blocks, ares_nw, ares_qk, in_nw, w_in, w_fb, conv_w, conv_state, a_log,
             dt_bias, on_w, rstate, st_idx, num_acc, *, qlen, nblocks, write_idx=-1, eps=1e-5, out_eps=1e-5,
-            onorm_eps=1e-5, lower_bound=-5.0):
+            onorm_eps=1e-5, lower_bound=-5.0, timeline=None):
     dev = prefix.device
     z = lambda *s, dt=torch.bfloat16: torch.zeros(*s, dtype=dt, device=dev)  # noqa: E731
     # FlyDSL's handle for a launcher whose arguments are raw addresses runs the kernel once: on a workspace and
@@ -83,7 +84,8 @@ def _inputs(mode, n, ws, layer, prefix, delta, blocks, ares_nw, ares_qk, in_nw, 
             ares_nw, ares_qk, in_nw, w_in, w_fb, conv_w, conv_state, a_log, dt_bias, on_w, rstate,
             z(n // qlen, st_idx.size(1), dt=torch.int32), z(n // qlen, dt=torch.int32) + 1)
     return args, dict(qlen=qlen, nblocks=nblocks, write_idx=write_idx, eps=eps, out_eps=out_eps,
-                      onorm_eps=onorm_eps, lower_bound=lower_bound)
+                      onorm_eps=onorm_eps, lower_bound=lower_bound, timeline=None if timeline is None else
+                      torch.zeros(BLOCKS * K.TL_POINTS, dtype=torch.int64, device=dev))
 
 
 @warm_up.entry(NAME, mode=_mode, sizes=_sizes, inputs=_inputs)
@@ -105,7 +107,7 @@ def kda_mono_decode_k1(ws, layer, prefix, delta, blocks, ares_nw, ares_qk, in_nw
     assert prefix.shape == (s, HIDDEN) and prefix.dtype == torch.bfloat16
     assert blocks.size(0) == s and blocks.size(2) == HIDDEN and blocks.stride(2) == 1
     assert blocks.stride(0) % 8 == 0 and blocks.stride(1) % 8 == 0 and blocks.data_ptr() % 16 == 0
-    assert 1 <= nblocks <= blocks.size(1) and (write_idx < 0 or nblocks <= write_idx < blocks.size(1))
+    assert 1 <= nblocks <= min(8, blocks.size(1)) and (write_idx < 0 or nblocks <= write_idx < blocks.size(1))
     assert w_in.shape == (NPROJ, HIDDEN) and w_in.is_contiguous() and w_fb.shape == (PROJ, HD) and w_fb.is_contiguous()
     assert rstate.dtype == torch.float32 and rstate.shape[1:] == (NH, HD, HD) and rstate.stride()[1:] == (HD * HD, HD, 1)
     assert st_idx.dtype == torch.int32 and st_idx.stride(1) == 1 and num_acc.dtype == torch.int32

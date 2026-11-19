@@ -1,32 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""K1 ``kda_pre``: one Kimi-K3 KDA layer from the AttnRes seam to the gated core
-output, for a spec-verify step (R requests x L tokens, S = R L rows).
+"""K1: one Kimi-K3 KDA layer from the AttnRes seam to the gated core output, for a spec-verify step (R requests x L
+tokens, S = R L rows), in one launch of ``BLOCKS`` CTAs x ``THREADS`` threads (all resident).
 
-One launch a layer, ``BLOCKS`` CTAs x ``THREADS`` threads, in three roles so that
-no CTA that polls a mailbox has weight loads in flight (a poll's load retires
-behind every earlier load):
+    token CTAs 0 .. S-1   AttnRes of one row (prefix + delta -> bf16, softmax weights, mix, RMSNorm) -> the bf16 x
+                          row (plain device-scope stores) and its XRDY flag
+    the other CTAs        26 rows of in_proj each (tile A: 16 rows, tile B: up to 10), issued at kernel start into
+                          registers: the stream is HBM-bound, so every wave but one issues them at once. The
+                          stager wave (``STAGER``) issues its own after it has polled the XRDY flags and DMA'd x
+                          into LDS (``stage_x``): a poll or DMA queued behind a wave's weight loads lands with them.
+                          The MFMAs of a wave wait for its own chunks only; the sums over the waves' K slices -> PROJ
+    KDA tasks             (request, head, 16 state rows), NVCH consecutive CTAs a head, in rounds when R x 12 x 8
+                          exceeds the CTAs left: one poll batch for everything read from PROJ, conv of the head's q / k
+                          channels (redundant in the head's chunks) and the chunk's v channels, f_b MFMA + gate, l2norm,
+                          the recurrence (a state a token), partial norms (ONRM), gated RMSNorm -> core_out
 
-    attn CTAs 0 .. 55   slice (128 hidden columns each): prefix (+ delta) ->
-                        bf16 prefix out, per-source partial sum of squares and
-                        qk dot (PART); gate (token t on CTA t): softmax weights
-                        (WGT); mix: the softmax mix, its partial sum of squares
-                        (MSQ), every slice's -> output RMSNorm -> bf16 x rows
-                        (plain device-scope stores, an XRDY flag a slice)
-    gemv CTAs 56 ..     in_proj, two 16-row groups each: the first group's
-                        weights issued at kernel start, the second's as x lands
-                        -> q|k|v|g|f_a|beta (PROJ)
-    kda tasks           (R x 12 heads x 8 v-chunks) on CTAs 0 ..: inputs that
-                        need no hand-off loaded first (metadata, conv window,
-                        state rows, f_b rows), then conv update of the owned
-                        channels (q / k out through QK), f_b MFMA + lower-bound
-                        gate, l2norm, the recurrence on 16 state rows (a state a
-                        token written), partial norms (ONRM), gated RMSNorm ->
-                        core_out
+x is read through LDS in MFMA-block order (``xblock_col``); what does not fit LDS (S > 10 rows) is loaded straight
+from the x rows (``x_direct``). A chunk's conv-state stores wait for its head's ONRM pairs, which every chunk puts after
+reading its window: the chunks read each other's q / k channels.
 
-Rounding follows the original path where it is elementwise (the AttnRes prefix
-add, every bf16 hand-off between the original kernels); split-K reductions
-differ only in their order.
+Rounding follows the original path where it is elementwise (the AttnRes prefix add, every bf16 hand-off); sums over the
+hidden dimension and K differ only in their order.
 """
 
 import math
@@ -97,6 +91,9 @@ KCH = 128  # K a chunk: 4 MFMAs of 32
 NKCH = HIDDEN // KCH  # 56
 PER_WAVE = NKCH // WAVES  # 7
 STAGER = WAVES - 1  # the wave that stages x
+import os
+WCM = int(os.environ.get('WCM', '0'))
+NSTAGER = int(os.environ.get('NSTAGER', '1'))
 VCH = 16  # state rows a KDA task
 NVCH = HD // VCH  # 8
 CONV_W = 4
@@ -114,7 +111,7 @@ TL_POINTS = 24
 _STREAM = fx.Stream(None)
 REGIONS = ("xrdy", "proj", "onrm")
 # every mono source file: in every build's JIT cache key
-_SOURCES = source_digest("common/mono", "attention/kda_mono_decode_k1_h12_d128_ranks8")
+_SOURCES = source_digest("common/mono", "attention/kda_mono_decode_k1_h12_d128_ranks8") + f"wcm{WCM}ns{NSTAGER}"
 
 
 @dataclass(frozen=True)
@@ -400,7 +397,7 @@ def gemv_loads(c, lr0, nrows, chunks):
         out += [
             fx.Vector(
                 bo.buffer_load(
-                    r_w, base + 16 * q, vec_width=4, dtype=T.i32, cache_modifier=0
+                    r_w, base + 16 * q, vec_width=4, dtype=T.i32, cache_modifier=WCM
                 )
             )
             for q in range(4)
@@ -422,15 +419,18 @@ def stage_x(c):
     l4 = lane // 4
     col0 = (l4 % 8) * KCH + (l4 // 8) * 32 + (lane % 4) * 8
     pieces = (nb + 15) // 16
+    sidx = uniform(c["wave"]) - (WAVES - NSTAGER)
     for t in range_constexpr(c["S"]):
         for p in range_constexpr(pieces):
             col = col0 + (p // 2) * (WAVES * KCH) + (p % 2) * 64
             src = c["xbuf"] + fx.Int64((t * HIDDEN + col) * 2)
             dst = c["xl_b"] + t * c["XROW"] + p * 1024
+            mine = sidx == ((t * pieces + p) % NSTAGER)
             if const_expr(nb % 16 == 0):
-                lds_dma(src, dst, "sc1")
+                if mine:
+                    lds_dma(src, dst, "sc1")
             else:
-                if p * 16 + l4 < nb:
+                if mine & (p * 16 + l4 < nb):
                     lds_dma(src, dst, "sc1")
     vm_wait(0)
 
@@ -450,7 +450,7 @@ def gemv_weights(c, lr_a, n_a, lr_b, n_b):
     ``STAGER``): it polls and stages x first (``stage_x``), then loads its own,
     which lands while the others' MFMAs wait for the barrier."""
     wave = uniform(c["wave"])
-    me = wave == STAGER
+    me = wave >= WAVES - NSTAGER
     ops_a = gemv_loads(c, lr_a, me.select(fx.Int32(0), n_a), range(PER_WAVE))
     ops_b = gemv_loads(c, lr_b, me.select(fx.Int32(0), n_b), range(PER_WAVE))
     if me:

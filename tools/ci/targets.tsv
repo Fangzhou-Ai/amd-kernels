@@ -38,6 +38,9 @@ norm/gemma_add_rmsnorm_h6144/test_decoder_tail_ranks4.py	4
 norm/gemma_add_rmsnorm_h6144/test_slots4_ar_add_rmsnorm.py	4
 norm/gemma_add_rmsnorm_h6144/test_slots4_lossless.py	4
 
+attention/kda_mono_decode_k1_h12_d128_ranks8/test_k1.py	1
+attention/kda_mono_decode_k1_h12_d128_ranks8/test_compile.py	1
+
 # compile tests: compile-only mode, sharing one card (the same FlyDSL compiles, kernel and cache key, as a normal run)
 attention/norm_rope_fp8_insert_d128_rot64/test_compile.py	compile
 attention/norm_rope_nvfp4_insert_d128_rot64_p128/test_compile.py	compile
