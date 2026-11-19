@@ -76,3 +76,30 @@ def test_state_continuation():
     host.scan(rec2, cu2, offsets(cu2), st, c["state_indices"], torch.ones_like(c["has_initial_state"]), o2)
     assert torch.equal(torch.cat([o1, o2]), out_whole)
     assert torch.equal(st, whole_state)
+
+
+@pytest.mark.parametrize("seq,offs,rows,groups,dt_shift", [
+    ([640], [320], None, 1, 0.0), ([2048, 300], [1024, 256], [3, 1], 4, -6.0), ([640, 700], [640, 0], [1, 0], 1, 0.0),
+    ([1500], [1472], None, 5, -6.0),
+], ids=["single", "ragged_rows_g4", "at_end_and_off", "late_g5"])
+@torch.inference_mode()
+def test_checkpoint(seq, offs, rows, groups, dt_shift):
+    """The state after ``checkpoint_offsets[n]`` tokens lands in the checkpoint rows; the final states are unchanged."""
+    require_gfx950()
+    c = make_case(seq, dt_shift=dt_shift)
+    rec, _ = workspace(c)
+    cu = c["cu_seqlens"]
+    ref_state, ref_ck = c["state_cache"].clone(), torch.zeros(len(seq) + 2, R.NH, R.D, R.D, device="cuda")
+    ck_off = torch.tensor(offs, dtype=torch.int32, device="cuda")
+    ck_rows = torch.tensor(rows if rows is not None else list(range(len(seq))), dtype=torch.int32, device="cuda")
+    R.chunk_reference(R.unpack_record(rec), cu, ref_state, c["state_indices"], c["has_initial_state"], ref_ck, ck_off, ck_rows)
+    state, ck = c["state_cache"].clone(), torch.zeros_like(ref_ck)
+    out = torch.zeros(sum(seq), R.NH, R.D, dtype=torch.bfloat16, device="cuda")
+    host.scan(rec, cu, offsets(cu), state, c["state_indices"], c["has_initial_state"], out, groups=groups, checkpoint_state=ck,
+              checkpoint_offsets=ck_off, checkpoint_rows=None if rows is None else ck_rows)
+    assert rel(state, ref_state) < STATE_TOL
+    assert rel(ck, ref_ck) < STATE_TOL
+    touched = {r for r, o in zip(ck_rows.tolist(), offs) if o > 0}
+    for r in range(ck.shape[0]):
+        if r not in touched:
+            assert not ck[r].any()

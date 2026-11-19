@@ -99,9 +99,10 @@ def _block_decode(bid, groups, ngrp):
 
 
 @launcher
-def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2):
+def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2, ckpt: bool = False):
     """``chain=False``: the walk kernel; ``chain=True``: the transfer kernel; ``stages``: depth of the LDS ring (the DMAs and the
-    ``u`` loads of chunk c + stages - 1 are issued during chunk c)."""
+    ``u`` loads of chunk c + stages - 1 are issued during chunk c); ``ckpt``: the walk also stores the state after
+    ``checkpoint_offsets[n]`` tokens of a sequence into ``checkpoint_state``."""
     nsl = waves * nvt
     nslices = 16 if chain else 8
     ngrp = nslices // nsl
@@ -111,7 +112,7 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2):
     stage = CHAIN_STAGE if chain else WALK_STAGE
     ndma = -(-pieces // waves)
     ct_pitch = 16 * nsl + 4  # elements of a staged C^T row
-    name = f"kda_prefill_{'chain' if chain else 'walk'}_h12_d128_w{waves}_v{nvt}_s{stages}"
+    name = f"kda_prefill_{'chain' if chain else 'walk'}_h12_d128_w{waves}_v{nvt}_s{stages}" + ("_ck" if ckpt else "")
 
     @fx.struct
     class Shared:
@@ -136,6 +137,10 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2):
         i32_groups: fx.Int32,
         i32_minc: fx.Int32,
         i32_npairs: fx.Int32,
+        arg_ck: fx.Int64,
+        i64_ck_row_bytes: fx.Int64,
+        arg_ckoff: fx.Int64,
+        arg_ckrow: fx.Int64,
     ):
         tx = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -154,6 +159,9 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2):
             c0 = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_choff), n * 2, vec_width=1, is_scalar=True))
             slot = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_sidx), n, vec_width=1, is_scalar=True))
             has_w = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_has), n // 4, vec_width=1, is_scalar=True))
+            if const_expr(ckpt):
+                ck_off = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_ckoff), n, vec_width=1, is_scalar=True))
+                ck_row = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_ckrow), n, vec_width=1, is_scalar=True))
             ntok = tok1 - tok0
             nt = (ntok + (BT - 1)) // BT
             gn = _group(nt, i32_groups, i32_minc)
@@ -335,6 +343,12 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2):
                         ex_next = [EX[kt] * d4s[kt] for kt in range_constexpr(8)]
                     else:
                         ex_next = [Vec(ob[vt][nt_].to(fx.BFloat16).bitcast(fx.Int32)) for vt in range_constexpr(nvt) for nt_ in range_constexpr(4)]
+                    if const_expr(ckpt):
+                        hit = ((ci + lo + 1) * BT == ck_off) & (ck_row >= 0) & (ck_off > 0)
+                        ck_r = _fp(arg_ck + fx.Int64(fx.max(ck_row, fx.Int32(0))) * i64_ck_row_bytes + fx.Int64(h) * STATE_BYTES, STATE_BYTES)
+                        for vt in range_constexpr(nvt):
+                            for kt in range_constexpr(8):
+                                buffer_ops.buffer_store(s_new[vt][kt], ck_r, (16 * (vs0 + vt) + l16) * D + 16 * kt + 4 * qg, mask=hit)
                     results = yield ([fx.as_ir_value(s_new[vt][kt]) for vt in range_constexpr(nvt) for kt in range_constexpr(8)]
                                      + [fx.as_ir_value(x) for x in u_next] + [fx.as_ir_value(x) for x in ex_next]
                                      + [fx.as_ir_value(y) for w in (win[1:] + [new_raw] if stages > 2 else []) for y in w])
@@ -410,10 +424,14 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2):
         i32_groups: fx.Int32,
         i32_minc: fx.Int32,
         i32_npairs: fx.Int32,
+        arg_ck: fx.Int64,
+        i64_ck_row_bytes: fx.Int64,
+        arg_ckoff: fx.Int64,
+        arg_ckrow: fx.Int64,
         stream: fx.Stream,
     ):
         kernel(arg_ws, i32_nc, arg_state, i64_slot_bytes, arg_sidx, arg_has, arg_cu, arg_choff, arg_out, i32_ostride, arg_gb, arg_gc,
-               arg_ga, arg_sin, i32_groups, i32_minc, i32_npairs).launch(
+               arg_ga, arg_sin, i32_groups, i32_minc, i32_npairs, arg_ck, i64_ck_row_bytes, arg_ckoff, arg_ckrow).launch(
             grid=(((i32_npairs * i32_groups + 7) // 8) * 8 * ngrp, 1, 1), block=(nthreads, 1, 1), stream=stream)
 
     return launch

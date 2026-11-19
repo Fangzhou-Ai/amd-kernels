@@ -67,7 +67,7 @@ def stock_arm(c, cu, ci, co):
     return run
 
 
-def fused_arm(c, cu, ci, co):
+def fused_arm(c, cu, ci, co, counts):
     table = host._prologue.chunk_table(cu, ci, c["state_indices"], c["has_initial_state"])
     cs = c["conv_state"].clone()
     state = c["state_cache"].clone()
@@ -75,12 +75,12 @@ def fused_arm(c, cu, ci, co):
 
     def run():
         host.prefill(c["mixed"], c["raw_g"], c["beta_logit"], c["gate"], c["A_log"], c["dt_bias"], c["conv_weight"], cs, state,
-                     c["state_indices"], c["has_initial_state"], cu, ci, co, c["norm_weight"], c["norm_eps"], out, c["lower_bound"], table=table)
+                     c["state_indices"], c["has_initial_state"], cu, ci, co, c["norm_weight"], c["norm_eps"], out, c["lower_bound"], table=table, chunk_counts=counts)
 
     return run
 
 
-def stage_arms(c, cu, ci, co):
+def stage_arms(c, cu, ci, co, counts):
     """(fused stages, stock stages): [(name, closure)] sharing one workspace / output so each stage runs on its real input."""
     import vllm.platforms.rocm  # noqa: F401
     from aiter.ops.triton.gated_delta_net import causal_conv1d_split_qkv_triton_tile_fn as conv_fn
@@ -99,7 +99,7 @@ def stage_arms(c, cu, ci, co):
 
     f_pro()
     fused = [("conv + prologue", f_pro),
-             ("scan", lambda: host.scan(ws["ws"], cu, co, state, c["state_indices"], c["has_initial_state"], out)),
+             ("scan", lambda: host.scan(ws["ws"], cu, co, state, c["state_indices"], c["has_initial_state"], out, counts)),
              ("gated norm", lambda: host.gated_norm(out, c["gate"], c["norm_weight"], c["norm_eps"], out))]
     w2 = c["conv_weight"].permute(0, 2, 1).reshape(3 * R.LP, 4).contiguous()
     cs2, state2 = c["conv_state"].clone(), c["state_cache"].clone()
@@ -170,21 +170,27 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", default="2048,4096,10240,16384")
     ap.add_argument("--seqs", type=int, default=1)
+    ap.add_argument("--lens", default="", help="ragged batch, e.g. 3000,1500,700,60 (replaces --tokens)")
     ap.add_argument("--no-stock", action="store_true")
     ap.add_argument("--stages", action="store_true", help="also time each stage alone (fused and stock)")
     args = ap.parse_args()
     print(f"{'T':>6} {'seqs':>4} {'fused us':>9} {'min':>8} {'stock us':>9} {'speedup':>8} {'floor(io) us':>13} {'%io':>5} {'floor(+ws)':>11} "
           f"{'mfma us':>8}")
-    for tokens in (int(x) for x in args.tokens.split(",")):
-        lens = [tokens // args.seqs] * args.seqs
-        lens[-1] += tokens - sum(lens)
+    batches = [[int(x) for x in args.lens.split(",")]] if args.lens else None
+    for k, tokens in enumerate(sum(b) for b in batches) if batches else enumerate(int(x) for x in args.tokens.split(",")):
+        if batches:
+            lens = batches[k]
+        else:
+            lens = [tokens // args.seqs] * args.seqs
+            lens[-1] += tokens - sum(lens)
         c0 = make_case(lens)
         cu = c0["cu_seqlens"]
         ci, co = chunk_indices(cu)
+        counts = [-(-n // 64) for n in lens]
         set_bytes = tokens * (R.LP * 2 * 5 + 6288 * 2)
         copies = max(2, min(12, -(-MIN_SET_BYTES // set_bytes)))
         cases = [c0] + [make_case(lens, seed=i + 1) for i in range(copies - 1)]
-        fused = [fused_arm(c, cu, ci, co) for c in cases]
+        fused = [fused_arm(c, cu, ci, co, counts) for c in cases]
         mn, md = timeit_graph(fused)
         smn = smd = float("nan")
         if not args.no_stock:
@@ -192,14 +198,14 @@ def main():
         io, with_ws, mfma = floors(tokens, int(ci.shape[0]))
         if args.stages:
             fs, ss = [], []
-            sets = [stage_arms(c, cu, ci, co) for c in cases]
+            sets = [stage_arms(c, cu, ci, co, counts) for c in cases]
             for k, (name, _) in enumerate(sets[0][0]):
                 fs.append((name, timeit_graph([a[0][k][1] for a in sets])[0]))
             for k, (name, _) in enumerate(sets[0][1]):
                 ss.append((name, timeit_graph([a[1][k][1] for a in sets])[0]))
             print("    fused stages us (min): " + ", ".join(f"{n} {v:.1f}" for n, v in fs))
             print("    stock stages us (min): " + ", ".join(f"{n} {v:.1f}" for n, v in ss))
-        print(f"{tokens:>6} {args.seqs:>4} {md:>9.1f} {mn:>8.1f} {smd:>9.1f} {smd / md:>7.2f}x {io:>13.1f} {100 * io / mn:>4.0f}% "
+        print(f"{tokens:>6} {len(lens):>4} {md:>9.1f} {mn:>8.1f} {smd:>9.1f} {smd / md:>7.2f}x {io:>13.1f} {100 * io / mn:>4.0f}% "
               f"{with_ws:>11.1f} {mfma:>8.1f}", flush=True)
 
 

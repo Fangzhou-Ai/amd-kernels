@@ -7,6 +7,7 @@ import functools
 import torch
 
 from amd_kernels.common.tensor_shim import _run_compiled
+from amd_kernels.warm_up import entry
 
 from . import norm as _norm
 from . import prologue as _prologue
@@ -29,8 +30,8 @@ NUM_CUS = 256
 
 
 @functools.cache
-def _walk_launcher():
-    return _scan.compile_scan(WALK_WAVES, WALK_NVT, False, WALK_STAGES)
+def _walk_launcher(ckpt=False):
+    return _scan.compile_scan(WALK_WAVES, WALK_NVT, False, WALK_STAGES, ckpt)
 
 
 @functools.cache
@@ -66,10 +67,13 @@ def plan_groups(chunk_counts):
     return best
 
 
-def scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_state, out, chunk_counts=None, groups=None):
+def scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_state, out, chunk_counts=None, groups=None,
+         checkpoint_state=None, checkpoint_offsets=None, checkpoint_rows=None):
     """Chunk scan over the workspace records ``ws`` [H, Nc, RECORD_BYTES]; updates ``state_cache`` rows in place and writes the
     bf16 outputs of the tokens into ``out`` [T, 12, 128] (row stride ``out.stride(0)``). ``chunk_counts``: the chunks of each
-    sequence as host ints (the grouping of long chains follows it; evenly split when ``None``); ``groups`` forces the grouping."""
+    sequence as host ints (the grouping of long chains follows it; evenly split when ``None``); ``groups`` forces the grouping.
+    ``checkpoint_offsets`` [N] int32 (tokens into the sequence, a multiple of 64, 0 = off) snapshot the state after that many
+    tokens into ``checkpoint_state`` [rows, 12, 128, 128] fp32, row ``checkpoint_rows[n]`` (``n`` when ``None``; negative: off)."""
     n = cu_seqlens.numel() - 1
     nc = ws.shape[1]
     assert ws.dtype == torch.uint8 and ws.shape[0] == NH and ws.shape[2] == RECORD_BYTES and ws.is_contiguous()
@@ -91,13 +95,20 @@ def scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_
     stream = torch.cuda.current_stream()
     common = (ws.data_ptr(), nc, state_cache.data_ptr(), state_cache.stride(0) * 4, state_indices.data_ptr(), has.data_ptr(),
               cu_seqlens.data_ptr(), chunk_offsets.data_ptr(), out.data_ptr(), out.stride(0))
-    tail = (g, MIN_CHUNKS, n * NH)
+    ckpt = checkpoint_state is not None
+    if ckpt:
+        assert checkpoint_state.dtype == torch.float32 and checkpoint_state.shape[1:] == (NH, D, D) and checkpoint_offsets.dtype == torch.int32
+        rows = checkpoint_rows if checkpoint_rows is not None else torch.arange(n, dtype=torch.int32, device=dev)
+        ck = (checkpoint_state.data_ptr(), checkpoint_state.stride(0) * 4, checkpoint_offsets.data_ptr(), rows.data_ptr())
+    else:
+        ck = (ws.data_ptr(), 0, ws.data_ptr(), ws.data_ptr())
+    tail = (g, MIN_CHUNKS, n * NH, *ck)
     full = (*common, gb.data_ptr(), gc.data_ptr(), ga.data_ptr(), sin.data_ptr(), *tail)
     if g > 1:
         _run_compiled(_chain_launcher(), *full, stream)
         _run_compiled(_fold_launcher(), state_cache.data_ptr(), state_cache.stride(0) * 4, state_indices.data_ptr(), has.data_ptr(),
                       cu_seqlens.data_ptr(), gb.data_ptr(), gc.data_ptr(), ga.data_ptr(), sin.data_ptr(), g, MIN_CHUNKS, n * NH, stream)
-    _run_compiled(_walk_launcher(), *full, stream)
+    _run_compiled(_walk_launcher(ckpt), *full, stream)
     return out
 
 
@@ -114,13 +125,48 @@ def gated_norm(o, gate, norm_weight, eps, out=None):
     return out
 
 
-def prefill(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices, has_initial_state,
-            cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale=D ** -0.5, table=None,
-            chunk_counts=None):
+def _prefill(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices, has_initial_state,
+             cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale=D ** -0.5, table=None,
+             chunk_counts=None, checkpoint_state=None, checkpoint_offsets=None, checkpoint_rows=None):
     """The KDA prefill of one layer: conv + prologue, chunk scan, gated RMSNorm. Writes ``out`` [T, 12, 128] bf16, rolls
     ``conv_state`` and updates ``state_cache`` rows in place. ``table``: ``prologue.chunk_table`` of the step (built once per step
-    and shared by the layers; built here when ``None``)."""
+    and shared by the layers; built here when ``None``); ``chunk_counts``: the chunks of each sequence as host ints (sizes the
+    groups of long chains); ``checkpoint_*``: see ``scan``."""
     ws = _prologue.prologue(mixed, raw_g, beta_logit, A_log, dt_bias, lower_bound, scale, conv_weight, conv_state, state_indices,
                             has_initial_state, cu_seqlens, chunk_indices, table=table)
-    scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_state, out, chunk_counts)
+    scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_state, out, chunk_counts,
+         checkpoint_state=checkpoint_state, checkpoint_offsets=checkpoint_offsets, checkpoint_rows=checkpoint_rows)
     return gated_norm(out, gate, norm_weight, norm_eps, out)
+
+
+def _mode(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices, has_initial_state,
+          cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale=D ** -0.5, table=None,
+          chunk_counts=None, checkpoint_state=None, checkpoint_offsets=None, checkpoint_rows=None):
+    """What a call fixes about its kernels (``amd_kernels.warm_up``): the norm weight dtype and the checkpoint export."""
+    return (norm_weight.dtype == torch.float32, checkpoint_state is not None)
+
+
+def _inputs(mode, n, mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices,
+            has_initial_state, cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale=D ** -0.5,
+            table=None, chunk_counts=None, checkpoint_state=None, checkpoint_offsets=None, checkpoint_rows=None):
+    """One sequence of ``n`` tokens (zeros; the launches are compiled, not run)."""
+    dev = mixed.device
+    chunks = -(-n // 64)
+    cu = torch.tensor([0, n], dtype=torch.int32, device=dev)
+    ci = torch.tensor([[0, k] for k in range(chunks)], dtype=torch.int32, device=dev)
+    co = torch.tensor([0, chunks], dtype=torch.int64, device=dev)
+    zero = torch.zeros(1, dtype=torch.int32, device=dev)
+    rows = mixed.shape[1] if mixed.dim() == 2 else 0
+    x = torch.zeros((n, max(rows, 4608)), dtype=mixed.dtype, device=dev)[:, :4608]
+    xg = torch.zeros((n, 6288), dtype=gate.dtype, device=dev)
+    g = xg[:, 4608:6144].view(n, NH, D)
+    args = (x, torch.zeros((n, NH, D), dtype=raw_g.dtype, device=dev), xg[:, 6272:6284], g, A_log, dt_bias, conv_weight, conv_state,
+            state_cache, zero, torch.zeros(1, dtype=torch.bool, device=dev), cu, ci, co, norm_weight, norm_eps,
+            torch.empty((n, NH, D), dtype=out.dtype, device=dev), lower_bound)
+    kwargs = {"chunk_counts": [chunks]}
+    if mode[1]:
+        kwargs.update(checkpoint_state=checkpoint_state, checkpoint_offsets=zero, checkpoint_rows=None)
+    return args, kwargs
+
+
+prefill = entry("attention/kda_prefill_h12_d128", mode=_mode, sizes=lambda mode: (2048,), inputs=_inputs)(_prefill)
