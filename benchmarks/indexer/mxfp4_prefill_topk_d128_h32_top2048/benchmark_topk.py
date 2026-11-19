@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """Graph replay of ``topk_rows`` vs AITER's ``top_k_per_row_prefill`` over logits tiles larger than the LLC; roofline table.
 
-    python3 benchmarks/indexer/mxfp4_prefill_topk_d128_h32_top2048/benchmark_topk.py [json]
+    python3 benchmarks/indexer/mxfp4_prefill_topk_d128_h32_top2048/benchmark_topk.py [--cases 0,1,..] [json]
 
 The roofline is the logits window read once (4 bytes per key of every row's window) at the measured HBM read ceilings
 (analysis/hw_ceilings.md: 6.5 TB/s plain loads, 6.9 TB/s nontemporal) and against a read-only kernel streaming the same window
@@ -110,9 +110,14 @@ def aiter_fn(logits, ks, ke, out, stable):
 
 
 def main():
+    args = sys.argv[1:]
+    picked = range(len(CASES))
+    if args[:1] == ["--cases"]:
+        picked = [int(i) for i in args[1].split(",")]
+        args = args[2:]
     results = []
     print("rows  width    windows   window_GB  aiter_us  aiter_stable_us  ours_us  speedup  read_floor_us  TB/s  %6.5  %6.9  %floor")
-    for rows, width, kind in CASES:
+    for rows, width, kind in (CASES[i] for i in picked):
         logits = make_logits("gauss", rows, width)
         ks, ke = make_windows(rows, width, kind)
         window_bytes = float((ke - ks).clamp(min=0).sum()) * 4
@@ -131,8 +136,8 @@ def main():
         )
         results.append(dict(rows=rows, width=width, windows=kind, aiter_us=t_aiter, aiter_stable_us=t_stable, us=t_ours, floor_us=t_floor, tbs=tbs))
         del tiles, logits
-    if len(sys.argv) > 1:
-        json.dump(results, open(sys.argv[1], "w"), indent=1)
+    if args:
+        json.dump(results, open(args[0], "w"), indent=1)
 
 
 if __name__ == "__main__":
