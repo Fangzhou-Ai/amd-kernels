@@ -15,6 +15,8 @@ CASES = [
     ("ragged", [300, 64, 130, 5, 2048], None),
     ("tiny", [1, 2, 3, 4, 65], [True, False, True, False, True]),
     ("noinit", [130, 70], [False, False]),
+    ("long", [4096], None),
+    ("ragged_large", [3000, 1500, 700, 60], [True, False, True, True]),
 ]
 TOL = dict(qg=6e-3, nw=6e-3, kgt=6e-3, aqk=6e-3, u=6e-3, decay=1e-5)
 
@@ -48,3 +50,48 @@ def test_prologue(name, seq, init):
     untouched = torch.ones(cs.shape[0], dtype=torch.bool)
     untouched[c["state_indices"].long().cpu()] = False
     assert torch.equal(cs[untouched.cuda()], c["conv_state"][untouched.cuda()])
+
+
+@torch.inference_mode()
+def test_deterministic():
+    require_gfx950()
+    c = make_case([300, 64, 130, 2048])
+    cu = c["cu_seqlens"]
+    table, _ = R.chunk_table(cu)
+    ci = torch.tensor([[n, k] for (n, k, _, _) in table], dtype=torch.int32, device="cuda")
+    runs = []
+    for _ in range(4):
+        cs = c["conv_state"].clone()
+        runs.append(P.prologue(c["mixed"], c["raw_g"], c["beta_logit"], c["A_log"], c["dt_bias"], c["lower_bound"], R.SCALE,
+                               c["conv_weight"], cs, c["state_indices"], c["has_initial_state"], cu, ci,
+                               ws=torch.zeros(R.NH, len(table), R.RECORD_BYTES, dtype=torch.uint8, device="cuda")))
+    for r in runs[1:]:
+        assert torch.equal(r, runs[0])
+
+
+@torch.inference_mode()
+def test_no_compile_across_sizes(monkeypatch):
+    """One compiled kernel serves every token count and sequence count."""
+    import flydsl.compiler as flyc
+
+    require_gfx950()
+    compiled = []
+    real = flyc.compile
+
+    def counting(fn, *args, **kwargs):
+        compiled.append(getattr(fn, "kernel_name", type(fn).__name__))
+        return real(fn, *args, **kwargs)
+
+    def call(seq):
+        c = make_case(seq)
+        cu = c["cu_seqlens"]
+        table, _ = R.chunk_table(cu)
+        ci = torch.tensor([[n, k] for (n, k, _, _) in table], dtype=torch.int32, device="cuda")
+        P.prologue(c["mixed"], c["raw_g"], c["beta_logit"], c["A_log"], c["dt_bias"], c["lower_bound"], R.SCALE, c["conv_weight"],
+                   c["conv_state"].clone(), c["state_indices"], c["has_initial_state"], cu, ci)
+
+    call([64])
+    monkeypatch.setattr(flyc, "compile", counting)
+    for seq in ([1], [4096], [300, 5, 2000], [12288], [65] * 7):
+        call(seq)
+    assert not compiled, compiled

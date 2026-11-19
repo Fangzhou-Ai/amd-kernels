@@ -61,7 +61,7 @@ _launch = None
 
 
 def skeleton_prologue(mixed, raw_g, beta_logit, A_log, dt_bias, lower_bound, scale, conv_weight, conv_state, state_indices,
-                      has_initial_state, cu_seqlens, chunk_indices, ws):
+                      has_initial_state, cu_seqlens, chunk_indices, ws, table=None):
     global _launch
     if _launch is None:
         _launch = build()

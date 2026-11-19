@@ -315,7 +315,6 @@ def compile_prologue():
             return [Vec(buffer_ops.buffer_load(cwr, (band * 4 + tap) * LP + h * D + cg * 8 + 4 * half, vec_width=4)) for tap in range_constexpr(4)]
 
         # ---- loads that start the HBM latency early: k band, gate, beta
-        k_rows = band_rows(1)
         dtr = buffer_ops.create_buffer_resource_from_addr(arg_dtb, num_records_bytes=LP * 4)
         dtb = []
         for k in range_constexpr(2):
@@ -331,6 +330,7 @@ def compile_prologue():
         for j in range_constexpr(4):
             bl = buffer_ops.buffer_load(br, (bos + t0 + r0 + j) * i32_ldb + h, vec_width=1, dtype=fx.Int16, mask=(r0 + j) < rows)
             betas.append(((r0 + j) < rows).select(sigmoid(((fx.Int32(bl) & 0xFFFF) << 16).bitcast(fx.Float32)), fx.Float32(0.0)))
+        k_rows = band_rows(1)
 
         # ---- gate: glog, chunk cumsum (log2 units)
         gl = []
@@ -738,6 +738,8 @@ def prologue(mixed, raw_g, beta_logit, A_log, dt_bias, lower_bound, scale, conv_
              has_initial_state, cu_seqlens, chunk_indices, ws=None, table=None):
     """Workspace records [H, Nc, RECORD_BYTES] uint8 of the chunks of ``cu_seqlens``; rolls ``conv_state`` in place."""
     nc = chunk_indices.shape[0]
+    assert mixed.dtype == raw_g.dtype == beta_logit.dtype == torch.bfloat16 and mixed.stride(-1) == raw_g.stride(-1) == beta_logit.stride(-1) == 1
+    assert mixed.stride(0) % 8 == 0 and conv_state.stride(0) < 2**31 // 2
     if ws is None:
         ws = torch.empty(NH, nc, RECORD_BYTES, dtype=torch.uint8, device=mixed.device)
     cs = conv_state
@@ -746,7 +748,7 @@ def prologue(mixed, raw_g, beta_logit, A_log, dt_bias, lower_bound, scale, conv_
     _run_compiled(
         _launcher(),
         mixed.data_ptr(), mixed.stride(0), mixed.shape[0] * mixed.stride(0) * 2,
-        raw_g.data_ptr(), raw_g.stride(0) if raw_g.dim() == 2 else raw_g.stride(0), beta_logit.data_ptr(), beta_logit.stride(0),
+        raw_g.data_ptr(), raw_g.stride(-3) if raw_g.dim() > 2 else raw_g.stride(0), beta_logit.data_ptr(), beta_logit.stride(-2),
         A_log.data_ptr(), dt_bias.data_ptr(), conv_weight.data_ptr(), cs.data_ptr(), cs.stride(0), cs.stride(1), cs.stride(2),
         table.data_ptr(), ws.data_ptr(), nc, float(lower_bound), float(scale), torch.cuda.current_stream(),
     )

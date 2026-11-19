@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """Graph-replay timing of the KDA prefill prologue against the stock sequence and its HBM floor.
 
-One HIP graph holds ``--copies`` launches over distinct inputs (the set is larger than the 256 MB MALL), median of 5
+One HIP graph holds ``--copies`` launches over distinct inputs (the set is larger than the 256 MB MALL), median and min of 15
 rounds in us per launch. Arms: ``fused`` (this kernel), ``skeleton`` (``skeleton.py``: the same loads and stores, no math)
 and ``stock`` (AITER ``causal_conv1d_split_qkv_triton_tile_fn`` + ``torch.ops._C.fused_kda_prologue``). Roofline columns: HBM
 bytes (reads of the projection bands, gate and beta; workspace writes) at the measured read / write ceilings.
@@ -57,11 +57,12 @@ def stock_arm(c, cu, ci):
 
 def fused_arm(c, cu, ci, ws, fn):
     cs = c["conv_state"].clone()
+    table = P.chunk_table(cu, ci, c["state_indices"], c["has_initial_state"])
     return lambda: fn(c["mixed"], c["raw_g"], c["beta_logit"], c["A_log"], c["dt_bias"], c["lower_bound"], R.SCALE, c["conv_weight"],
-                      cs, c["state_indices"], c["has_initial_state"], cu, ci, ws=ws)
+                      cs, c["state_indices"], c["has_initial_state"], cu, ci, ws=ws, table=table)
 
 
-def graph_time(calls, rounds=5, replays=10):
+def graph_time(calls, rounds=15, replays=5):
     for f in calls:
         f()
     torch.cuda.synchronize()
