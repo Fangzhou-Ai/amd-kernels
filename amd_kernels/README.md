@@ -34,6 +34,8 @@ One line per kernel package. Each package's README has what it does, its entry p
   the MoE tail on eight ranks: latent all-reduce + RMSNorm + the hidden-shard up projection of the shared output.
 - [`moe/mxfp4_h3584_i3072_e896_top16`](moe/mxfp4_h3584_i3072_e896_top16/README.md): routed MXFP4 experts (A4W4, SiTUv2)
   of one Kimi-K3.1 TP8 rank: activation quant, GEMM1 + GEMM2 in one launch, deterministic top-16 sum.
+- [`moe/router_sigmoid_bias_top16_e896_h7168`](moe/router_sigmoid_bias_top16_e896_h7168/README.md): the MoE router,
+  bf16 gate GEMM + sigmoid + correction bias + top-16 + renormalisation, two launches.
 
 ## Attention
 
