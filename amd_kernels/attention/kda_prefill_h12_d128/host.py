@@ -236,8 +236,8 @@ def prefill_v1(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv
     return gated_norm(out, gate, norm_weight, norm_eps, out)
 
 
-MEGA_MAX_CHAIN = 48  # chunks of the longest sequence the one-launch path serves (its walk is serial: about 0.9 us per chunk)
-MEGA_MAX_CHUNKS = 48  # chunks of a one- or two-sequence batch; larger batches start too many walk workgroups beside the prologue
+MEGA_MAX_CHAIN = 60  # chunks of the longest sequence the one-launch path serves (its walk is serial: 0.7-0.9 us per chunk)
+MEGA_MAX_CHUNKS = 60  # chunks of a batch of up to three sequences; larger batches start too many walk workgroups beside the prologue
 MEGA_TINY_CHUNKS = 16  # a batch this small takes the one-launch path whatever its sequence count (up to 8)
 
 
@@ -247,7 +247,7 @@ def uses_mega(chunk_counts):
     if chunk_counts is None:
         return False
     n, nc = len(chunk_counts), sum(chunk_counts)
-    return max(chunk_counts) <= MEGA_MAX_CHAIN and (nc <= MEGA_TINY_CHUNKS and n <= 8 or n <= 2 and nc <= MEGA_MAX_CHUNKS)
+    return max(chunk_counts) <= MEGA_MAX_CHAIN and (nc <= MEGA_TINY_CHUNKS and n <= 8 or n <= 3 and nc <= MEGA_MAX_CHUNKS)
 
 
 def _prefill(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices, has_initial_state,

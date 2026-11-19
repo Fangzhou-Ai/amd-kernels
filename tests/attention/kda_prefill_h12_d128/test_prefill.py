@@ -138,6 +138,7 @@ def test_one_launch_hand_over():
 
 
 def test_dispatch():
-    assert host.uses_mega([32]) and host.uses_mega([1]) and host.uses_mega([16, 16]) and host.uses_mega([5, 1, 2, 1])
-    assert not host.uses_mega([64]) and not host.uses_mega([11] * 4) and not host.uses_mega([4] * 8) and not host.uses_mega([30, 30])
+    assert host.uses_mega([32]) and host.uses_mega([60]) and host.uses_mega([1]) and host.uses_mega([16, 16]) and host.uses_mega([5, 1, 2, 1])
+    assert host.uses_mega([19, 19, 10]) and host.uses_mega([2] * 8)
+    assert not host.uses_mega([64]) and not host.uses_mega([11] * 4) and not host.uses_mega([4] * 8) and not host.uses_mega([30, 31])
     assert not host.uses_mega(None) and not host.uses_mega([2] * 9)
