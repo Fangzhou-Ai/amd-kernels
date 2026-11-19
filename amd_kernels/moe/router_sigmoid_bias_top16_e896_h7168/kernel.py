@@ -35,7 +35,7 @@ from .topk import (LDS_WORDS, MAXC, NQ, RANK_UNROLL, TOPK, _ballot, _popcount, t
 SC1 = 0x10  # agent-scope (cross-XCD) stores and loads of the slabs and counters
 FLAG_WORDS = 256  # one flag word per workgroup (a call advances each by one)
 import os
-POLL_SLEEP = int(os.environ.get('KK_POLL', '2'))  # s_sleep units (64 clocks) between two polls of the tile counters
+POLL_SLEEP = 2  # s_sleep units (64 clocks) between two polls of the arrival flags
 NB = K // 64  # 112 K blocks
 NWV = 4
 W_CM = 2  # nt

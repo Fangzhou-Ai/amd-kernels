@@ -37,7 +37,22 @@ ORs its bit into one 256-bit mask per routed expert, waits for all token flags a
 `aux.py` the sort.
 
 ## Performance
-PERF_TABLE
+One launch, graph replay, cold weights (24 copies), MI355X GPU 1, us. Stock = hipBLASLt `mm(out_dtype=fp32)` +
+`aiter.biased_grouped_topk`. Ceiling = launch floor (1.76) + cold HBM stream of W (12.8 MB, ~3.7 us in a graph) + flag
+hand-off and the minimal top-16 chain (~2.3 us), ~8 us at M=12, growing with the per-CU ingestion limit at large M.
+
+| M | stock | fused | speedup | % of ceiling (est.) |
+|---|---|---|---|---|
+| 12 | 15.7 | 9.9 | 1.58x | ~80 |
+| 24 | 15.4 | 10.6 | 1.46x | ~76 |
+| 40 | 15.4 | 11.3 | 1.37x | ~74 |
+| 65 | 17.2 | 12.9 | 1.34x | ~70 |
+| 80 | 19.1 | 13.6 | 1.40x | ~70 |
+| 128 | 19.4 | 16.2 | 1.20x | ~70 |
+| 192 | 21.3 | 20.0 | 1.07x | ~65 |
+
+Not yet within 10% of the ceiling: the consumer tail (flag detect ~1.2 us, slab load ~1 us, pivot/rank/finish ~2 us)
+and, at large M, the per-CU DMA ingestion bound remain. `aux` adds ~1 us. Attempts are logged in the analysis report.
 
 ## Tests
 - `python3 -m pytest tests/moe/router_sigmoid_bias_top16_e896_h7168 -q`
