@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """Rank body of test_layer_tail (torchrun, 8 ranks): the entry against ``reference`` at the served widths, the
-ranks' agreement, a replayed CUDA graph, and the options' bit-exactness."""
+ranks' agreement and a replayed CUDA graph."""
 import os
 import sys
 
 import torch
 import torch.distributed as dist
 
-from amd_kernels.moe.layer_tail_k2_h7168_ranks8 import K2Build, LayerTailRunner, LayerTailWeights, k2_launch, layer_tail
+from amd_kernels.moe.layer_tail_k2_h7168_ranks8 import LayerTailRunner, LayerTailWeights, layer_tail
 from amd_kernels.moe.layer_tail_k2_h7168_ranks8 import kernel as K
+from amd_kernels.moe.layer_tail_k2_h7168_ranks8.kernel import K2Build
 from amd_kernels.moe.layer_tail_k2_h7168_ranks8 import reference as ref
 
 from .inputs import layer_inputs, moe_weights
@@ -57,19 +58,6 @@ def main():
         dist.all_gather(outs, out)
         if not all(torch.equal(outs[0], o) for o in outs):
             errors.append(f"rank {rank} S={S}: ranks disagree")
-        # the options change no bit
-        for opt in (0,):
-            comm.step_begin()
-            out0 = torch.empty_like(out)
-            p0 = w["prefix"].clone()
-            k2_launch(K2Build(tokens=S, nblocks=4 + int(reset), reset=reset, opt=opt), core=w["core"], w_o=w["w_o"],
-                      prefix=p0, blocks=w["blocks"], ares_nw=w["ares_nw"], ares_qk=w["ares_qk"], in_nw=w["in_nw"],
-                      out=out0, layer=128 + 4, **{k: getattr(weights, k) for k in (
-                          "w_gate", "bias", "w_ld", "w_sgu", "w_sd", "w13", "w13s", "w2", "w2s", "ln_w", "w_up")},
-                      **comm.launch_args(), **comm.peer_args())
-            torch.accelerator.synchronize()
-            if not (torch.equal(out0, out) and torch.equal(p0, prefix)):
-                errors.append(f"rank {rank} S={S}: opt={opt} differs from the default build")
     # a graph of one step, replayed
     S = 12
     w = layer_inputs(rank, device, S, seed=1)

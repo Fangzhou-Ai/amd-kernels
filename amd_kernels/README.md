@@ -21,6 +21,8 @@ One line per kernel package. Each package's README has what it does, its entry p
 
 - [`moe/mxfp4_h6144_i768_e128_top4`](moe/mxfp4_h6144_i768_e128_top4/README.md): routed MXFP4 experts (A4W4) with the
   MXFP8 shared expert.
+- [`moe/layer_tail_k2_h7168_ranks8`](moe/layer_tail_k2_h7168_ranks8/README.md): one decode layer's whole tail in one
+  persistent kernel on 8 ranks: o_proj, AttnRes, router, shared + routed MXFP4 experts, latent norm, up projection.
 
 ## Attention
 

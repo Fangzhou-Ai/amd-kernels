@@ -103,7 +103,6 @@ from . import gemv
 
 REGIONS = (
     "sgu",
-    "sgup",
     "h",
     "rpart",
     "lpart",
@@ -156,7 +155,7 @@ W13_K = LAT  # 3584
 W13_STEPS = W13_K // 128  # 28
 W2_STEPS = RI // 128  # 3
 DOWN_TASKS = LAT // ROWS  # 224
-DOWN_BATCH = 5  # a wave's experts whose w2 is in flight together
+DOWN_BATCH = 2  # a wave's experts whose w2 is in flight together (5: +2.8 us at 12 rows, 1: same as 2)
 MASK_WORDS = 2  # an expert's token bitmap in the route table
 MAX_S = 32 * MASK_WORDS  # 64 rows
 PTILE = 16  # picks a pick tile: the ug and down MFMAs' N
@@ -174,10 +173,10 @@ def max_tiles(s):
     return min(s * TOPK, max_u(s) + s * TOPK // PTILE)
 
 
-def inter_lds(s, poll=False):
+def inter_lds(s):
     """Down reads the picks' INTER from LDS (``load_inter``), else polls each
     pick's at its use."""
-    return s <= INTER_LDS_S and not poll
+    return s <= INTER_LDS_S
 
 
 def few_rows(s):
@@ -212,7 +211,6 @@ def peer_pairs(s):
 def scratch_layout(s: int) -> dict:
     pairs = {
         "sgu": s * SI,
-        "sgup": 2 * s * 2 * SI,
         "h": s * SI // 2,
         "rpart": R_GROUPS * R_PARTS * s * ROWS,
         "lpart": L_GROUPS * L_PARTS * s * ROWS,
@@ -465,9 +463,7 @@ def early_compute(c, kind, i, q, ops):
         if tid < c["xflags"]:
             c["poll"]([(c["xrdy"], tid, 1)])
         gpu.barrier()
-        src, cm = c["xbuf"], c["sgu_cm"] if kind == 2 else CM_DEV
-        if const_expr(kind == 2):
-            stamp(c["tl_on"], c["tls"], tid, 32)
+        src, cm = c["xbuf"], CM_DEV
     else:
         src, cm = c["args"]["x"], 0
     # a tile of x rows at a time, the weights held over them
@@ -475,30 +471,17 @@ def early_compute(c, kind, i, q, ops):
         if const_expr(tagged):
             poll_rows_to_lds(c, c["xt"], klen, n, c["xl"], xrow, HIDDEN, q * klen, t0)
         else:
-            if const_expr(kind == 2 and c["sgu_batched"]):
-                gemv.rows_to_lds_batched(
-                    tid, src, klen, n, c["xl"], xrow, cm, ldk=HIDDEN, k0=q * klen, t0=t0
-                )
-            else:
-                gemv.rows_to_lds(
-                    tid, src, klen, n, c["xl"], xrow, cm, ldk=HIDDEN, k0=q * klen, t0=t0
-                )
-            if const_expr(kind == 2):
-                stamp(c["tl_on"], c["tls"], tid, 36 if t0 == 0 else 37)
+            gemv.rows_to_lds(
+                tid, src, klen, n, c["xl"], xrow, cm, ldk=HIDDEN, k0=q * klen, t0=t0
+            )
         if const_expr(kind == 0):
             stamp(c["tl_on"], c["tls"], tid, 18)
-        if const_expr(kind == 2):
-            stamp(c["tl_on"], c["tls"], tid, 33)
         acc = gemv.mfmas(lane, wave, c["xl"], xrow, klen, n, ops)
         fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
         gpu.barrier()
-        if const_expr(kind == 2):
-            stamp(c["tl_on"], c["tls"], tid, 34)
         early_out(c, kind, i, q, red, t0, n)
         if const_expr(kind == 0):
             stamp(c["tl_on"], c["tls"], tid, 19)
-        if const_expr(kind == 2):
-            stamp(c["tl_on"], c["tls"], tid, 35)
 
 
 @traced
@@ -1148,46 +1131,6 @@ def load_inter(c):
     gpu.barrier()
 
 
-def phase_bounds(nt, db, nph, p):
-    """Down phase ``p`` of ``nph`` (few_rows): its batches [bi_lo, bi_hi) of ``db`` tiles a wave and the pick tiles
-    (slots) [t_lo, t_hi) they cover."""
-    nbat = (nt + WAVES * db - 1) // (WAVES * db)
-    bi_lo = (nbat * p) // nph
-    bi_hi = (nbat * (p + 1)) // nph
-    t_lo = bi_lo * WAVES * db
-    t_hi = fx.min(bi_hi * WAVES * db, nt)
-    return bi_lo, bi_hi, t_lo, t_hi
-
-
-@traced
-def load_inter_range(c, t_lo, t_hi):
-    """``load_inter`` of the picks whose expert's slot is in [t_lo, t_hi) only (few_rows): a phase of the down
-    stage polls what its tiles need, the later slots' ug tasks still running."""
-    s, tid, rt = c["S"], c["tid"], c["rt"]
-    nw = s * TOPK * 48
-    per = (nw + THREADS - 1) // THREADS
-    nc = s * TOPK * UG_GROUPS
-    perc = (nc + THREADS - 1) // THREADS
-
-    def live_of(pick, inside):
-        slot = fx.ptr_load(rt["eslot"] + route_id(rt, pick))
-        return inside & (slot >= t_lo) & (slot < t_hi)
-
-    wi = [fx.min(tid + THREADS * i, nw - 1) for i in range(per)]
-    wc = [fx.min(tid + THREADS * i, nc - 1) for i in range(perc)]
-    li = [live_of(w // 48, (tid + THREADS * i) < nw) for i, w in enumerate(wi)]
-    lc = [live_of(w // UG_GROUPS, (tid + THREADS * i) < nc) for i, w in enumerate(wc)]
-    specs = [(c["inter"], w, 1) for w in wi] + [(c["isc"], w, 1) for w in wc]
-    both = c["poll"](specs, batch=per + perc, lives=li + lc)
-    for i in range_constexpr(per):
-        if li[i]:
-            fx.ptr_store(both[i][0], c["interq"] + (tid + THREADS * i))
-    for i in range_constexpr(perc):
-        if lc[i]:
-            fx.ptr_store(both[per + i][0], c["intsc"] + (tid + THREADS * i))
-    gpu.barrier()
-
-
 def w2_scale(c, e, rgd, st, lane):
     """The e8m0 code of w2 (row e 3584 + rgd 16 + lane % 16, K block 4 st +
     lane / 16) in ``e8m0_shuffle``'s layout (16 codes a row)."""
@@ -1219,8 +1162,7 @@ def down_loads(c, rgd, nt, b0):
     lane = c["lane"]
     r_w = rsrc(c["args"]["w2"])
     rt = c["rt"]
-    db = c["db"]
-    tiles = [fx.min(b0 + WAVES * j, nt - 1) for j in range(db)]
+    tiles = [fx.min(b0 + WAVES * j, nt - 1) for j in range(DOWN_BATCH)]
     if const_expr(few_rows(c["S"])):
         es = [uniform(fx.ptr_load(rt["expert"] + tl)) for tl in tiles]
     else:
@@ -1230,12 +1172,12 @@ def down_loads(c, rgd, nt, b0):
         ]
     av = [
         fp4_tile_load(r_w, es[j] * (LAT * RI // 8), rgd, RI, st, lane * 4)
-        for j in range(db)
+        for j in range(DOWN_BATCH)
         for st in range(W2_STEPS)
     ]
     sa = [
         w2_scale(c, es[j], rgd, st, lane)
-        for j in range(db)
+        for j in range(DOWN_BATCH)
         for st in range(W2_STEPS)
     ]
     return av + sa
@@ -1252,79 +1194,71 @@ def stage_down(c, rgd, nt, ops0):
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     rt = c["rt"]
     kb = lane // 16
-    db = c["db"]
-    nbs = db * W2_STEPS
+    nbs = DOWN_BATCH * W2_STEPS
+    b0 = wave
     ops = ops0
-    nph = c["down_phases"]
-    for ph in range_constexpr(nph):
-        bi_lo, bi_hi, t_lo, t_hi = phase_bounds(nt, db, nph, ph)
-        if const_expr(ph > 0):
-            gpu.barrier()
-            load_inter_range(c, t_lo, t_hi)
-        bi = bi_lo
-        while bi < bi_hi:
-            b0 = wave + WAVES * db * bi
-            nb = b0 + WAVES * db
-            ops_n = down_loads(c, rgd, nt, fx.min(nb, nt - 1))
-            for j in range_constexpr(db):
-                live = (b0 + WAVES * j) < nt
-                if const_expr(few_rows(s)):
-                    # the slot's tile: lane % 16 a token, picked if it has a kof
-                    tq = fx.min(lane % 16, s - 1)
-                    kq = fx.ptr_load(rt["kof"] + (fx.min(b0 + WAVES * j, nt - 1) * s + tq))
-                    picked = (kq >= 0) & (lane % 16 < s)
-                    t, k = tq, fx.max(kq, 0)
-                    pick = t * TOPK + k
+    while b0 < nt:
+        nb = b0 + WAVES * DOWN_BATCH
+        ops_n = down_loads(c, rgd, nt, fx.min(nb, nt - 1))
+        for j in range_constexpr(DOWN_BATCH):
+            live = (b0 + WAVES * j) < nt
+            if const_expr(few_rows(s)):
+                # the slot's tile: lane % 16 a token, picked if it has a kof
+                tq = fx.min(lane % 16, s - 1)
+                kq = fx.ptr_load(rt["kof"] + (fx.min(b0 + WAVES * j, nt - 1) * s + tq))
+                picked = (kq >= 0) & (lane % 16 < s)
+                t, k = tq, fx.max(kq, 0)
+                pick = t * TOPK + k
+            else:
+                _, p0, cnt = pick_tile(c, fx.min(b0 + WAVES * j, nt - 1))
+                picked = lane % 16 < cnt
+                pick = fx.ptr_load(rt["order"] + (p0 + fx.min(lane % 16, cnt - 1)))
+                # a pick is >= 0: shifts, not signed division
+                t, k = pick >> TOPK_BITS, pick & (TOPK - 1)
+            if const_expr(not inter_lds(s)):
+                got = poll_inter(c, pick, kb)
+            acc = fx.Vector.filled(4, 0.0, fx.Float32)
+            for st in range_constexpr(W2_STEPS):
+                if const_expr(inter_lds(s)):
+                    bw = fx.Vector(
+                        fx.ptr_load(
+                            c["interq"] + (pick * 48 + st * 16 + kb * 4),
+                            result_type=fx.Vector.make_type(4, fx.Int32),
+                        )
+                    )
+                    scode = fx.ptr_load(c["intsc"] + (pick * UG_GROUPS + st * 4 + kb))
                 else:
-                    _, p0, cnt = pick_tile(c, fx.min(b0 + WAVES * j, nt - 1))
-                    picked = lane % 16 < cnt
-                    pick = fx.ptr_load(rt["order"] + (p0 + fx.min(lane % 16, cnt - 1)))
-                    # a pick is >= 0: shifts, not signed division
-                    t, k = pick >> TOPK_BITS, pick & (TOPK - 1)
-                if const_expr(not inter_lds(s, c["inter_poll"])):
-                    got = poll_inter(c, pick, kb)
-                acc = fx.Vector.filled(4, 0.0, fx.Float32)
-                for st in range_constexpr(W2_STEPS):
-                    if const_expr(inter_lds(s, c["inter_poll"])):
-                        bw = fx.Vector(
-                            fx.ptr_load(
-                                c["interq"] + (pick * 48 + st * 16 + kb * 4),
-                                result_type=fx.Vector.make_type(4, fx.Int32),
-                            )
-                        )
-                        scode = fx.ptr_load(c["intsc"] + (pick * UG_GROUPS + st * 4 + kb))
-                    else:
-                        bw = fx.Vector.from_elements(
-                            [got[st * 4 + d][0] for d in range(4)], fx.Int32
-                        )
-                        scode = got[W2_STEPS * 4 + st][0]
                     bw = fx.Vector.from_elements(
-                        [picked.select(bw[d], fx.Int32(0)) for d in range(4)], fx.Int32
+                        [got[st * 4 + d][0] for d in range(4)], fx.Int32
                     )
-                    sb = picked.select(scode, fx.Int32(UNIT_SCALE))
-                    acc = mfma_scaled(
-                        ops[j * W2_STEPS + st],
-                        bw,
-                        acc,
-                        ops[nbs + j * W2_STEPS + st],
-                        sb,
-                        FP4,
-                        FP4,
-                        0,
-                        0,
+                    scode = got[W2_STEPS * 4 + st][0]
+                bw = fx.Vector.from_elements(
+                    [picked.select(bw[d], fx.Int32(0)) for d in range(4)], fx.Int32
+                )
+                sb = picked.select(scode, fx.Int32(UNIT_SCALE))
+                acc = mfma_scaled(
+                    ops[j * W2_STEPS + st],
+                    bw,
+                    acc,
+                    ops[nbs + j * W2_STEPS + st],
+                    sb,
+                    FP4,
+                    FP4,
+                    0,
+                    0,
+                )
+            # lane: rows 4 (lane / 16) + i of pick lane % 16
+            if live & picked:
+                wt = fx.ptr_load(rt["route"] + (t * 2 * TOPK + TOPK + k)).bitcast(
+                    fx.Float32
+                )
+                for i in range_constexpr(4):
+                    row = 4 * (lane // 16) + i
+                    fx.ptr_store(
+                        bf16_round(acc[i] * wt), c["contrib"] + (pick * ROWS + row)
                     )
-                # lane: rows 4 (lane / 16) + i of pick lane % 16
-                if live & picked:
-                    wt = fx.ptr_load(rt["route"] + (t * 2 * TOPK + TOPK + k)).bitcast(
-                        fx.Float32
-                    )
-                    for i in range_constexpr(4):
-                        row = 4 * (lane // 16) + i
-                        fx.ptr_store(
-                            bf16_round(acc[i] * wt), c["contrib"] + (pick * ROWS + row)
-                        )
-            bi = bi + 1
-            ops = ops_n
+        b0 = nb
+        ops = ops_n
     gpu.barrier()
     n = (ROWS // 2) * s
     for i in range_constexpr((n + THREADS - 1) // THREADS):
@@ -1355,77 +1289,6 @@ def stage_down(c, rgd, nt, ops0):
 
 
 # ---------------------------------------------------------------- shared down
-SGU_HALF_CTAS = 104
-SGU_RGS = 2 * SI // ROWS  # 96
-SGU_HALF_STRIDE = SGU_HALF_CTAS // 2
-
-
-@traced
-def stage_sgu_half(c, ci):
-    """Shared gate / up, K halves: CTA ``ci`` (of ``SGU_HALF_CTAS``) takes K half ci % 2 of row groups ci / 2 and
-    ci / 2 + 52, one load of that half's x rows for both -> fp32 partials ``sgup`` (half, token, row)."""
-    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
-    a = c["args"]
-    half = ci % 2
-    rg0 = ci // 2
-    rg1 = rg0 + SGU_HALF_STRIDE
-    klen = HIDDEN // 2
-    k0 = half * klen
-    ops0 = gemv.loads(lane, wave, a["w_sgu"], rg0 * ROWS, klen, ldk=HIDDEN, k0=k0)
-    ops1 = gemv.loads(
-        lane, wave, a["w_sgu"], fx.min(rg1, SGU_RGS - 1) * ROWS, klen, ldk=HIDDEN, k0=k0
-    )
-    if tid < c["xflags"]:
-        c["poll"]([(c["xrdy"], tid, 1)])
-    gpu.barrier()
-    stamp(c["tl_on"], c["tls"], tid, 32)
-    xrow = klen + gemv.LDS_PAD
-    for t0, n in gemv.token_tiles(s, gemv.tile_rows(klen)):
-        gemv.rows_to_lds(
-            tid, c["xbuf"], klen, n, c["xl"], xrow, c["sgu_cm"], ldk=HIDDEN, k0=k0, t0=t0
-        )
-        stamp(c["tl_on"], c["tls"], tid, 33)
-        for j, (ops, rg) in enumerate(((ops0, rg0), (ops1, rg1))):  # noqa: B007
-            acc = gemv.mfmas(lane, wave, c["xl"], xrow, klen, n, ops)
-            fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-            gpu.barrier()
-            if const_expr(j == 0):
-                if tid < ROWS * n:
-                    r = tid % ROWS
-                    tl = tid // ROWS
-                    v = row_sum(red, r, tl)
-                    c["put"](c["sgup"], (half * s + t0 + tl) * 2 * SI + rg * ROWS + r, v)
-            else:
-                if (tid < ROWS * n) & (rg < SGU_RGS):
-                    r = tid % ROWS
-                    tl = tid // ROWS
-                    v = row_sum(red, r, tl)
-                    c["put"](c["sgup"], (half * s + t0 + tl) * 2 * SI + rg * ROWS + r, v)
-            gpu.barrier()
-    stamp(c["tl_on"], c["tls"], tid, 35)
-
-
-@traced
-def stage_h_half(c, t):
-    """``stage_h`` from the K-half partials: bf16(half 0 + half 1) of the gate and up rows."""
-    s, tid = c["S"], c["tid"]
-    n = SI // 2
-    if tid < n:
-        specs = [
-            (c["sgup"], (half * s + t) * 2 * SI + off + 2 * tid + d, 1)
-            for half in range(2)
-            for off in (0, SI)
-            for d in range(2)
-        ]
-        got = c["poll"](specs)
-        g0 = bf16_round(f32_of(got[0][0]) + f32_of(got[4][0]))
-        g1 = bf16_round(f32_of(got[1][0]) + f32_of(got[5][0]))
-        u0 = bf16_round(f32_of(got[2][0]) + f32_of(got[6][0]))
-        u1 = bf16_round(f32_of(got[3][0]) + f32_of(got[7][0]))
-        c["put_bf"](c["h"], t * SI + 2 * tid, [situ_vllm(g0, u0), situ_vllm(g1, u1)])
-    gpu.barrier()
-
-
 @traced
 def stage_h(c, t):
     """Token t's shared h = SiTU(g, u) (vLLM's situ_and_mul, bf16) of SGU, once
@@ -1458,7 +1321,7 @@ def load_h(c):
         t = fx.min(pidx, n - 1) // (SI // 2)
         cp = fx.min(pidx, n - 1) % (SI // 2)
         if pidx < n:
-            fx.ptr_store(got[i][0], c["hl"] + (t * hrow + 2 * cp) // 2)
+            fx.ptr_store(got[i][0], c["xl"] + (t * hrow + 2 * cp) // 2)
     gpu.barrier()
 
 
@@ -1488,7 +1351,7 @@ def sdown_tile(c, j, ops, t0, n):
     """``stage_sdown`` for the h rows t0 .. t0 + n."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     hrow = SI + gemv.LDS_PAD
-    acc = gemv.mfmas(lane, wave, c["hl"] + t0 * hrow // 2, hrow, SI, n, ops)
+    acc = gemv.mfmas(lane, wave, c["xl"] + t0 * hrow // 2, hrow, SI, n, ops)
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
     lo = c["rank"] * UP_TASKS
@@ -1630,6 +1493,7 @@ def stage_lnorm(c, t):
             batch=nch * TP,
         )
     stamp(c["tl_on"], c["tls"], tid, 26)
+    stamp(c["tl_on"], c["tls"], tid, 26)
     vals = []
     for i in range_constexpr(nch):
         acc0, acc1 = bf2_f32(got[i * TP][0])
@@ -1728,18 +1592,6 @@ def up_tile(c, j, ops, t0, n):
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     row0 = c["rank"] * UP_N + j * ROWS  # the hidden column; w_up is the shard
     lrow = LAT + gemv.LDS_PAD
-    w_pre = None
-    if const_expr(c["up_pre"]):
-        tl0 = fx.min(tid // (ROWS // 2), n - 1)
-        w_pre = fx.Int32(
-            bo.buffer_load(
-                rsrc(c["shp"]),
-                ((t0 + tl0) * UP_N + j * ROWS + 2 * (tid % (ROWS // 2))) // 2,
-                vec_width=1,
-                dtype=T.i32,
-                cache_modifier=CM_DEV,
-            )
-        )
     gemv.dev_rows_to_lds(tid, c["ln"], LAT, n, c["xl"], lrow, t0=t0)
     stamp(c["tl_on"], c["tls"], tid, 28)
     acc = gemv.mfmas(lane, wave, c["xl"], lrow, LAT, n, ops)
@@ -1750,18 +1602,15 @@ def up_tile(c, j, ops, t0, n):
         rp = tid % (ROWS // 2)
         tl = tid // (ROWS // 2)
         tt = t0 + tl
-        if const_expr(c["up_pre"]):
-            w = w_pre
-        else:
-            w = fx.Int32(
-                bo.buffer_load(
-                    rsrc(c["shp"]),
-                    (tt * UP_N + j * ROWS + 2 * rp) // 2,
-                    vec_width=1,
-                    dtype=T.i32,
-                    cache_modifier=CM_DEV,
-                )
+        w = fx.Int32(
+            bo.buffer_load(
+                rsrc(c["shp"]),
+                (tt * UP_N + j * ROWS + 2 * rp) // 2,
+                vec_width=1,
+                dtype=T.i32,
+                cache_modifier=CM_DEV,
             )
+        )
         v0 = bf16_round(bf_lo(w) + row_sum(red, 2 * rp, tl))
         v1 = bf16_round(bf_hi(w) + row_sum(red, 2 * rp + 1, tl))
         at = (c["rank"] * s + tt) * HIDDEN + row0 + 2 * rp

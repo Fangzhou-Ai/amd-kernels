@@ -4,7 +4,7 @@
 
 Each graph replays NSET launches over distinct weights (the working set exceeds the LLC); the time is the median of
 ROUNDS x REPL replays, per launch, the slowest rank. ``P`` limits the experts the routing can pick (896: uniform,
-the worst case for the expert weights' bytes). The baseline is the stock vLLM K2 when ``vllm`` is importable."""
+the worst case for the expert weights' bytes)."""
 import os
 import statistics
 
@@ -16,7 +16,7 @@ from amd_kernels.moe.layer_tail_k2_h7168_ranks8 import kernel as K
 from amd_kernels.moe.layer_tail_k2_h7168_ranks8 import reference as ref
 from tests.moe.layer_tail_k2_h7168_ranks8.inputs import layer_inputs, moe_weights
 
-HBM_READ_TBS = 6.5  # measured achievable read bandwidth (analysis/hw_ceilings.md)
+HBM_READ_TBS = 6.4  # measured achievable HBM read (analysis/hw_ceilings.md)
 NSET, REPL, ROUNDS = 4, 20, 12
 bf = torch.bfloat16
 DENSE_MB = (7168 * 1536 + 112 * 7168 + 448 * 7168 + 1536 * 7168 + 7168 * 768 + 896 * 3584) * 2 / 1e6
@@ -33,13 +33,6 @@ def main():
     for i in range(NSET):
         nat, dev = moe_weights(rank, device)
         sets.append(dev)
-    stock = None
-    try:
-        from vllm.models.kimi_k3.amd.specialized_decode.mono import layer as stock_k2
-
-        stock = stock_k2
-    except Exception:  # noqa: BLE001
-        pass
     rows = []
     for uniq in (896, 96):
         for S in (6, 12):
@@ -90,11 +83,11 @@ def main():
                 m = torch.stack(gathered)
                 mb = DENSE_MB + used * EXPERT_MB
                 us = m[:, 0].max().item()
-                rows.append((S, uniq, used, us, m[:, 1].max().item(), mb, mb / us / 1e3 / HBM_READ_TBS * 100))
+                rows.append((S, uniq, used, us, m[:, 1].max().item(), mb, mb / us / HBM_READ_TBS * 100))
     if rank == 0:
-        print("M  P   experts  us/layer (min)   MB/rank   TB/s    % of the 6.5 TB/s read ceiling")
+        print("M  P   experts  us/layer (min)   MB/rank   TB/s    % of the 6.4 TB/s read ceiling")
         for S, uniq, used, us, mn, mb, pct in rows:
-            print(f"{S:<3}{uniq:<5}{used:<8}{us:7.1f} ({mn:6.1f}){mb:9.0f}{mb / us / 1e3:8.2f}  {pct:5.1f}")
+            print(f"{S:<3}{uniq:<5}{used:<8}{us:7.1f} ({mn:6.1f}){mb:9.0f}{mb / us:8.2f}  {pct:5.1f}")
 
 
 if __name__ == "__main__":

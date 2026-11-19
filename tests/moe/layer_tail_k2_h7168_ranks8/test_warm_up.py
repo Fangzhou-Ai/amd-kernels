@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """``layer_tail`` is an entry (``amd_kernels.warm_up``): its first call of a mode (nblocks, reset) compiles every
-served width; calls at the served widths afterwards compile nothing. Compile-only: no kernel launches."""
+served width, launching nothing (the runner's scratch, health and epoch stay zero); calls at the served widths afterwards compile nothing. Compile-only: no kernel launches."""
 import json
 import os
 import subprocess
@@ -42,17 +42,18 @@ def scenario():
             if len(late) > before:
                 bad.append((nblocks, reset, n))
     torch.cuda.synchronize()
-    return {"late": bad, "warmed": len(warm_up.warmed())}
+    touched = bool(comm.scratch.any().item() or comm.health.any().item() or comm.epoch.item())
+    return {"late": bad, "warmed": len(warm_up.warmed()), "touched": touched}
 
 
-def test_first_call_warm_up_compiles_every_served_width(tmp_path):
+def test_first_call_warm_up_compiles_every_served_width():
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
     proc = subprocess.run([sys.executable, "-m", __name__], capture_output=True, text=True, timeout=1500,
-                          env={**os.environ, "COMPILE_ONLY": "1", "FLYDSL_RUNTIME_CACHE_DIR": str(tmp_path / "flydsl")})
+                          env={**os.environ, "COMPILE_ONLY": "1"})
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
     result = json.loads(proc.stdout.strip().splitlines()[-1])
-    assert result["late"] == [] and result["warmed"] == 2, result
+    assert result["late"] == [] and result["warmed"] == 2 and not result["touched"], result
 
 
 if __name__ == "__main__":

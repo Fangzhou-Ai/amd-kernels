@@ -25,10 +25,9 @@ from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Int32, Int64
 
-from amd_kernels.common import buffer_ops as bo
 from amd_kernels.common.mono.debug import (
     region_ids,
     stamp,
@@ -36,11 +35,8 @@ from amd_kernels.common.mono.debug import (
     stamp_flush,
 )
 from amd_kernels.common.mono.ops import (
-    CM_DEV,
     ld_i32,
     lds_bytes,
-    rsrc,
-    scalar_atomic_add,
     load_ptr64,
     traced,
     uniform,
@@ -81,18 +77,19 @@ from .attn_res import (
 
 _SOURCES = source_digest("common/mono", "moe/layer_tail_k2_h7168_ranks8")
 
-O0, O1 = NA, BLOCKS  # o_proj CTAs: every CTA past AttnRes's
-O_N = O1 - O0  # 200
+O0 = NA  # the first CTA past AttnRes's
 OTASKS = k2a.OTASKS  # 448
-O_ROUNDS = (OTASKS + O_N - 1) // O_N  # 5
+O_N = BLOCKS  # o_proj tasks gi, gi + 256 on every CTA
+O_ROUNDS = (OTASKS + O_N - 1) // O_N  # 2
 E0 = 160  # router / latent CTAs (their weights in flight under their o_proj)
-H0 = 8  # the shared SiTU's CTAs (after their AttnRes work)
+H0 = 20  # the shared SiTU's CTAs: past the route CTAs (tokens 0 .. 15)
 SD0 = k2b.DOWN_TASKS  # 224: the shared down's CTAs
-# timeline points: 0 start, 1 o_proj done / AR reduced, 2 early done / slice,
-# 3 ug, 4 down/sdown, 5 lnorm, 6 up, 7 reduce, 8 gate, 9 mix (x published),
-# 10 route, 11 route table, 12 latent quant, 13 the shared SiTU's h done
-TL_POINTS = 38  # + 14 the fused M1b's push, 15 INTER loaded, 16 down done,
-# 17 the fused M1b's combine
+# timeline points (``common.mono.debug``): 0 start, 1 o_proj done / AR reduced, 2 early done / slice, 3 ug,
+# 4 down + shared down, 5 lnorm, 6 up, 7 reduce, 8 gate, 9 mix (x published), 10 route, 11 route table,
+# 12 latent quant, 13 shared SiTU, 15 INTER loaded, 16 down done, 18 / 19 router x loaded / pushed, 20 router
+# logits, 21 route end, 22 ROUTE polled, 23 / 24 route start / parts polled, 26 lnorm polled, 27 up polled,
+# 28 up rows in LDS, 29 up MFMA done, 30 LN rows published, 31 reduce polled
+TL_POINTS = 32
 
 assert E0 + k2b.R_TASKS + k2b.L_TASKS <= BLOCKS and k2b.G_TASKS <= E0 - O0
 
@@ -108,7 +105,7 @@ REGIONS: tuple[str, ...] = (
 ) + k2b.REGIONS
 # the all-reduce sentinel regions, RLOGP and the tagged rows (``K2Build.opt``),
 # past every region above
-REGIONS = REGIONS + ("ars", "latrs", "finals", "xt", "rlogp", "gram")
+REGIONS = REGIONS + ("ars", "latrs", "finals", "xt", "rlogp")
 
 # K2 options (``K2Build.opt``), all bit-exact vs opt=0; K2_OPT is the default.
 #   1 / 16 / 32  o_proj / latent / final all-reduce via sentinel regions
@@ -131,17 +128,6 @@ K2_OPT = (
     OPT_SENTS | OPT_PRELOAD | OPT_TAG_X | OPT_SDOWN_FIRST | OPT_RLOG_PARTS | OPT_BATCH
 )
 SENT_ROWS = 16  # the served widths (runtime.MAX_ROWS)
-EXP_OALL = 1  # o_proj tasks on all 256 CTAs (AttnRes CTAs too)
-EXP_HMOVE = 2  # the shared SiTU on CTAs past the route CTAs
-EXP_SDMID = 4  # the shared down tasks run between ug rounds (own LDS rows), not after down
-EXP_UGTICKET = 16  # ug tasks past the second round handed out by a ticket counter
-EXP_SGUPLAIN = 32  # the shared gate/up reads the x rows with the default cache policy
-EXP_SGUBATCH = 64  # the shared gate/up loads a tile's x rows before storing any
-EXP_GRAM = 128  # the AttnRes mix's sum of squares from source-pair dot products (no second exchange)
-EXP_UPPRE = 4096  # up loads its SHP words before the LN rows
-EXP_SGUHALF = 8192  # the shared gate/up as K halves on CTAs 56 .. 159
-EXP_DOWNPH2 = 1 << 14  # down in 2 phases (exp bits 14-15): INTER polled per slot range
-EXP_INTERPOLL = 8  # down polls each pick tile's INTER at use (no wait for every ug task)
 
 _STREAM = fx.Stream(None)
 
@@ -164,7 +150,6 @@ class K2Build:
     timeline: bool = False
     # the OPT_* bits
     opt: int = K2_OPT
-    exp: int = 0  # experiment bits (EXP_*)
 
 
 def k2_sent(key: K2Build) -> bool:
@@ -296,7 +281,6 @@ def scratch_layout(key: K2Build) -> dict:
         lay[name] = ((end + 15) // 16 * 16 + o, n)
     end = max(o + n for o, n in lay.values())
     lay["xrow"] = ((end + 15) // 16 * 16, s * HIDDEN * 2)
-    lay["ugctr"] = ((lay["xrow"][0] + lay["xrow"][1] + 63) // 64 * 64, 64)
     return lay
 
 
@@ -318,13 +302,12 @@ def stage_oproj(c, gi):
     """o_proj tasks gi, gi + 200, gi + 400 (< 448): every task's weights in
     flight at once (one memory latency, not three), then the MFMAs a core tile
     of 16 rows at a time."""
-    on_, rounds = c["o_n"], c["o_rounds"]
-    ops = [k2a.o_loads(c, fx.min(gi + on_ * j, OTASKS - 1)) for j in range(rounds)]
+    ops = [k2a.o_loads(c, fx.min(gi + O_N * j, OTASKS - 1)) for j in range(O_ROUNDS)]
     for t0, n in gemv.token_tiles(c["S"]):
         cm = 0
         k2a.load_core(c, t0, n, cm)
-        for j in range_constexpr(rounds):
-            t = gi + on_ * j
+        for j in range_constexpr(O_ROUNDS):
+            t = gi + O_N * j
             if t < OTASKS:
                 k2a.stage_o(c, t, ops[j], t0, n)
 
@@ -392,7 +375,7 @@ def build(key: K2Build):
         latsc: fx.Array[fx.Int32, k2b.latsc_words(s), 16]
 
     # every pick's INTER in LDS, or (polled at use) none
-    nq = s * k2b.TOPK if k2b.inter_lds(s, bool(key.exp & EXP_INTERPOLL)) else 1
+    nq = s * k2b.TOPK if k2b.inter_lds(s) else 1
 
     @fx.struct
     class DownLds:
@@ -417,12 +400,9 @@ def build(key: K2Build):
     class MainLds:
         k2: K2Lds
 
-    sdmid = bool(key.exp & EXP_SDMID)
-
     @fx.struct
     class Smem:
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
-        hl: fx.Array[fx.Int32, s * (k2b.SI + gemv.LDS_PAD) // 2 if sdmid else 1, 16]
 
     # LLVM's own over-the-limit error doesn't stop a build (COMPILE_ONLY)
     assert lds_bytes(Smem) + lds_bytes(MainLds) <= LDS_BYTES, lds_bytes(
@@ -529,7 +509,6 @@ def build(key: K2Build):
             "ar_peer": peer["ar"],
             "ar_own": peer["ar_own"],
             "xl": el.xl.ptr,
-            "hl": lds.hl.ptr if sdmid else el.xl.ptr,
             "vals": al.vals.ptr,
             "delta_lds": al.dl.ptr,
             "latq": ul.latq.ptr,
@@ -581,16 +560,6 @@ def build(key: K2Build):
             },
         }
         # the OPT_* bits' switches and regions
-        c["o_n"] = BLOCKS if key.exp & EXP_OALL else O_N
-        c["o_rounds"] = -(-OTASKS // c["o_n"])
-        c["db"] = ((key.exp >> 8) & 15) or k2b.DOWN_BATCH
-        c["inter_poll"] = bool(key.exp & EXP_INTERPOLL)
-        c["use_gram"] = bool(key.exp & EXP_GRAM)
-        c["down_phases"] = max((key.exp >> 14) & 3, 1)
-        assert c["down_phases"] == 1 or (k2b.few_rows(s) and k2b.inter_lds(s, False))
-        c["up_pre"] = bool(key.exp & EXP_UPPRE)
-        c["sgu_batched"] = bool(key.exp & EXP_SGUBATCH)
-        c["sgu_cm"] = 0 if key.exp & EXP_SGUPLAIN else CM_DEV
         c["tag_x"] = bool(key.opt & OPT_TAG_X)
         c["batch"] = bool(key.opt & OPT_BATCH)
         rlogp = k2_rlogp(key)
@@ -620,9 +589,7 @@ def build(key: K2Build):
             "wgt",
             "msq",
             "xrdy",
-            "gram",
             "sgu",
-            "sgup",
             "h",
             "rpart",
             "lpart",
@@ -636,37 +603,30 @@ def build(key: K2Build):
         on, tls = key.timeline, lds.tls.ptr
         stamp_begin(on, tls, tid, TL_POINTS)
         # ---- o_proj on every CTA past AttnRes's
-        oall = key.exp & EXP_OALL
-        obase = bid if oall else bid - O0
         eb = bid - E0
         lb = eb - k2b.R_TASKS
         is_r = (bid >= E0) & (eb < k2b.R_TASKS)
         is_l = (bid >= E0 + k2b.R_TASKS) & (lb < k2b.L_TASKS)
         # o_proj first (every AttnRes CTA waits on the slowest partial; loads
         # retire in order), the early weights after: they land before x does
-        if const_expr(key.exp & EXP_OALL):
-            if bid < NA:
-                stage_oproj(c, bid)
+        if bid < NA:
+            stage_oproj(c, bid)
         if is_r:
-            stage_oproj(c, obase)
+            stage_oproj(c, bid)
             stamp(on, tls, tid, 1)
             rops = k2b.early_loads(c, 0, eb // k2b.R_PARTS, eb % k2b.R_PARTS)
             k2b.early_compute(c, 0, eb // k2b.R_PARTS, eb % k2b.R_PARTS, rops)
         if is_l:
-            stage_oproj(c, obase)
+            stage_oproj(c, bid)
             stamp(on, tls, tid, 1)
             lops = k2b.early_loads(c, 1, lb // k2b.L_PARTS, lb % k2b.L_PARTS)
             k2b.early_compute(c, 1, lb // k2b.L_PARTS, lb % k2b.L_PARTS, lops)
         if (bid >= O0) & ~is_r & ~is_l:
-            stage_oproj(c, obase)
+            stage_oproj(c, bid)
             stamp(on, tls, tid, 1)
             gi = bid - O0
-            if const_expr(bool(key.exp & EXP_SGUHALF)):
-                if gi < k2b.SGU_HALF_CTAS:
-                    k2b.stage_sgu_half(c, gi)
-            else:
-                if gi < k2b.G_TASKS:
-                    k2b.early_compute(c, 2, gi, 0, k2b.early_loads(c, 2, gi, 0))
+            if gi < k2b.G_TASKS:
+                k2b.early_compute(c, 2, gi, 0, k2b.early_loads(c, 2, gi, 0))
         # ---- AttnRes: the reduced o_proj -> x; then route / SiTU
         if bid < NA:
             if const_expr(key.opt & OPT_PRELOAD):
@@ -689,25 +649,19 @@ def build(key: K2Build):
             stamp(on, tls, tid, 9)
             # the shared SiTU of token t on CTA (t + H0) % 56, first: SGU lands
             # before the logits
-            hb = (bid + NA - (20 if key.exp & EXP_HMOVE else H0)) % NA
+            hb = (bid + NA - H0) % NA
             for rr in range_constexpr((s + NA - 1) // NA):
                 if hb + NA * rr < s:
-                    if const_expr(bool(key.exp & EXP_SGUHALF)):
-                        k2b.stage_h_half(c, hb + NA * rr)
-                    else:
-                        k2b.stage_h(c, hb + NA * rr)
+                    k2b.stage_h(c, hb + NA * rr)
             stamp(on, tls, tid, 13)
             for rr in range_constexpr((s + NA - 1) // NA):
                 if bid + NA * rr < s:
                     stamp(on, tls, tid, 23)
-                    if const_expr(key.exp & EXP_UGTICKET):
-                        if (bid == 0) & (tid == 0):
-                            bo.buffer_store(fx.Int32(0), rsrc(scratch + fx.Int64(lay["ugctr"][0])), 0, cache_modifier=CM_DEV)
-                            rocdl.s_waitcnt(vmcnt=0)
                     if const_expr(rlogp):
                         k2b.route_parts(c, bid + NA * rr)
                     stamp(on, tls, tid, 24)
                     k2b.stage_route(c, bid + NA * rr)
+                    stamp(on, tls, tid, 21)
                     stamp(on, tls, tid, 21)
             stamp(on, tls, tid, 10)
         if bid >= NA:
@@ -727,57 +681,21 @@ def build(key: K2Build):
         # whose early work ends first (the AttnRes / route CTAs start ug last)
         task = BLOCKS - 1 - bid
         ops = k2b.ug_loads(c, fx.min(task, last))
-        rnd = fx.Int32(0)
-        if const_expr(key.exp & EXP_UGTICKET):
-            ctr = scratch + fx.Int64(lay["ugctr"][0])
+        while task < total:
             nxt = task + BLOCKS
             ops_n = k2b.ug_loads(c, fx.min(nxt, last))
-            while task < total:
-                if tid == 0:
-                    fx.ptr_store(scalar_atomic_add(ctr, 1), c["scan"])
-                gpu.barrier()
-                third = fx.ptr_load(c["scan"]) + 2 * BLOCKS
-                k2b.stage_ug(c, task, ops)
-                ops_t = k2b.ug_loads(c, fx.min(third, last))
-                task = nxt
-                ops = ops_n
-                nxt = third
-                ops_n = ops_t
-                if const_expr(sdmid):
-                    rnd = rnd + 1
-                    if rnd == 3:
-                        k2b.run_sdown_first(c, bid, w_sd)
-                        k2b.run_sdown_rest(c, bid, w_sd)
-        else:
-            while task < total:
-                nxt = task + BLOCKS
-                ops_n = k2b.ug_loads(c, fx.min(nxt, last))
-                k2b.stage_ug(c, task, ops)
-                task = nxt
-                ops = ops_n
-                if const_expr(sdmid):
-                    rnd = rnd + 1
-                    if rnd == 3:
-                        k2b.run_sdown_first(c, bid, w_sd)
-                        k2b.run_sdown_rest(c, bid, w_sd)
-        if const_expr(sdmid):
-            if rnd < 3:
-                k2b.run_sdown_first(c, bid, w_sd)
-                k2b.run_sdown_rest(c, bid, w_sd)
+            k2b.stage_ug(c, task, ops)
+            task = nxt
+            ops = ops_n
         stamp(on, tls, tid, 3)
         if bid < k2b.DOWN_TASKS:
             dops = k2b.down_loads(c, bid, nt, fx.min(c["wave"], nt - 1))
-            if const_expr(c["down_phases"] > 1):
-                _, _, t_lo, t_hi = k2b.phase_bounds(nt, c["db"], c["down_phases"], 0)
-                k2b.load_inter_range(c, t_lo, t_hi)
-            elif const_expr(k2b.inter_lds(s, bool(key.exp & EXP_INTERPOLL))):
+            if const_expr(k2b.inter_lds(s)):
                 k2b.load_inter(c)
             stamp(on, tls, tid, 15)
             k2b.stage_down(c, bid, nt, dops)
             stamp(on, tls, tid, 16)
-        if const_expr(sdmid):
-            pass
-        elif const_expr(key.opt & OPT_SDOWN_FIRST):
+        if const_expr(key.opt & OPT_SDOWN_FIRST):
             k2b.run_sdown_first(c, bid, w_sd)
             k2b.run_sdown_rest(c, bid, w_sd)
         else:
