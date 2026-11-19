@@ -83,3 +83,12 @@ def test_same_blocks_as_aiter(params, m):
         return key.view(-1, 16).sort(1)[0]
 
     assert torch.equal(blocks(aux["sorted_token_ids"], aux["sorted_weights"]), blocks(r_sti, r_sw))
+
+
+def test_back_to_back_sorts(params):
+    """Calls of different M back to back with fresh aux tensors (the ids' parity tag): every call's sort equals the reference."""
+    ws, bias = params
+    for rep in range(3):
+        for m in (12, 80, 17, 12, 192, 1, 80, 33, 192, 16):
+            out, aux = run(m, ws, bias, seed=rep * 7 + m)
+            check(out, aux, m)

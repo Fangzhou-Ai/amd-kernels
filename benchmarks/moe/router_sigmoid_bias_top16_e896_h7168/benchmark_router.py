@@ -60,7 +60,7 @@ if __name__ == "__main__":
     def skeleton(m, xs, bits):
         mt = host.m_tile_fragments(m)
         cfg = host._config(mt)
-        part, flags, _ = host._workspace(xs[0].device, torch.cuda.current_stream().cuda_stream, mt, cfg)
+        part, flags = host._workspace(xs[0].device, torch.cuda.current_stream().cuda_stream, mt, cfg)
         ow, oi = torch.empty(m, TOPK, device="cuda"), torch.empty(m, TOPK, dtype=torch.int32, device="cuda")
         exe = compile_router_e896_h7168(mt, cfg[0], 1, 1, cfg[1], cfg[2], 0, 0, bits, cfg[3])
         mk = lambda x, w: (x.data_ptr(), w.data_ptr(), part.data_ptr(), flags.data_ptr(), bias.data_ptr(), ow.data_ptr(),

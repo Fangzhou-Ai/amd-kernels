@@ -74,17 +74,29 @@ _WORK: dict = {}
 
 
 def _workspace(device: torch.device, stream: int, mt: int, config: tuple):
-    """The partial slabs, the epoch words (zero, never reset: each call advances each by one) and the sort's masks and
-    flags (flags carry the call's epoch) of one (device, stream, row tile, config). A call writes every word of its
-    slabs, so the words an epoch finds are those of the previous call of the same workspace (the slab parity tag)."""
+    """The partial slabs and the epoch words (zero, never reset: each call advances each by one) of one (device, stream,
+    row tile, config). A call writes every word of its slabs, so the words an epoch finds are those of the previous call
+    of the same workspace (the slab parity tag)."""
     key = (device.index, stream, mt, config)
     ws = _WORK.get(key)
     if ws is None:
         ks, wn, _, ms = _config(mt, config)
         ws = (torch.zeros(partial_bytes(mt, ks, wn, ms), dtype=torch.uint8, device=device),
-              torch.zeros(FLAG_WORDS, dtype=torch.int32, device=device),
-              torch.zeros(WORKSPACE_WORDS, dtype=torch.int32, device=device))
+              torch.zeros(FLAG_WORDS, dtype=torch.int32, device=device))
         _WORK[key] = ws
+    return ws
+
+
+_AUX_WORK: dict = {}
+
+
+def _aux_workspace(device: torch.device, stream: int, m: int):
+    """The expert ids the sort's token waves exchange (tagged with the call's parity) of one (device, stream, M): a call
+    writes the ids of all M tokens, so the words it finds are those of the previous call with the same M."""
+    key = (device.index, stream, m)
+    ws = _AUX_WORK.get(key)
+    if ws is None:
+        ws = _AUX_WORK[key] = torch.zeros(WORKSPACE_WORDS, dtype=torch.int32, device=device)
     return ws
 
 
@@ -122,7 +134,7 @@ def _launch(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None, scale: 
     stream = torch.cuda.current_stream()
     mt = m_tile_fragments(m)
     ks, wn, nrw, ms = _config(mt)
-    part, counters, aux_ws = _workspace(x.device, stream.cuda_stream, mt, (ks, wn, nrw, ms))
+    part, counters = _workspace(x.device, stream.cuda_stream, mt, (ks, wn, nrw, ms))
     ptrs = [0] * 8
     cap = zvecs = 0
     if out is None:
@@ -138,7 +150,7 @@ def _launch(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None, scale: 
                 assert t.is_contiguous() and t.numel() >= n and t.device == x.device
             mb = aux.get("moe_buf")
             zvecs = 0 if mb is None else m * 3584 * 2 // 16
-            ptrs = [aux_ws.data_ptr(), aux["sorted_token_ids"].data_ptr(), aux["sorted_weights"].data_ptr(),
+            ptrs = [_aux_workspace(x.device, stream.cuda_stream, m).data_ptr(), aux["sorted_token_ids"].data_ptr(), aux["sorted_weights"].data_ptr(),
                     aux["sorted_expert_ids"].data_ptr(), aux["num_valid_ids"].data_ptr(), aux["m_indices"].data_ptr(),
                     aux["reverse_sorted"].data_ptr(), 0 if mb is None else mb.data_ptr()]
     _run(_router_kernel(mt, ks, bool(shuffled), out is not None, wn, nrw, aux is not None, ms), x.data_ptr(), w.data_ptr(),

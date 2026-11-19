@@ -4,14 +4,15 @@
 ``register_presorted_moe`` takes: sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, m_indices,
 reverse_sorted) and the zeroed [M, 3584] bf16 output buffer the atomic stage 2 accumulates into.
 
-How it is made without a global sort pass. Every wave that finished a token ORs the token's bit into one 256-bit mask
-per routed expert (an expert's tokens, scratch ``mask``), writes its token's flag, and waits for every token's flag.
-Then each wave, from the masks alone, derives the same layout: lane l counts the tokens of experts 14 l .. 14 l + 13,
-rounds each count up to 16 and a DPP scan over the lanes gives every expert's first row; a pair's row is its expert's
-first row plus the number of lower tokens in the expert's mask (ascending token order inside an expert, the same bits
-on every run). Each wave writes its token's 16 rows; the padding rows (token id M, weight 0, m_indices M), the zeroed
-masks and the moe buffer are written by every workgroup before it arrives, so a valid row is never overwritten
-by a pad. The wave of token 0 also writes the expert id of every 16-row block and ``num_valid_ids`` (padded rows, M).
+How it is made without a global sort pass. Every token's wave stores its 16 expert ids (the call's parity in bit 31) and
+loads all tokens' ids until every word carries the call's parity (the slab hand-off's tag). Each wave then ORs the
+(token, slot) bits into 256-bit masks, one per expert, in LDS (an expert's tokens), and derives the same layout from the
+masks alone: lane l counts the tokens of experts 14 l .. 14 l + 13, rounds each count up to 16 and a DPP scan over the lanes
+gives every expert's first row; a pair's row is its expert's first row plus the number of lower tokens in the expert's mask
+(ascending token order inside an expert, the same bits on every run). Each wave writes its token's 16 rows; the padding rows
+(token id M, weight 0, m_indices M) and the moe buffer are written by every workgroup before its slabs, so a valid row is
+never overwritten by a pad. The wave of token 0 also writes the expert id of every 16-row block and ``num_valid_ids``
+(padded rows, M).
 """
 from types import SimpleNamespace
 
@@ -29,8 +30,10 @@ BM = 16
 MASK_WORDS = 8  # 32-bit words of one expert's token mask (M <= 256)
 NE = 896
 EPL = 14  # experts per lane
-FLAG_BASE = NE * MASK_WORDS  # the token flags follow the masks (int32 words in the workspace)
-WORKSPACE_WORDS = FLAG_BASE + 256
+MASK_BYTES = NE * MASK_WORDS * 4  # the masks live in the dead GEMM ring (LDS), the cumulative rows after them
+IDS_WORDS = 256 * 16  # the workspace: every token's 16 expert ids, tagged
+EPOCH_BASE = IDS_WORDS  # and one epoch word a token (an aux workspace serves one M: all its tokens advance each call)
+WORKSPACE_WORDS = IDS_WORDS + 256
 SC1 = 0x10
 MAX_ZERO_VECS = 192 * 3584 * 2 // 16  # 16-byte vectors of the largest moe buffer, [192, 3584] bf16
 
@@ -42,20 +45,26 @@ def aux_capacity(m: int, topk: int = 16, num_experts: int = NE) -> int:
     return (routes + active * (BM - 1) + BM - 1) // BM * BM
 
 
-def atomic_or(addr, value):
-    """Device-scope ``atomicrmw or`` on a global int32 (no result used: ``global_atomic_or`` without return)."""
-    ptr = llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), fx.as_ir_value(fx.Int64(addr)))
+def lds_or(byte_addr, value):
+    """Workgroup-scope ``atomicrmw or`` on an LDS int32 (no result used: ``ds_or_b32``)."""
+    ptr = llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), fx.as_ir_value(fx.Int64(byte_addr)))
     llvm.AtomicRMWOp(llvm.AtomicBinOp._or, ptr, fx.as_ir_value(fx.Int32(value)), llvm.AtomicOrdering.monotonic,
-                     syncscope="agent", alignment=4)
+                     syncscope="workgroup", alignment=4)
 
 
-def aux_prefill(gt, nthreads, i32_m, i32_cap, i32_zero_vecs, mask_res, sti_res, sw_res, mi_res, mb_res):
-    """Thread ``gt`` of ``nthreads`` (the whole grid, at least ``16512`` threads): its share of the zeroed expert masks,
-    of the padding rows of the three row arrays (token id M, weight 0, m_indices M) and of the zeroed moe buffer
-    (``i32_zero_vecs`` 16-byte vectors; 0: none). Stores of the masks and rows are write-through (sc1): a consumer
-    wave's valid row, written later from another XCD, can never be overtaken by a stale pad line."""
+def aux_zero_masks(lds_base, lane):
+    """Zero the masks (LDS ``lds_base`` ..): a wave's 28 stores of 1 KB."""
+    zeros = Vec.from_elements([fx.Int32(0)] * 4, fx.Int32)
+    for i in range_constexpr(MASK_BYTES // 1024):
+        llvm.store(fx.as_ir_value(zeros), _lds_ptr(lds_base + i * 1024 + lane * 16), alignment=16)
+
+
+def aux_prefill(gt, nthreads, i32_m, i32_cap, i32_zero_vecs, sti_res, sw_res, mi_res, mb_res):
+    """Thread ``gt`` of ``nthreads`` (the whole grid): its share of the padding rows of the three row arrays (token id M,
+    weight 0, m_indices M) and of the zeroed moe buffer (``i32_zero_vecs`` 16-byte vectors; 0: none). Stores of the rows are
+    write-through (sc1): a consumer wave's valid row, written later from another XCD, can never be overtaken by a stale
+    pad line."""
     zero = fx.Int32(0)
-    buffer_ops.buffer_store(zero, mask_res, gt, mask=gt < NE * MASK_WORDS, cache_modifier=SC1)
     ok = gt < i32_cap
     buffer_ops.buffer_store(i32_m, sti_res, gt, mask=ok, cache_modifier=SC1)
     buffer_ops.buffer_store(i32_m, mi_res, gt, mask=ok, cache_modifier=SC1)
@@ -66,11 +75,11 @@ def aux_prefill(gt, nthreads, i32_m, i32_cap, i32_zero_vecs, mask_res, sti_res, 
         buffer_ops.buffer_store(zeros, mb_res, v * 4, mask=v < i32_zero_vecs)
 
 
-def aux_counts(mask_res, lane):
+def aux_counts(lds_base, lane):
     """Lane ``lane``'s experts 14 lane .. 14 lane + 13: token counts, padded counts and first rows (scan over the lanes),
-    from the finished masks. Also ``total``: the padded rows of all experts."""
-    words = [Vec(buffer_ops.buffer_load(mask_res, EPL * lane * MASK_WORDS + 4 * i, vec_width=4, dtype=fx.Int32,
-                                        cache_modifier=SC1 | 1)) for i in range_constexpr(EPL * MASK_WORDS // 4)]
+    from the finished masks (LDS). Also ``total``: the padded rows of all experts."""
+    words = [Vec(llvm.load(T.vec(4, T.i32), _lds_ptr(lds_base + EPL * lane * MASK_WORDS * 4 + 16 * i), alignment=16))
+             for i in range_constexpr(EPL * MASK_WORDS // 4)]
     count, pad = [], []
     for e in range_constexpr(EPL):
         c = fx.Int32(fx.math.ctpop(fx.Int32(words[2 * e][0])))
@@ -96,21 +105,19 @@ def _lds_ptr(byte_addr):
 
 
 def aux_publish_cum(st, lds_base, wv, lane):
-    """Every expert's first row to LDS (the dead GEMM ring at ``lds_base``: 3584 bytes a wave), for the lanes that look
-    an expert up by id."""
+    """Every expert's first row to LDS (after the masks), for the lanes that look an expert up by id."""
     for e in range_constexpr(EPL):
-        llvm.store(fx.as_ir_value(st.cum[e]), _lds_ptr(lds_base + (wv * NE + EPL * lane + e) * 4), alignment=4)
+        llvm.store(fx.as_ir_value(st.cum[e]), _lds_ptr(lds_base + MASK_BYTES + (wv * NE + EPL * lane + e) * 4), alignment=4)
     fx.rocdl.s_waitcnt(lgkmcnt=0)
     fx.rocdl.sched_barrier(0)
 
 
-def aux_pair_row(lds_base, wv, mask_res, expert, tok):
-    """Lane r's pair (token ``tok``, slot r, routed to ``expert``): its row, the expert's first row (an LDS read) plus the
-    number of lower tokens in the expert's mask."""
-    first = fx.Int32(llvm.load(T.i32, _lds_ptr(lds_base + (wv * NE + expert) * 4), alignment=4))
-    w0 = Vec(buffer_ops.buffer_load(mask_res, expert * MASK_WORDS, vec_width=4, dtype=fx.Int32, cache_modifier=SC1 | 1))
-    w1 = Vec(buffer_ops.buffer_load(mask_res, expert * MASK_WORDS + 4, vec_width=4, dtype=fx.Int32,
-                                    cache_modifier=SC1 | 1))
+def aux_pair_row(lds_base, wv, expert, tok):
+    """Lane r's pair (token ``tok``, slot r, routed to ``expert``): its row, the expert's first row plus the number of lower
+    tokens in the expert's mask (LDS reads)."""
+    first = fx.Int32(llvm.load(T.i32, _lds_ptr(lds_base + MASK_BYTES + (wv * NE + expert) * 4), alignment=4))
+    w0 = Vec(llvm.load(T.vec(4, T.i32), _lds_ptr(lds_base + expert * (MASK_WORDS * 4)), alignment=16))
+    w1 = Vec(llvm.load(T.vec(4, T.i32), _lds_ptr(lds_base + expert * (MASK_WORDS * 4) + 16), alignment=16))
     tw = tok >> 5
     low = (fx.Int32(1) << (tok & 31)) - fx.Int32(1)
     rank = fx.Int32(0)

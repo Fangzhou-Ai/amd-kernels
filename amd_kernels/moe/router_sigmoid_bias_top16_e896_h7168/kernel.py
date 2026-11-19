@@ -26,8 +26,8 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T, Vector as Vec
 
 from .reference import E as N, H as K
-from .aux import (FLAG_BASE, MASK_WORDS, aux_counts, aux_expert_blocks, aux_max_blocks, aux_pair_row, aux_prefill,
-                  aux_publish_cum, atomic_or)
+from .aux import (EPOCH_BASE, IDS_WORDS, MASK_BYTES, MASK_WORDS, NE, aux_counts, aux_expert_blocks, aux_max_blocks, aux_pair_row, aux_prefill, aux_publish_cum,
+                  aux_zero_masks, lds_or)
 from .topk import (LDS_WORDS, MAXC, NQ, RANK_UNROLL, TOPK, _ballot, _popcount, topk_fast_write, topk_new, topk_pivot, topk_q_keys,
                    topk_rank_start, topk_rank_step, topk_slow_out, topk_slow_select,
                    topk_finish, topk_tie_masks)
@@ -109,6 +109,7 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
     NBK = NB // KS  # K blocks per workgroup
     MR = 16 * MT
     MR_ALLOC = slab_rows(MT, WN, MS)
+    IDS_VECS = (192 * TOPK + 255) // 256  # vectors of 4 ids a lane loads
     SLOT_FRAGS = NF + MTP
     WF = NF  # weight positions per slot
     SLOT = SLOT_FRAGS * 2048
@@ -120,6 +121,7 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
     R = max(2, min(NBK, RING_BYTES // SLOT, 63 // PER + 1))
     LDS = R * SLOT
     assert LDS <= RING_BYTES and (R - 1) * PER <= 63, (LDS, R, PER)
+    assert not AUX or LDS >= MASK_BYTES + NE * 4, LDS  # the masks and the first rows of the sort live in the dead ring
 
     @fx.struct
     class Shared:
@@ -275,7 +277,6 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
             # goes on once every slab is in, may then write a valid row)
             pre_bytes = fx.Int64(i32_cap) * 4
             aux_prefill(bid * (64 * NWV) + tx, GRID * 64 * NWV, i32_m, i32_cap, i32_zvecs,
-                        buffer_ops.create_buffer_resource_from_addr(arg_aux, num_records_bytes=FLAG_BASE * 4),
                         buffer_ops.create_buffer_resource_from_addr(arg_sti, num_records_bytes=pre_bytes),
                         buffer_ops.create_buffer_resource_from_addr(arg_sw, num_records_bytes=pre_bytes),
                         buffer_ops.create_buffer_resource_from_addr(arg_mi, num_records_bytes=pre_bytes),
@@ -302,6 +303,10 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
             if bid < (i32_m * 0 if SKEL & 8 else i32_m):
                 tok = bid
                 stamp(3)
+                if const_expr(AUX):  # this call's id parity (the sort workspace's own epoch: it serves one M)
+                    ep_res = buffer_ops.create_buffer_resource_from_addr(arg_aux, num_records_bytes=(IDS_WORDS + 256) * 4)
+                    ep = fx.Int32(buffer_ops.buffer_load(ep_res, EPOCH_BASE + bid, vec_width=1, dtype=fx.Int32,
+                                                         cache_modifier=SC1 | 1)) + 1
                 out_bytes = fx.Int64(i32_m) * fx.Int64(i32_os) * 4
                 owr = buffer_ops.create_buffer_resource_from_addr(arg_ow, num_records_bytes=out_bytes)
                 oir = buffer_ops.create_buffer_resource_from_addr(arg_oid, num_records_bytes=out_bytes)
@@ -378,29 +383,47 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
                             out_id, out_w = topk_finish(rank, lane < TOPK, mysig, myid, lane, smem, wave, owr, oir, tok, i32_os, i32_scale)
                         stamp(12)
                         if const_expr(AUX):
-                            # publish the token (its bit in the mask of each routed expert, then its flag), wait for every token
-                            # and write the token's 16 rows of the sort
-                            if lane < TOPK:
-                                atomic_or(arg_aux + fx.Int64((out_id * MASK_WORDS + (tok >> 5)) * 4), fx.Int32(1) << (tok & 31))
-                            fx.rocdl.s_waitcnt(vmcnt=0)
-                            stamp(13)
-                            fres = buffer_ops.create_buffer_resource_from_addr(arg_aux + FLAG_BASE * 4, num_records_bytes=256 * 4)
-                            buffer_ops.buffer_store(tag, fres, tok, mask=lane == 0, cache_modifier=SC1)
-                            fx.rocdl.s_waitcnt(vmcnt=0)
-                            done = fx.Int32(0)
-                            while done < 192:
-                                done = fx.Int32(0)
-                                for r in range_constexpr(3):
-                                    f = fx.Int32(buffer_ops.buffer_load(fres, lane + 64 * r, vec_width=1, dtype=fx.Int32,
-                                                                        mask=(lane + 64 * r) < i32_m, cache_modifier=SC1 | 1))
-                                    done = done + _popcount(_ballot((f == tag) | ((lane + 64 * r) >= i32_m)))
+                            # publish the token's 16 expert ids (tagged with the call's parity), load every token's ids until
+                            # all carry the parity, OR their bits into the expert masks (LDS) and write the token's 16 rows
+                            ids_res = buffer_ops.create_buffer_resource_from_addr(arg_aux, num_records_bytes=IDS_WORDS * 4)
+                            par = fx.Int32(ep & 1)
+                            buffer_ops.buffer_store(ep, ep_res, EPOCH_BASE + tok, mask=lane == 0, cache_modifier=SC1)
+                            buffer_ops.buffer_store(out_id | (par << 31), ids_res, tok * TOPK + lane, mask=lane < TOPK,
+                                                    cache_modifier=SC1)
+                            aux_zero_masks(lds_base, lane)
+                            nwords = i32_m * TOPK
+                            idw = [Vec.filled(4, 0, fx.Int32) for _ in range_constexpr(IDS_VECS)]
+                            stale = fx.Int32(1)
+                            while stale != 0:
+                                bad = fx.Int32(0)
+                                loaded = []
+                                for it in range_constexpr(IDS_VECS):
+                                    wi = (it * 64 + lane) * 4
+                                    inside = wi < nwords
+                                    v = Vec(buffer_ops.buffer_load(ids_res, wi, vec_width=4, dtype=fx.Int32, mask=inside,
+                                                                   cache_modifier=SC1 | 1))
+                                    for ee in range_constexpr(4):
+                                        bad = bad | inside.select(((fx.Int32(v[ee]) >> 31) & 1) ^ par, fx.Int32(0))
+                                    loaded.append(v)
+                                idw = loaded
+                                stale = _popcount(_ballot(bad != 0))
                                 fx.rocdl.s_sleep(POLL_SLEEP)
+                            stamp(13)
+                            for it in range_constexpr(IDS_VECS):
+                                for ee in range_constexpr(4):
+                                    wi = (it * 64 + lane) * 4 + ee
+                                    inside = wi < nwords
+                                    t_ = wi >> 4
+                                    ex = inside.select(fx.Int32(idw[it][ee]) & 1023, fx.Int32(0))
+                                    lds_or(lds_base + (ex * MASK_WORDS + (t_ >> 5)) * 4,
+                                           inside.select(fx.Int32(1) << (t_ & 31), fx.Int32(0)))
+                            fx.rocdl.s_waitcnt(lgkmcnt=0)
+                            fx.rocdl.sched_barrier(0)
                             stamp(14)
-                            mres = buffer_ops.create_buffer_resource_from_addr(arg_aux, num_records_bytes=FLAG_BASE * 4)
-                            ac = aux_counts(mres, lane)
+                            ac = aux_counts(lds_base, lane)
                             aux_publish_cum(ac, lds_base, wave, lane)
                             stamp(15)
-                            row = aux_pair_row(lds_base, wave, mres, out_id, tok)
+                            row = aux_pair_row(lds_base, wave, out_id, tok)
                             cap_bytes = fx.Int64(i32_cap) * 4
                             sti_r = buffer_ops.create_buffer_resource_from_addr(arg_sti, num_records_bytes=cap_bytes)
                             sw_r = buffer_ops.create_buffer_resource_from_addr(arg_sw, num_records_bytes=cap_bytes)
