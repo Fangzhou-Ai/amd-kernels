@@ -99,7 +99,8 @@ CONV_W = 4
 LOG2E = 1.0 / math.log(2.0)
 LDS_PAD = 8  # bf16 a padded x row
 MAX_S = 16  # rows a launch
-XL_BYTES = 163_200 - 192  # LDS of the x rows: all of it but the timeline stamps  # LDS of the x rows
+XL_BYTES = 163_200 - 192  # LDS of the x rows: all of it but the timeline stamps
+XS_MAX = 12  # rows x stays resident in LDS for
 WGT0 = 256  # red: the source weights
 MSQ0 = 512  # red: the mix's per-wave sums of squares
 # timeline points: start, slice, gate, mix, load_x, gemv0, gemv1, k.stage,
@@ -409,25 +410,26 @@ def gemv_loads(c, lr0, nrows, chunks):
 
 
 @traced
-def stage_x(c):
-    """The stager wave's part (the others hold weights in flight, and a poll or
+def stage_x(c, t0, n, poll=True, wait=True):
+    """The stager waves' part (the others hold weights in flight, and a poll or
     DMA queued behind them would land with them): every token's x row ready (one
-    lane a row polls its XRDY flag), then all of x into LDS in block order
-    (``xblock_col``): 1 KB DMAs of 16 blocks of 32 columns a (row, piece),
-    the blocks past ``c["XB"]`` stay out (``x_direct``)."""
+    lane a row polls its XRDY flag), then rows t0 .. t0 + n of x into LDS rows
+    0 .. n in block order (``xblock_col``): 1 KB DMAs of 16 blocks of 32 columns
+    a (row, piece), the blocks past ``c["XB"]`` stay out (``x_direct``)."""
     lane = c["lane"]
     nb = c["XB"]
-    if lane < c["S"]:
-        c["poll"]([(c["xrdy"], lane, 1)])
-    stamp(c["on"], c["tls"], c["tid"] - 64 * (WAVES - 1), 24)
+    if const_expr(poll):
+        if lane < c["S"]:
+            c["poll"]([(c["xrdy"], lane, 1)])
+        stamp(c["on"], c["tls"], c["tid"] - 64 * (WAVES - 1), 24)
     l4 = lane // 4
     col0 = (l4 % 8) * KCH + (l4 // 8) * 32 + (lane % 4) * 8
     pieces = (nb + 15) // 16
     sidx = uniform(c["wave"]) - (WAVES - NSTAGER)
-    for t in range_constexpr(c["S"]):
+    for t in range_constexpr(n):
         for p in range_constexpr(pieces):
             col = col0 + (p // 2) * (WAVES * KCH) + (p % 2) * 64
-            src = c["xbuf"] + fx.Int64((t * HIDDEN + col) * 2)
+            src = c["xbuf"] + fx.Int64(((t0 + t) * HIDDEN + col) * 2)
             dst = c["xl_b"] + t * c["XROW"] + p * 1024
             mine = sidx == ((t * pieces + p) % NSTAGER)
             if const_expr(nb % 16 == 0):
@@ -436,9 +438,10 @@ def stage_x(c):
             else:
                 if mine & (p * 16 + l4 < nb):
                     lds_dma(src, dst, "sc1")
-    stamp(c["on"], c["tls"], c["tid"] - 64 * (WAVES - 1), 25)
-    vm_wait(0)
-    stamp(c["on"], c["tls"], c["tid"] - 64 * (WAVES - 1), 26)
+    if const_expr(wait):
+        stamp(c["on"], c["tls"], c["tid"] - 64 * (WAVES - 1), 25)
+        vm_wait(0)
+        stamp(c["on"], c["tls"], c["tid"] - 64 * (WAVES - 1), 26)
 
 
 def xblock_col(blk):
@@ -466,7 +469,7 @@ def gemv_weights(c, lr_a, n_a, lr_b, n_b):
     ops_a = gemv_loads(c, lr_a, n_a, early) + gemv_loads(c, lr_a, me.select(zero, n_a), rest)
     ops_b = gemv_loads(c, lr_b, n_b, early) + gemv_loads(c, lr_b, me.select(zero, n_b), rest)
     if me:
-        stage_x(c)
+        stage_x(c, 0, c["NT"])
         ops_a = ops_a[: 4 * EARLY] + gemv_loads(c, lr_a, n_a, rest)
         ops_b = ops_b[: 4 * EARLY] + gemv_loads(c, lr_b, n_b, rest)
     gpu.barrier()
@@ -505,7 +508,7 @@ def gemv_mfma(c, ops_a, ops_b, xd):
     once for both) -> this wave's two 16x16 accumulators."""
     lane, wave = c["lane"], c["wave"]
     g = lane // ROWS
-    t = fx.min(lane % ROWS, c["S"] - 1)
+    t = fx.min(lane % ROWS, c["NT"] - 1)
     nb = c["XB"]
     acc_a = fx.Vector.filled(4, 0.0, fx.Float32)
     acc_b = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -533,23 +536,24 @@ def gemv_mfma(c, ops_a, ops_b, xd):
 
 
 @traced
-def gemv_put(c, accs, lr_a, n_a, lr_b, n_b):
-    """The waves' accumulators summed -> bf16 PROJ rows (``n_a`` / ``n_b`` rows
-    from logical rows ``lr_a`` / ``lr_b``; none for a CTA without weights)."""
+def gemv_put(c, accs, lr_a, n_a, lr_b, n_b, t0, n):
+    """The waves' accumulators summed -> bf16 PROJ rows of tokens t0 .. t0 + n
+    (``n_a`` / ``n_b`` rows from logical rows ``lr_a`` / ``lr_b``; none for a CTA
+    without weights)."""
     tid, lane, wave, red = c["tid"], c["lane"], c["wave"], c["red"]
-    gpu.barrier()  # every wave done reading x: ``red`` shares its LDS
+    gpu.barrier()  # every wave done reading x: ``red`` may share its LDS
     fx.ptr_store(accs[0], red + (wave * 64 + lane) * 4)
     fx.ptr_store(accs[1], c["red2"] + (wave * 64 + lane) * 4)
     gpu.barrier()
     r = tid % ROWS
     tt = tid // ROWS
-    if tid < ROWS * c["S"]:
+    if tid < ROWS * n:
         if (r < n_a) & (lr_a + r < NPROJ):
             v = bf16r(row_sum(red, r, tt))
-            c["put"](c["proj"], tt * NPROJ + proj_row(lr_a + r), v)
+            c["put"](c["proj"], (t0 + tt) * NPROJ + proj_row(lr_a + r), v)
         if (r < n_b) & (lr_b + r < NPROJ):
             vb = bf16r(row_sum(c["red2"], r, tt))
-            c["put"](c["proj"], tt * NPROJ + proj_row(lr_b + r), vb)
+            c["put"](c["proj"], (t0 + tt) * NPROJ + proj_row(lr_b + r), vb)
     gpu.barrier()
 
 
@@ -816,13 +820,18 @@ def build(key: KdaPreBuild):
     ns = key.nblocks + 1
     lay = scratch_layout(key)
     assert 1 <= s <= MAX_S and L <= 16 and key.nblocks >= 1
-    # x blocks in LDS: all 224, or what a row of ``XL_BYTES / s`` holds
-    xb_lds = min(PER_WAVE * 4 * WAVES, (XL_BYTES // s - 16) // 64)
+    # past XS_MAX rows x goes through LDS in two passes of s / 2 rows, with the
+    # reduction buffers beside it; below, x takes the whole LDS (the buffers
+    # share it) and the blocks that do not fit are loaded straight from global
+    npass = 1 if s <= XS_MAX else 2
+    nt = -(-s // npass)
+    xl_bytes = XL_BYTES if npass == 1 else XL_BYTES - 2 * WAVES * 64 * 4 * 4
+    xb_lds = min(PER_WAVE * 4 * WAVES, (xl_bytes // nt - 16) // 64)
     xrow = xb_lds * 64 + 16
 
     @fx.struct
     class GemvLds:
-        xl: fx.Array[fx.Int32, s * xrow // 4, 16]
+        xl: fx.Array[fx.Int32, nt * xrow // 4, 16]
 
     @fx.struct
     class KdaLds:
@@ -842,6 +851,11 @@ def build(key: KdaPreBuild):
         gemv: GemvLds
         acc: GemvAcc
         kda: KdaLds
+
+    @fx.struct
+    class SmemSep:
+        tls: fx.Array[fx.Int64, TL_POINTS, 16]
+        red: fx.Array[fx.Float32, 2 * WAVES * 64 * 4, 16]
 
     @fx.struct
     class Smem:
@@ -890,7 +904,7 @@ def build(key: KdaPreBuild):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         alloc = fx.SharedAllocator()
-        lds = alloc.allocate(Smem).peek()
+        lds = alloc.allocate(SmemSep if npass > 1 else Smem).peek()
         role = alloc.allocate(RoleLds)
         gl, kl, ga = role.gemv.peek(), role.kda.peek(), role.acc.peek()
         mb = Mailbox(step_tag(epoch, layer) - 1, health, alarm, region_ids(REGIONS))
@@ -915,8 +929,9 @@ def build(key: KdaPreBuild):
             "XROW": xrow,
             "put": mb.put,
             "poll": mb.poll,
-            "red": ga.v.ptr,
-            "red2": ga.v.ptr + WAVES * 64 * 4,
+            "red": lds.red.ptr if npass > 1 else ga.v.ptr,
+            "red2": (lds.red.ptr if npass > 1 else ga.v.ptr) + WAVES * 64 * 4,
+            "NT": nt,
             "xl": gl.xl.ptr,
             "xl_b": fx.Int32(fx.ptrtoint(gl.xl.ptr)),
             "fa": kl.fa.ptr,
@@ -975,7 +990,20 @@ def build(key: KdaPreBuild):
         stamp(on, tls, tid, 5)
         accs = gemv_mfma(c, ops_a, ops_b, xd)
         stamp(on, tls, tid, 19)
-        gemv_put(c, accs, lr_a, n_a, lr_b, n_b)
+        if const_expr(npass == 1):
+            gemv_put(c, accs, lr_a, n_a, lr_b, n_b, 0, s)
+        else:
+            # the second pass's x streams in while the first pass's sums go out
+            gpu.barrier()
+            me = uniform(c["wave"]) >= WAVES - NSTAGER
+            if me:
+                stage_x(c, nt, s - nt, poll=False, wait=False)
+            gemv_put(c, accs, lr_a, n_a, lr_b, n_b, 0, nt)
+            if me:
+                vm_wait(0)
+            gpu.barrier()
+            accs = gemv_mfma(c, ops_a, ops_b, xd)
+            gemv_put(c, accs, lr_a, n_a, lr_b, n_b, nt, s - nt)
         stamp(on, tls, tid, 21)
         k = kda_stage(c)
         stamp(on, tls, tid, 20)
