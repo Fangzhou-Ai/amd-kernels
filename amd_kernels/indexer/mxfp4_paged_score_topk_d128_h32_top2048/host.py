@@ -173,10 +173,10 @@ def _score_topk(
 
 
 def prefer_fused(batch: int, width: int) -> bool:
-    """Where the fused call beats the unfused scorer + top-k pair in cold-page graph replay: everywhere measured but
-    more than 32 sequences of a rank's 8192 keys or fewer (48 x 4 rows x 8K: 0.95x), where the unfused pair is
-    marginally faster."""
-    return not (batch > 32 and width <= 8192)
+    """Where the fused call beats the unfused scorer + top-k pair in cold-page graph replay: everywhere measured except
+    24 or more sequences of a rank's 8192 keys or fewer (below the 100K-token contexts DCP8 serves), where the unfused
+    pair is 5 - 10% faster."""
+    return not (batch >= 24 and width <= 8192)
 
 
 def _mode(*args, **kwargs):
