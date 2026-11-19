@@ -35,13 +35,15 @@ measured library bf16 GEMM).
 | this entry | 43.2 | 43.3 | 44.0 | 45.9 | 50.4 | 51.6 | 53.9 | 57.6 | 65.4 | 66.2 | 85.4 |
 | ceiling | 45.2 | 45.3 | 45.4 | 45.5 | 45.7 | 45.8 | 46.0 | 46.3 | 46.5 | 46.8 | 50.1 |
 | % of ceiling | 104 | 104 | 103 | 99 | 91 | 89 | 85 | 80 | 71 | 71 | 59 |
-| memory-side floor of the design | 42 | 42 | 42 | 43 | 43 | 44 | 46 | 47 | 49 | 50 | 61 |
+| stream-only floor of the split-K design | - | - | - | - | - | - | - | 47.3 | 48.8 | 50.2 | 61.2 |
 
-The floor row is a kernel that only streams the same operands through the same rings (no math, no exchange; graph-timed, launch
-included): the weight stream at HBM speed plus the activation re-read; the L2 -> LDS path carries both, so above ~64 rows the
-activation traffic adds to the weight time. The split-K kernel reaches 92-97 % of that floor at 128-192 rows; the rest is the
-dispatch ramp and the end of the kernel (partial exchange 2-3 us, output store drain 1.5 us) and the 6-8 us spread of the
-CUs' finishing times (`analysis/kernels/bf16_n20480_k7168.md`: timestamps, ablations, every attempt that did not help).
+The floor row is a kernel that only streams the split-K operands through the same rings (no math, no exchange; graph-timed, launch
+included). Up to 40 rows the weight stream (6.95 TB/s alone) is the limit; above, the L2 -> LDS path carries the weights and the
+activation re-reads together (~12 TB/s), so the activation traffic adds to the weight time: the unsplit band kernel at 80 rows sits at
+the floor of its design (50.7-52.3 us), the split-K pairs cut the traffic of a workgroup from 3.9 MB to 2.5 MB at 192 rows. The split-K
+kernel is 10-16 us above its floor at 128-192 rows: the K loop 1-7 us (MFMA and LDS fragment reads next to the DMAs), the exchange and
+the output store 4-5 us, the 2-4 us the slowest workgroup finishes after the mean (`analysis/kernels/bf16_n20480_k7168.md`: timestamps,
+ablations, every attempt, the S = 4 and direct-load variants that lost).
 
 ## Tests
 - `python3 -m pytest tests/gemm/bf16_n20480_k7168 -q` (`test_push.py`: 8 GPUs, `gpurun ranks8`)
