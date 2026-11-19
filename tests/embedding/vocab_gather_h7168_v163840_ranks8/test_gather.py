@@ -40,6 +40,17 @@ def worker(rank,errors):
         inputs.copy_(new_ids);graph.replay();torch.cuda.synchronize()
         new_ref=vocab_gather_reference(shards,new_ids.cpu()).to(dev)
         assert torch.equal(out.view(torch.uint8),new_ref.view(torch.uint8)),('changed',rank,m)
+    for m in (12,80,128,192):
+        for name,ids in (('same token',torch.full((m,),5)),
+                         ('one owner',3*128+torch.randint(0,128,(m,))),
+                         ('balanced owners',(torch.arange(m)%8)*128+torch.randint(0,128,(m,))),
+                         ('descending',torch.arange(1023,1023-m,-1)%1024)):
+            inputs=ids.to(dev)
+            expected=vocab_gather_reference(shards,ids).to(dev)
+            graph=torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):out=c(inputs)
+            out.fill_(float('nan'));graph.replay();torch.cuda.synchronize()
+            assert torch.equal(out.view(torch.uint8),expected.view(torch.uint8)),(name,rank,m)
     MlirCompiler.compile=orig
     c.close()
 
