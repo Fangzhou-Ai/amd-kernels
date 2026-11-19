@@ -32,13 +32,13 @@ stream with no math (analysis report): 21.5 us at 12 rows, 21.2 at 6.
 
 | rows x tokens a request | stock us | this kernel us | speedup | floor us | % of floor |
 |---|---|---|---|---|---|
-| 12 x 6 (CI c4) | 45.4 | 30.5 | 1.49x | 17.5 | 57% |
-| 6 x 6 (graph pad) | 35.5 | 28.1 | 1.26x | 16.5 | 59% |
-| 4 x 4 | 33.0 | 26.3 | 1.26x | 16.2 | 62% |
-| 8 x 4 | 35.5 | 28.1 | 1.26x | 16.9 | 60% |
-| 8 x 8 | 37.1 | 30.0 | 1.24x | 16.8 | 56% |
-| 16 x 4 (4 requests: two task rounds) | 54.8 | 37.3 | 1.47x | 18.3 | 49% |
-| 16 x 8 | 49.7 | 33.7 | 1.48x | 18.1 | 54% |
+| 12 x 6 (CI c4) | 45.2 | 30.3 | 1.49x | 17.5 | 58% |
+| 6 x 6 (graph pad) | 35.6 | 27.7 | 1.29x | 16.5 | 60% |
+| 4 x 4 | 33.1 | 25.7 | 1.29x | 16.2 | 63% |
+| 8 x 4 | 35.5 | 27.5 | 1.29x | 16.9 | 61% |
+| 8 x 8 | 36.8 | 29.2 | 1.26x | 16.8 | 58% |
+| 16 x 4 (4 requests: two task rounds) | 54.9 | 36.8 | 1.49x | 18.3 | 50% |
+| 16 x 8 | 49.5 | 33.1 | 1.50x | 18.1 | 55% |
 
 The weight stream lands at ~6.3 TB/s (the measured ceiling); the kernel is that stream plus a ~15 us dependent tail (reduce / hand-offs / conv / gates / recurrence / norm).
 
