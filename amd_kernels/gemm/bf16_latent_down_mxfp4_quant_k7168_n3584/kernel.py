@@ -11,13 +11,20 @@ a slice). Weight loads are non-temporal: the weight streams through. Wave (pair,
 of every block for the weight groups 2 pair and 2 pair + 1, so an activation fragment read from LDS feeds two MFMAs;
 the halves add in a fixed order (half 0 + half 1) through LDS.
 
-Epilogue: wave half 0 stores the workgroup's fp32 accumulators (sc1, one contiguous 1 KB per fragment) to its slice of
-the tile's slab, the workgroup drains and takes a ticket from the tile's counter (one scalar atomic; the last of the KS
-takes the epilogue and returns the counter to 0). The last workgroup sums the KS slices in slice order (the same bits
-whichever slice arrives last), rounds to bf16 into an LDS tile, and every thread quantizes 32-column blocks: |max| by
-v_max3, the e8m0 exponent ceil(log2(amax / 6)) floored at 92, e2m1 by v_cvt_scalef32_pk_fp4_f32 (RNE, saturating), one
-16-byte code store and one scale byte; the bf16 tile is optionally stored too. Counters are tickets, never an output sum.
-Measured on one MI355X at M 192 the slab stores and loads cost ~8 us of the 28, the activation DMA ~7 (L2 bandwidth).
+Epilogue: wave half 0 stores the workgroup's fp32 accumulators (one contiguous 1 KB per fragment) to its slice of the
+tile's slab, the workgroup drains and increments the tile's counter (a scalar atomic that only ever counts up; the tile's
+KS = 4 workgroups meet at multiples of 4, so nothing is reset), then waits until all four have arrived. Workgroup kz
+reduces a quarter of the tile: the 32-column block kz // 2 of the fragments 2 i + kz % 2 (a workgroup with no fragment
+leaves at once): its four slices summed in slice order (the same bits whichever arrives last), rounded to bf16 into an LDS
+tile, then one thread per (row, block) quantizes: |max| by v_max3, the e8m0 exponent ceil(log2(amax / 6)) floored at 92,
+e2m1 by v_cvt_scalef32_pk_fp4_f32 (RNE, saturating), one 16-byte code store and one scale byte; the bf16 tile is
+optionally stored too. Counters are tickets, never an output sum. The wait needs the tile's four workgroups to be
+resident together: they are consecutive (or, with ``xcd``, one XCC's) workgroups of a grid that fits the GPU.
+
+``xcd`` placement: the dispatcher sends workgroup b to XCC b % 8, and each XCC has its own L2, so the slab exchange
+costs a write-through to memory (sc1) when the four slices of a tile sit on four XCCs. With ``xcd`` the tile's slices are
+workgroups x + 8 (4 j .. 4 j + 3), one XCC, and the slab stays in that L2 (sc0 loads and stores); the host checks the
+placement with a probe launch (``xcc_probe``) once per device and uses the other placement if it does not hold.
 
 Weight layouts: ROW (the checkpoint's [3584, 7168]) or SHUF ([224 groups, 112 K blocks, 16 rows, 64 K]: one DMA reads
 1 KB in one piece, a bit-exact permutation made once at load).
@@ -39,7 +46,9 @@ TILES = N // TN  # 56
 NB = K // 64  # 112 K blocks
 NWV = 4
 W_CM = 2  # nt
+SC0 = 0x1  # workgroup-coherent through the L2 the K slices of a tile share (placement tile_peers_share_l2)
 SC1 = 0x10  # agent-scope (cross-XCD) partial stores / loads
+XCDS = 8
 MT_MAX = 12
 RING_BYTES = 160 * 1024
 CNT_STRIDE = 128  # bytes: one counter per tile, each on its own line
@@ -100,9 +109,10 @@ def _f32(i):
 
 
 @launcher
-def compile_bf16_latent_down_mxfp4_quant_k7168_n3584(mt: int, ks: int, shuf: int, with_bf16: int):
-    MT, KS, SHUF, WB = mt, ks, shuf, with_bf16
-    assert 1 <= MT <= MT_MAX and KS >= 2 and NB % KS == 0
+def compile_bf16_latent_down_mxfp4_quant_k7168_n3584(mt: int, ks: int, shuf: int, with_bf16: int, xcd: int):
+    MT, KS, SHUF, WB, XCDL = mt, ks, shuf, with_bf16, xcd
+    SLAB = SC0 if XCDL else SC1
+    assert 1 <= MT <= MT_MAX and KS == 4 and NB % KS == 0
     NBK = NB // KS  # K blocks per workgroup
     MR = 16 * MT
     R = min(ring_depth(MT), NBK)
@@ -115,16 +125,13 @@ def compile_bf16_latent_down_mxfp4_quant_k7168_n3584(mt: int, ks: int, shuf: int
     TILE_BYTES = MR * TS
     assert LDS <= RING_BYTES and (R - 1) * PER <= 63 and TILE_BYTES <= LDS and 4 * MT * 1024 <= LDS, (LDS, R, PER)
     PBYTES = partial_bytes(MT, KS)
-    UNITS = MR * 2  # (row, 32-column block) quant units
-    UPT = (UNITS + 255) // 256
-
+    
     @fx.struct
     class Shared:
         buf: fx.Array[fx.Uint8, LDS, 16]
-        flag: fx.Array[fx.Int32, 4]
 
     name = f"bf16_latent_down_mxfp4_quant_k7168_n3584_mt{MT}_ks{KS}" + ("_shuf" if SHUF else "_row") \
-        + ("_bf16" if WB else "")
+        + ("_bf16" if WB else "") + ("_xcd" if XCDL else "")
 
     @flyc.kernel(name=name, known_block_size=[64 * NWV, 1, 1])
     def kernel(arg_x: fx.Int64, arg_w: fx.Int64, arg_q: fx.Int64, arg_s: fx.Int64, arg_o: fx.Int64,
@@ -133,8 +140,12 @@ def compile_bf16_latent_down_mxfp4_quant_k7168_n3584(mt: int, ks: int, shuf: int
         smem = fx.SharedAllocator().allocate(Shared).peek()
         lane = tx % 64
         wave = fx.Int32(fx.rocdl.readfirstlane(T.i32, tx // 64))
-        kz = bid % KS
-        tile = bid // KS
+        if const_expr(XCDL):
+            kz = (bid // XCDS) % KS
+            tile = (bid % XCDS) * (TILES // XCDS) + (bid // XCDS) // KS
+        else:
+            kz = bid % KS
+            tile = bid // KS
         n0 = tile * TN
         b0 = kz * NBK
         g = lane // 16
@@ -257,72 +268,77 @@ def compile_bf16_latent_down_mxfp4_quant_k7168_n3584(mt: int, ks: int, shuf: int
             for m in range_constexpr(MT):
                 buffer_ops.buffer_store(acc[ig][m].bitcast(fx.Int32), pr, slab_off(kz, m, pair * 2 + ig) * 4,
                                         offset_is_bytes=True, mask=(half == 0) & ((m * 16 + l16) < i32_m),
-                                        cache_modifier=SC1)
+                                        cache_modifier=SLAB)
         fx.rocdl.s_waitcnt(vmcnt=0)
         fx.gpu.barrier()
+        rh = kz % 2  # this workgroup reduces the fragments 2 i + rh of the 32-column block kz // 2
+        cb = kz // 2
+        NF = (fx.Int32(MT + 1) - rh) // 2
+        need = (NF > 0).select(fx.Int32(KS), fx.Int32(0))
         if tx == 0:
             cnt_addr = arg_c + fx.Int64(tile) * CNT_STRIDE
             old = _atomic_add(cnt_addr, 1)
-            last = old == KS - 1
-            smem.flag.ptr[0] = last.select(fx.Int32(1), fx.Int32(0))
-            if last:
-                _atomic_add(cnt_addr, -KS)
-        fx.rocdl.s_waitcnt(lgkmcnt=0)
+            ebase = old - (old & (KS - 1))
+            arrived = old + 1 - ebase
+            while arrived < need:
+                arrived = _atomic_add(cnt_addr, 0) - ebase
         fx.gpu.barrier()
-        take = fx.Int32(smem.flag.ptr[0]) == 1
 
         def epilogue():
             tile_base = lds_base
-            for m in range_constexpr(MT):
-                parts = [Vec(buffer_ops.buffer_load(pr, slab_off(k, m, wave), vec_width=4, dtype=fx.Int32,
-                                                    cache_modifier=SC1)).bitcast(fx.Float32)
+            grp = cb * 2 + wave % 2
+            for jj in range_constexpr((((MT + 1) // 2) + 1) // 2):
+                i = jj * 2 + wave // 2
+                m = i * 2 + rh
+                m = (m < MT).select(m, fx.Int32(MT - 1))
+                parts = [Vec(buffer_ops.buffer_load(pr, slab_off(k, m, grp), vec_width=4, dtype=fx.Int32,
+                                                    cache_modifier=SLAB)).bitcast(fx.Float32)
                          for k in range_constexpr(KS)]
                 v = parts[0]
                 for k in range_constexpr(1, KS):
                     v = v + parts[k]
                 pk = v.to(fx.BFloat16).bitcast(fx.Int32)
-                p = _lds_ptr(tile_base + (m * 16 + l16) * TS + (wave * 16 + g * 4) * 2)
+                p = _lds_ptr(tile_base + (m * 16 + l16) * TS + (grp * 16 + g * 4) * 2)
                 llvm.store(pk, p, alignment=8)
             fx.rocdl.s_waitcnt(lgkmcnt=0)
             fx.gpu.barrier()
             qr = buffer_ops.create_buffer_resource_from_addr(arg_q, num_records_bytes=i32_m * QCOLS)
             sr = buffer_ops.create_buffer_resource_from_addr(arg_s, num_records_bytes=i32_m * QGROUPS)
             orr = buffer_ops.create_buffer_resource_from_addr(arg_o, num_records_bytes=i32_m * (N * 2))
-            for i in range_constexpr(UPT):
-                u = tx + i * 256
-                r = u // 2
-                j = u % 2
-                live = (u < UNITS) & (r < i32_m)
-                src = tile_base + (u < UNITS).select(r, fx.Int32(0)) * TS + j * 64
-                words = [Vec(llvm.load(T.vec(4, T.i32), _lds_ptr(src + 16 * q), alignment=16))
-                         for q in range_constexpr(4)]
-                vals = []
+            i = tx // 16
+            m = i * 2 + rh
+            r = m * 16 + tx % 16
+            live = (tx < NF * 16) & (r < i32_m)
+            src = tile_base + live.select(r, fx.Int32(0)) * TS + cb * 64
+            words = [Vec(llvm.load(T.vec(4, T.i32), _lds_ptr(src + 16 * q), alignment=16))
+                     for q in range_constexpr(4)]
+            vals = []
+            for q in range_constexpr(4):
+                for k in range_constexpr(4):
+                    w = fx.Int32(words[q][k])
+                    vals.append(_f32(w << 16))
+                    vals.append(_f32(w & fx.Int32(-65536)))
+            amax = _fmax3_abs(vals[0], vals[1], vals[2])
+            for q in range_constexpr(3, 31, 2):
+                amax = _fmax3_abs(vals[q], vals[q + 1], amax)
+            amax = _fmax3_abs(vals[31], vals[31], amax)
+            t = (((amax * fx.Float32(1.0 / 6.0)).bitcast(fx.Int32)) + fx.Int32(0x7FFFFF)) >> 23
+            e8 = (t > SCALE_FLOOR).select(t, fx.Int32(SCALE_FLOOR))
+            scale_f = _f32(e8 << 23)
+            outw = []
+            for d in range_constexpr(4):
+                pw = fx.Int32(0)
+                for k in range_constexpr(4):
+                    pw = _cvt_pk_fp4(pw, vals[8 * d + 2 * k], vals[8 * d + 2 * k + 1], scale_f, k)
+                outw.append(pw)
+            buffer_ops.buffer_store(Vec.from_elements(outw, fx.Int32), qr, r * (QCOLS // 4) + tile * 8 + cb * 4,
+                                    mask=live)
+            buffer_ops.buffer_store(e8.to(fx.Int8), sr, r * QGROUPS + tile * 2 + cb, mask=live)
+            if const_expr(WB):
                 for q in range_constexpr(4):
-                    for k in range_constexpr(4):
-                        w = fx.Int32(words[q][k])
-                        vals.append(_f32(w << 16))
-                        vals.append(_f32(w & fx.Int32(-65536)))
-                amax = _fmax3_abs(vals[0], vals[1], vals[2])
-                for q in range_constexpr(3, 31, 2):
-                    amax = _fmax3_abs(vals[q], vals[q + 1], amax)
-                amax = _fmax3_abs(vals[31], vals[31], amax)
-                t = (((amax * fx.Float32(1.0 / 6.0)).bitcast(fx.Int32)) + fx.Int32(0x7FFFFF)) >> 23
-                e8 = (t > SCALE_FLOOR).select(t, fx.Int32(SCALE_FLOOR))
-                scale_f = _f32(e8 << 23)
-                outw = []
-                for d in range_constexpr(4):
-                    pw = fx.Int32(0)
-                    for k in range_constexpr(4):
-                        pw = _cvt_pk_fp4(pw, vals[8 * d + 2 * k], vals[8 * d + 2 * k + 1], scale_f, k)
-                    outw.append(pw)
-                buffer_ops.buffer_store(Vec.from_elements(outw, fx.Int32), qr,
-                                        r * (QCOLS // 4) + tile * 8 + j * 4, mask=live)
-                buffer_ops.buffer_store(e8.to(fx.Int8), sr, r * QGROUPS + tile * 2 + j, mask=live)
-                if const_expr(WB):
-                    for q in range_constexpr(4):
-                        buffer_ops.buffer_store(words[q], orr, r * (N // 2) + (n0 + j * 32) // 2 + q * 4, mask=live)
+                    buffer_ops.buffer_store(words[q], orr, r * (N // 2) + (n0 + cb * 32) // 2 + q * 4, mask=live)
 
-        if take:
+        if NF > 0:
             epilogue()
 
     @flyc.jit
@@ -332,3 +348,28 @@ def compile_bf16_latent_down_mxfp4_quant_k7168_n3584(mt: int, ks: int, shuf: int
             grid=(TILES * KS, 1, 1), block=(64 * NWV, 1, 1), stream=stream)
 
     return launch
+
+
+def _xcc_id():
+    return fx.Int32(llvm.inline_asm(T.i32, [], "s_getreg_b32 $0, hwreg(HW_REG_XCC_ID, 0, 4)\n\ts_waitcnt lgkmcnt(0)", "=s",
+                                    has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT))
+
+
+@flyc.kernel(name="xcc_probe", known_block_size=[64, 1, 1])
+def _xcc_probe(arg_o: fx.Int64):
+    bid = fx.block_idx.x
+    out = buffer_ops.create_buffer_resource_from_addr(arg_o, num_records_bytes=TILES * 4 * 4)
+    if fx.thread_idx.x == 0:
+        buffer_ops.buffer_store(_xcc_id(), out, bid)
+
+
+@flyc.jit
+def xcc_probe(arg_o: fx.Int64, stream: fx.Stream):
+    _xcc_probe(arg_o).launch(grid=(TILES * 4, 1, 1), block=(64, 1, 1), stream=stream)
+
+
+def tile_peers_share_l2(xcc_ids) -> bool:
+    """Whether the workgroups of each tile (placement ``XCDL``: bids x + 8 (4 j .. 4 j + 3)) ran on one XCC."""
+    n = TILES * 4
+    return all(len({xcc_ids[x + XCDS * (4 * j + q)] for q in range(4)}) == 1
+               for x in range(XCDS) for j in range(n // XCDS // 4))

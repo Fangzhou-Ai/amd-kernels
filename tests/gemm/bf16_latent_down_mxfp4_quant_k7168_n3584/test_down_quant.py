@@ -11,7 +11,6 @@ from amd_kernels.gemm.bf16_latent_down_mxfp4_quant_k7168_n3584.reference import 
                                                                                   quant_reference)
 
 MS = [1, 2, 5, 12, 15, 16, 17, 24, 33, 40, 48, 65, 80, 96, 112, 127, 128, 129, 160, 176, 191, 192, 193, 300]
-KS = [2, 4, 7, 8, 14, 16]
 
 
 @pytest.fixture(scope="module")
@@ -50,13 +49,19 @@ def test_reference(weights, shuffled, m):
     assert torch.equal(u8(q), u8(q2)) and torch.equal(u8(s), u8(s2))
 
 
-@pytest.mark.parametrize("ks", KS)
 @pytest.mark.parametrize("m", [3, 40, 192])
-def test_every_k_split(weights, monkeypatch, ks, m):
-    monkeypatch.setitem(host.KS_BY_MT, host.m_tile_fragments(m), ks)
-    host._WORK.clear()
+def test_placements_agree(weights, monkeypatch, m):
     x = torch.randn(m, K, device="cuda").to(torch.bfloat16)
-    check(x, weights[True], True, weights[False])
+    outs = []
+    for local in (False, True):
+        monkeypatch.setitem(host._XCD_LOCAL, torch.cuda.current_device(), local)
+        host._WORK.clear()
+        outs.append(bf16_latent_down_mxfp4_quant_k7168_n3584(x, weights[True], shuffled=True))
+    assert torch.equal(u8(outs[0][0]), u8(outs[1][0])) and torch.equal(u8(outs[0][1]), u8(outs[1][1]))
+
+
+def test_probe_finds_one_xcc_per_tile():
+    assert host._xcd_local(torch.device("cuda", torch.cuda.current_device()))
 
 
 def test_layouts_agree(weights):

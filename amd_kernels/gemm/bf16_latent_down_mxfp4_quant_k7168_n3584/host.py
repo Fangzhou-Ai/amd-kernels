@@ -7,8 +7,8 @@ import torch
 
 from amd_kernels.warm_up import entry
 
-from .kernel import (CNT_STRIDE, MT_MAX, NB, TILES, compile_bf16_latent_down_mxfp4_quant_k7168_n3584,
-                     partial_bytes)
+from .kernel import (CNT_STRIDE, MT_MAX, NB, TILES, compile_bf16_latent_down_mxfp4_quant_k7168_n3584, partial_bytes,
+                     tile_peers_share_l2, xcc_probe)
 from .reference import K, N
 
 MAX_M = 16 * MT_MAX
@@ -44,8 +44,24 @@ def m_tile_fragments(m: int) -> int:
 
 
 @functools.cache
-def _kernel(mt: int, ks: int, shuf: bool, with_bf16: bool):
-    return compile_bf16_latent_down_mxfp4_quant_k7168_n3584(mt, ks, int(shuf), int(with_bf16))
+def _kernel(mt: int, ks: int, shuf: bool, with_bf16: bool, xcd: bool):
+    return compile_bf16_latent_down_mxfp4_quant_k7168_n3584(mt, ks, int(shuf), int(with_bf16), int(xcd))
+
+
+_XCD_LOCAL: dict = {}
+
+
+def _xcd_local(device: torch.device) -> bool:
+    """Whether the K slices of a tile may exchange partials through one L2: the workgroups placed on one XCC share an
+    L2, so a probe launch (once per device) checks the dispatcher's placement. Under graph capture: no (not cached)."""
+    key = device.index
+    if key not in _XCD_LOCAL:
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        ids = torch.full((TILES * 4,), -1, dtype=torch.int32, device=device)
+        xcc_probe(ids.data_ptr(), torch.cuda.current_stream())
+        _XCD_LOCAL[key] = tile_peers_share_l2(ids.cpu().tolist())
+    return _XCD_LOCAL[key]
 
 
 def _run(exe, *args):
@@ -102,7 +118,7 @@ def _down_quant(x: torch.Tensor, w: torch.Tensor, out: tuple | None = None, *, s
         mt = m_tile_fragments(m)
         stream = torch.cuda.current_stream()
         part, cnt = _workspace(x.device, stream.cuda_stream)
-        exe = _kernel(mt, KS_BY_MT[mt], bool(shuffled), out_bf16 is not None)
+        exe = _kernel(mt, KS_BY_MT[mt], bool(shuffled), out_bf16 is not None, _xcd_local(x.device))
         o = out_bf16 if out_bf16 is not None else codes
         _run(exe, x.data_ptr(), w.data_ptr(), codes.data_ptr(), scales.data_ptr(), o.data_ptr(), part.data_ptr(),
              cnt.data_ptr(), m, stream)
@@ -111,7 +127,7 @@ def _down_quant(x: torch.Tensor, w: torch.Tensor, out: tuple | None = None, *, s
 
 def _mode(x, w, out=None, *, shuffled=False, out_bf16=None):
     """What a call fixes about its kernels besides M (``amd_kernels.warm_up``): the weight layout, the bf16 output."""
-    return bool(shuffled), out_bf16 is not None
+    return bool(shuffled), out_bf16 is not None, _xcd_local(x.device)
 
 
 def _inputs(mode, n, x, w, out=None, *, shuffled=False, out_bf16=None):

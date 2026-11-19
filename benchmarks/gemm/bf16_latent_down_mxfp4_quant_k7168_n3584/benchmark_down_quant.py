@@ -2,11 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """Graph replay of bf16_latent_down_mxfp4_quant_k7168_n3584 against vLLM's rocm_unquantized_gemm_impl (VLLM_ROCM_USE_AITER=1)
 followed by aiter's per_1x32_mx_quant_hip: one graph of 12 calls over 12 weight copies (12 x 51 MB > the 256 MB MALL: HBM on every
-call, as in serving) and 12 activation sets, 10 replays x 5 rounds, median us, with the roofline of the weight stream.
+call, as in serving) and 12 activation sets, 10 replays x 15 rounds, min us, with the roofline of the weight stream.
 Run: python3 benchmarks/gemm/bf16_latent_down_mxfp4_quant_k7168_n3584/benchmark_down_quant.py [M ...]
 """
 import os
-import statistics
 import sys
 
 os.environ.setdefault("VLLM_ROCM_USE_AITER", "1")  # vLLM's tuned aiter hgemm path, as served
@@ -34,7 +33,7 @@ def timing(calls):
     graph.replay()
     torch.cuda.synchronize()
     times = []
-    for _ in range(5):
+    for _ in range(15):
         a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         a.record()
         for _ in range(10):
@@ -42,7 +41,7 @@ def timing(calls):
         b.record()
         b.synchronize()
         times.append(a.elapsed_time(b) * 1000 / (10 * len(calls)))
-    return statistics.median(times)
+    return min(times)
 
 
 if __name__ == "__main__":
