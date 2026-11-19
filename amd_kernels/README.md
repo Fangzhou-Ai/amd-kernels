@@ -38,6 +38,8 @@ One line per kernel package. Each package's README has what it does, its entry p
   sliding-window decode attention over an fp8 KV cache.
 - [`attention/norm_rope_fp8_insert_d128_rot64`](attention/norm_rope_fp8_insert_d128_rot64/README.md): the draft's
   norm + RoPE + fp8 KV insert.
+- [`attention/dcp8_lse_combine_vup_mla_h12_kv512`](attention/dcp8_lse_combine_vup_mla_h12_kv512/README.md): the DCP8
+  MLA decode combine: W_UV up-projection, owner-rank push and LSE-weighted combine in one launch.
 
 ## Indexer
 
