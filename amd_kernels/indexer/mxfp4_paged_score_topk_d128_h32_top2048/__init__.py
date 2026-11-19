@@ -6,7 +6,7 @@
 (scores and per-chunk top lists, the logits never reach memory); ``merge.py`` the row merge.
 """
 
-from .host import cache_views, mxfp4_paged_score_topk
+from .host import cache_views, mxfp4_paged_score_topk, prefer_fused
 from .reference import TOPK
 
-__all__ = ["TOPK", "cache_views", "mxfp4_paged_score_topk"]
+__all__ = ["TOPK", "cache_views", "mxfp4_paged_score_topk", "prefer_fused"]

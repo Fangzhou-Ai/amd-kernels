@@ -126,6 +126,13 @@ def _score_topk(
                   dbg.data_ptr() + 4 * 4096 * 16 if dbg is not None else 0, rows, stream)
 
 
+def prefer_fused(batch: int, width: int) -> bool:
+    """Where the fused call beats the unfused scorer + top-k pair in graph replay (measured, cold pages): at most 8
+    sequences (up to 6 rows each) of 16384+ keys a rank. Beyond that the chunk kernel's select work, not the bytes,
+    sets the time and the pair is as fast or faster."""
+    return batch <= 8 and width >= 16384
+
+
 def _mode(*args, **kwargs):
     return ()
 
