@@ -26,8 +26,6 @@ from .geometry import CHUNK_MAX, COUNTER_BYTES, FULL_STRIDE, INFO_OFFSET, NCH_MA
 from .scoring import SPEC_SIZES, TAG, Scorer, score_chunk
 
 NW = 8
-HPAD = 1280  # 1024 bins in 16-bin groups of 20 words: the scan reads a lane's group conflict-free
-HIST = HPAD + 64  # + one dummy word a lane, for keys outside the round's prefix
 NUM_REC = 0x7FFFF000
 import os
 SKIP = int(os.environ.get('KK_SKIP', '0'))
@@ -39,6 +37,15 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
     a chunk)."""
     assert 1 <= rows <= QMAX
     split = 2 if rows in (3, 4) else 1  # waves a row's chunk is selected by (virtual chunks of ``cb / split`` keys)
+    # the list histograms of a wave: 2048 bins in 32-bin groups (rounds of 11, 11, 10 bits) while rows are few, else
+    # 1024 bins in 16-bin groups (10, 10, 10, 2 bits) to keep the workgroup's LDS under half a CU's
+    FINE = rows <= 2
+    WB = (11, 11, 10) if FINE else (10, 10, 10, 2)
+    G = 32 if FINE else 16  # bins of a group
+    GW = G + 4  # words of a group: the scan reads a lane's group conflict-free
+    GL = 5 if FINE else 4
+    HPAD = 64 * GW
+    HIST = HPAD + 64  # + one dummy word a lane, for keys outside the round's prefix
     OFFS, WORDS = layout(keys=rows * CHUNK_MAX, hist=rows * split * HIST, st=128 if timing else 0)
     CM = (SC1 if os.environ.get('KK_CM', '1') == '1' else 0) if sync else 0  # stores a merge workgroup of another XCD reads: write-through
 
@@ -96,7 +103,7 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
         hh = I(1)  # lists are of chunks of cbv keys: cb, or half of it while that leaves at most NCH_MAX of them
         if fx.const_expr(split == 2):
             half = cb // 2
-            hh = (fx.max((max_end + half - 1) // half, I(1)) <= NCH_MAX).select(I(2), I(1))
+            hh = ((fx.max((max_end + half - 1) // half, I(1)) <= NCH_MAX) & (cb >= 1536)).select(I(2), I(1))  # long chunks only
         cbv = cb // hh
         nvch = fx.max((max_end + cbv - 1) // cbv, I(1))
         tbv = list_size_rt(nvch, cbv)
@@ -123,11 +130,11 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
             fx.memory_fence(ordering=fx.AtomicOrdering.AcqRel, syncscope=FENCE_SCOPE)
 
         def hist_scan(wb, need):
-            """The bin holding the ``need``-th largest key of the histogram at ``wb`` (a lane's 16 bins: 4 vector reads,
-            then one 16-bin group re-read across lanes) and the number of keys in bins above it."""
-            base = wb + (63 - lane) * 20
+            """The bin holding the ``need``-th largest key of the histogram at ``wb`` (a lane's group of bins: vector
+            reads, then one group re-read across lanes) and the number of keys in bins above it."""
+            base = wb + (63 - lane) * GW
             ssum = None
-            for m in range_constexpr(4):
+            for m in range_constexpr(G // 4):
                 v4 = lds_load4(smem.hist, base + 4 * m)
                 part = (I(v4[0]) + I(v4[1])) + (I(v4[2]) + I(v4[3]))
                 ssum = part if ssum is None else ssum + part
@@ -135,10 +142,10 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
             lstar = I(fx.math.cttz(ballot(incl >= need)).to(I))
             above_g = readlane(incl - ssum, lstar)
             gsel = 63 - lstar
-            h = (lane < 16).select(I(smem.hist.ptr[wb + gsel * 20 + (15 - (lane & 15))]), I(0))
+            h = (lane < G).select(I(smem.hist.ptr[wb + gsel * GW + (G - 1 - (lane & (G - 1)))]), I(0))
             incl2 = inclusive_scan(h)
-            jstar = I(fx.math.cttz(ballot((incl2 >= need - above_g) & (lane < 16))).to(I))
-            return gsel * 16 + 15 - jstar, above_g + (readlane(incl2, jstar) - readlane(h, jstar))
+            jstar = I(fx.math.cttz(ballot((incl2 >= need - above_g) & (lane < G))).to(I))
+            return gsel * G + (G - 1) - jstar, above_g + (readlane(incl2, jstar) - readlane(h, jstar))
 
         def zero_hist(wb):
             z = fx.Vector.from_elements([I(0)] * 4, dtype=I)
@@ -147,22 +154,15 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
             fence()
 
         def hist_add(wb, key, rnd, pref, sh):
-            """Round ``rnd`` (10, 10, 10 and 2 bits of the left-aligned key): the key counts in the bin of its next bits
+            """Round ``rnd`` (``WB`` bits of the left-aligned key a round): the key counts in the bin of its next bits
             when its earlier bits are the prefix ``pref`` so far."""
             u = (key ^ I(INT_MIN)) << sh
             ok = key != I(INT_MIN)
-            if fx.const_expr(rnd == 0):
-                bn = (u >> 22) & 0x3FF
-            elif fx.const_expr(rnd == 1):
-                bn = (u >> 12) & 0x3FF
-                ok = ok & (((u >> 22) & 0x3FF) == pref)
-            elif fx.const_expr(rnd == 2):
-                bn = (u >> 2) & 0x3FF
-                ok = ok & (((u >> 12) & 0xFFFFF) == pref)
-            else:
-                bn = u & 3
-                ok = ok & (((u >> 2) & 0x3FFFFFFF) == pref)
-            idx = ok.select(bn + ((bn >> 4) << 2), I(HPAD) + lane)
+            done = sum(WB[:rnd])  # bits of the prefix
+            bn = (u >> (32 - done - WB[rnd])) & ((1 << WB[rnd]) - 1)
+            if fx.const_expr(rnd > 0):
+                ok = ok & (((u >> (32 - done)) & ((1 << done) - 1)) == pref)
+            idx = ok.select(bn + ((bn >> GL) << 2), I(HPAD) + lane)
             fx.atomic_add(fx.add_offset(smem.hist.ptr, wb + idx), I(1), syncscope="workgroup")
 
         def threshold(wb, region, nblk, need0, cap, kmax_l, kmin_l):
@@ -183,7 +183,7 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
 
             need, pref, fl = need0, I(0), I(0)
             kt, ties, tk, listed = I(INT_MIN), I(0), I(INT_MIN), I(0)
-            for rnd in range_constexpr(4):
+            for rnd in range_constexpr(len(WB)):
                 if fl == 0:
                     zero_hist(wb)
                     for jj in range(0, nblk, 1):
@@ -192,10 +192,10 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
                             hist_add(wb, I(v4[k]), rnd, pref, sh)
                     fence()
                     d, above = hist_scan(wb, need)
-                    count_d = I(smem.hist.ptr[wb + d + ((d >> 4) << 2)])
-                    newpref = d if rnd == 0 else (pref << (2 if rnd == 3 else 10)) | d
-                    if fx.const_expr(rnd < 3):
-                        bits = 10 * (rnd + 1)
+                    count_d = I(smem.hist.ptr[wb + d + ((d >> GL) << 2)])
+                    newpref = d if rnd == 0 else (pref << WB[rnd]) | d
+                    if fx.const_expr(rnd < len(WB) - 1):
+                        bits = sum(WB[: rnd + 1])
                         low_key = key_of(newpref << (32 - bits))
                         listed_here = need0 - need + above + count_d
                         fin = listed_here <= cap
