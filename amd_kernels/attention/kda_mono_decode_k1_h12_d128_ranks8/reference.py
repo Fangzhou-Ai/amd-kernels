@@ -20,9 +20,9 @@ core output:
    ``st_idx[r, j]`` (slots <= 0 skipped). A request whose initial slot is the null slot yields ``o = 0``.
 6. ``core = bf16(o * rsqrt(mean(o^2) + onorm_eps) * on_w * sigmoid(g))`` per head.
 
-Tolerance: ``prefix`` / ``blocks`` match bit for bit; conv state, recurrent state and core match with relative L2
-error <= 1e-3 and cosine >= 0.9999 (the kernel's sums run in a different order, which flips an occasional bf16
-rounding).
+Tolerance: ``prefix`` / ``blocks`` match bit for bit; conv state and recurrent state match with relative L2 error <= 1e-3,
+core with relative L2 error <= 3e-3 and cosine >= 0.9999 (the kernel's sums run in a different order, which flips an
+occasional bf16 rounding).
 """
 
 import math

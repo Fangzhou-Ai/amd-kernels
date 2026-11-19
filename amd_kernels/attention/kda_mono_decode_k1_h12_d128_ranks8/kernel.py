@@ -66,12 +66,13 @@ from amd_kernels.common.mono.ops import (
     wave_max,
     wave_sum,
 )
+from amd_kernels.common.mono.abi import FAILED  # noqa: F401
 from amd_kernels.common.mono.plan import (
     BLOCKS,
+    HEALTH_WORDS,  # noqa: F401
     THREADS,
     WAVES,
     KernelAbi,
-    first_task,
     key_tuple,
     pair_layout,
     source_digest,
@@ -95,6 +96,7 @@ ROWS = 16
 KCH = 128  # K a chunk: 4 MFMAs of 32
 NKCH = HIDDEN // KCH  # 56
 PER_WAVE = NKCH // WAVES  # 7
+STAGER = WAVES - 1  # the wave that stages x
 VCH = 16  # state rows a KDA task
 NVCH = HD // VCH  # 8
 CONV_W = 4
@@ -128,10 +130,6 @@ class KdaPreBuild:
     lower_bound: float = -5.0
     timeline: bool = False
     write_idx: int = -1  # a block-write layer's block: the updated prefix stored there
-    # Per-token recurrent-state snapshots (S*NH*64 KB a layer) stored
-    # non-temporal + device scope: they stream out instead of sitting dirty in
-    # L2 and draining at kernel end (~1.3 us a launch). Bit-exact.
-    stream_states: bool = False
 
 
 ABI = KernelAbi(
@@ -387,8 +385,8 @@ def proj_row(lr):
 def gemv_loads(c, lr0, nrows, chunks):
     """This wave's weight operands of logical rows ``lr0`` .. + ``nrows`` for its
     K chunks ``chunks`` (indices into wave, wave + 8, ..): a lane 64 contiguous
-    bytes of its row a chunk (4 dwordx4). A row past ``nrows`` or the last
-    loads nothing (an out-of-range buffer offset)."""
+    bytes of its row a chunk (4 dwordx4), a flat list [4 chunk + q]. A row past
+    ``nrows`` or the last loads nothing (an out-of-range buffer offset)."""
     lane, wave = c["lane"], c["wave"]
     r_w = rsrc(c["args"]["w_in"], NPROJ * HIDDEN * 2)
     lr = lr0 + lane % ROWS
@@ -399,53 +397,42 @@ def gemv_loads(c, lr0, nrows, chunks):
     for i in chunks:
         k = (wave + WAVES * i) * KCH + g * 8
         base = (row * HIDDEN + k) // 2  # dwords
-        out.append(
-            [
-                fx.Vector(
-                    bo.buffer_load(
-                        r_w,
-                        base + 16 * q,
-                        vec_width=4,
-                        dtype=T.i32,
-                        cache_modifier=0,
-                    )
+        out += [
+            fx.Vector(
+                bo.buffer_load(
+                    r_w, base + 16 * q, vec_width=4, dtype=T.i32, cache_modifier=0
                 )
-                for q in range(4)
-            ]
-        )
+            )
+            for q in range(4)
+        ]
     return out
 
 
 @traced
-def wait_x(c):
-    """Every token's x row ready."""
-    if c["tid"] < c["S"]:
-        c["poll"]([(c["xrdy"], c["tid"], 1)])
-    gpu.barrier()
-
-
-@traced
-def load_x(c):
-    """The bf16 x rows into LDS in block order (``xblock``): a 1 KB DMA a (row,
-    piece of 16 blocks of 32 columns), every wave's in flight together. The
-    last blocks past ``c["XB"]`` stay out (``x_direct``)."""
-    lane, wave = c["lane"], c["wave"]
+def stage_x(c):
+    """The stager wave's part (the others hold weights in flight, and a poll or
+    DMA queued behind them would land with them): every token's x row ready (one
+    lane a row polls its XRDY flag), then all of x into LDS in block order
+    (``xblock_col``): 1 KB DMAs of 16 blocks of 32 columns a (row, piece),
+    the blocks past ``c["XB"]`` stay out (``x_direct``)."""
+    lane = c["lane"]
     nb = c["XB"]
+    if lane < c["S"]:
+        c["poll"]([(c["xrdy"], lane, 1)])
+    l4 = lane // 4
+    col0 = (l4 % 8) * KCH + (l4 // 8) * 32 + (lane % 4) * 8
     pieces = (nb + 15) // 16
-    total = c["S"] * pieces
-    for i in range_constexpr((total + WAVES - 1) // WAVES):
-        idx = wave + WAVES * i
-        t = idx // pieces
-        p = idx % pieces
-        blk = p * 16 + lane // 4
-        col = xblock_col(blk) + (lane % 4) * 8
-        src = c["xbuf"] + fx.Int64((t * HIDDEN + col) * 2)
-        dst = c["xl_b"] + t * c["XROW"] + p * 1024
-        if const_expr(total % WAVES == 0 and nb % 16 == 0):
-            lds_dma(src, dst, "sc1")
-        else:
-            if (idx < total) & (blk < nb):
+    for t in range_constexpr(c["S"]):
+        for p in range_constexpr(pieces):
+            col = col0 + (p // 2) * (WAVES * KCH) + (p % 2) * 64
+            src = c["xbuf"] + fx.Int64((t * HIDDEN + col) * 2)
+            dst = c["xl_b"] + t * c["XROW"] + p * 1024
+            if const_expr(nb % 16 == 0):
                 lds_dma(src, dst, "sc1")
+            else:
+                if p * 16 + l4 < nb:
+                    lds_dma(src, dst, "sc1")
+    vm_wait(0)
 
 
 def xblock_col(blk):
@@ -455,6 +442,23 @@ def xblock_col(blk):
     q = (blk // 8) % 4
     w = blk % 8
     return (w + WAVES * i) * KCH + 32 * q
+
+
+@traced
+def gemv_weights(c, lr_a, n_a, lr_b, n_b):
+    """Every wave's weights in flight at once, except the stager wave's (wave
+    ``STAGER``): it polls and stages x first (``stage_x``), then loads its own,
+    which lands while the others' MFMAs wait for the barrier."""
+    wave = uniform(c["wave"])
+    me = wave == STAGER
+    ops_a = gemv_loads(c, lr_a, me.select(fx.Int32(0), n_a), range(PER_WAVE))
+    ops_b = gemv_loads(c, lr_b, me.select(fx.Int32(0), n_b), range(PER_WAVE))
+    if me:
+        stage_x(c)
+        ops_a = gemv_loads(c, lr_a, n_a, range(PER_WAVE))
+        ops_b = gemv_loads(c, lr_b, n_b, range(PER_WAVE))
+    gpu.barrier()
+    return ops_a, ops_b
 
 
 def x_direct(c):
@@ -511,8 +515,8 @@ def gemv_mfma(c, ops_a, ops_b, xd):
                         fx.Int32,
                     )
             xb = xb.bitcast(fx.BFloat16)
-            acc_a = mfma_bf16(ops_a[i][q].bitcast(fx.BFloat16), xb, acc_a)
-            acc_b = mfma_bf16(ops_b[i][q].bitcast(fx.BFloat16), xb, acc_b)
+            acc_a = mfma_bf16(ops_a[4 * i + q].bitcast(fx.BFloat16), xb, acc_a)
+            acc_b = mfma_bf16(ops_b[4 * i + q].bitcast(fx.BFloat16), xb, acc_b)
     return acc_a, acc_b
 
 
@@ -541,14 +545,17 @@ def gemv_put(c, accs, lr_a, n_a, lr_b, n_b):
 NCONV = 2 * HD + VCH  # conv channels a task computes: its head's q and k, its v chunk
 
 
-def kda_meta(c):
-    """This CTA's task (the CTAs past the token CTAs take one each, in order) and
-    its request's metadata: scalar loads, issued first (``kda_stage`` uses them)."""
+def kda_meta(c, r):
+    """This CTA's round-``r`` task and its request's metadata (scalar loads). A
+    head's NVCH chunk tasks run in one round on consecutive CTAs: they read each
+    other's conv-state channels (``kda_inputs``)."""
     s, L, a = c["S"], c["L"], c["args"]
     ntasks = (s // L) * NH * NVCH
-    task = first_task(c["bid"], s)
-    valid = task < ntasks
-    t = fx.min(task, ntasks - 1)
+    gi = c["bid"] - s
+    per_round = (BLOCKS - s) // NVCH
+    task = (gi // NVCH + r * per_round) * NVCH + gi % NVCH
+    valid = (gi >= 0) & (gi < per_round * NVCH) & (task < ntasks)
+    t = fx.max(fx.min(task, ntasks - 1), 0)
     m = {"valid": valid, "req": t // (NH * NVCH), "h": (t // NVCH) % NH, "ch": t % NVCH}
     req = m["req"]
     m["acc_idx"] = sld_i32(a["num_acc"], req) - 1
@@ -646,15 +653,9 @@ def kda_inputs(c, k, req, h):
             fx.ptr_store(f32_of(got[L + i][0]), c["fa"] + fa_at[i])
     if tid < L:
         fx.ptr_store(sigmoid(f32_of(got[L + nfa][0])), c["beta"] + tid)
+    xv = [f32_of(got[j][0]) for j in range(L)]
+    k["xv"] = xv
     if tid < NCONV:
-        xv = [f32_of(got[j][0]) for j in range(L)]
-        rs = rsrc(k["cs"])
-        if k["own"] & (k["slot_c"] > 0):
-            for j in range_constexpr(sl):
-                nv = k["old"][j] if j < sl - L else xv[j - (sl - L)]
-                bo.buffer_store(
-                    fx.Float32(nv).to(fx.BFloat16), rs, k["co"] + j * a["cs_tok"]
-                )
         seq = k["win"] + xv
         for j in range_constexpr(L):
             acc = fx.Float32(0.0)
@@ -754,7 +755,7 @@ def kda_recur(c, k, req, h, ch):
 
 
 @traced
-def kda_norm(c, req, h, ch):
+def kda_norm(c, k, req, h, ch):
     """Rows 16 ch ..: gated RMSNorm over the head's 128 (every chunk's partial)
     -> core_out."""
     L, tid = c["L"], c["tid"]
@@ -780,6 +781,17 @@ def kda_norm(c, req, h, ch):
             y.to(fx.BFloat16), rsrc(a["core_out"]), (req * L + j) * PROJ + h * HD + vr
         )
     gpu.barrier()
+    # the head's other chunks read this chunk's q / k channels' window too: the
+    # new conv state goes out once every chunk has passed ``kda_inputs``
+    # (their ONRM pairs are here)
+    sl = c["SL"]
+    if (tid < NCONV) & k["own"] & (k["slot_c"] > 0):
+        rs = rsrc(k["cs"])
+        for j in range_constexpr(sl):
+            nv = k["old"][j] if j < sl - L else k["xv"][j - (sl - L)]
+            bo.buffer_store(
+                fx.Float32(nv).to(fx.BFloat16), rs, k["co"] + j * a["cs_tok"]
+            )
 
 
 # ---------------------------------------------------------------- kernel
@@ -827,7 +839,7 @@ def build(key: KdaPreBuild):
     keyed = key_tuple(key, _SOURCES)
     name = (
         f"k3_mono_kda_pre_s{s}_l{L}_nb{key.nblocks}_d{int(key.delta)}"
-        f"_t{int(key.timeline)}" + ("_ns" if key.stream_states else "")
+        f"_t{int(key.timeline)}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -887,7 +899,7 @@ def build(key: KdaPreBuild):
             "onorm_eps": key.onorm_eps,
             "lb": key.lower_bound,
             "write_idx": key.write_idx,
-            "st_cm": (CM_NT | CM_DEV) if key.stream_states else 0,
+            "st_cm": CM_NT | CM_DEV,
             "XB": xb_lds,
             "XROW": xrow,
             "put": mb.put,
@@ -935,7 +947,7 @@ def build(key: KdaPreBuild):
         on, tls = key.timeline, lds.tls.ptr
         c["on"], c["tls"] = on, tls
         stamp_begin(on, tls, tid, TL_POINTS)
-        c["tk"] = kda_meta(c)
+        c["tk"] = kda_meta(c, 0)
         if bid < s:
             stage_attn(c, bid)
         gi = bid - s
@@ -946,30 +958,31 @@ def build(key: KdaPreBuild):
         n_a = isg.select(fx.Int32(ROWS), fx.Int32(0))
         lr_b = ROWS * ng + rows_b * gi
         n_b = isg.select(fx.max(fx.min(fx.Int32(rows_b), NPROJ - lr_b), 0), fx.Int32(0))
-        ops_a = gemv_loads(c, lr_a, n_a, range(PER_WAVE))
-        ops_b = gemv_loads(c, lr_b, n_b, range(PER_WAVE))
-        wait_x(c)
-        stamp(on, tls, tid, 4)
-        load_x(c)
+        ops_a, ops_b = gemv_weights(c, lr_a, n_a, lr_b, n_b)
         xd = x_direct(c)
-        vm_wait(0)
-        gpu.barrier()
         stamp(on, tls, tid, 5)
         accs = gemv_mfma(c, ops_a, ops_b, xd)
+        stamp(on, tls, tid, 19)
         k = kda_stage(c)
+        stamp(on, tls, tid, 20)
         gemv_put(c, accs, lr_a, n_a, lr_b, n_b)
         stamp(on, tls, tid, 21)
-        tk = c["tk"]
-        if tk["valid"]:
-            stamp(on, tls, tid, 7)
-            kda_inputs(c, k, tk["req"], tk["h"])
-            stamp(on, tls, tid, 8)
-            kda_gates(c, k, tk["req"], tk["h"])
-            stamp(on, tls, tid, 9)
-            kda_recur(c, k, tk["req"], tk["h"], tk["ch"])
-            stamp(on, tls, tid, 10)
-            kda_norm(c, tk["req"], tk["h"], tk["ch"])
-            stamp(on, tls, tid, 11)
+        nrounds = -(-(s // L) * NH // ((BLOCKS - s) // NVCH))
+        for r in range_constexpr(nrounds):
+            if r > 0:
+                c["tk"] = kda_meta(c, r)
+                k = kda_stage(c)
+            tk = c["tk"]
+            if tk["valid"]:
+                stamp(on, tls, tid, 7)
+                kda_inputs(c, k, tk["req"], tk["h"])
+                stamp(on, tls, tid, 8)
+                kda_gates(c, k, tk["req"], tk["h"])
+                stamp(on, tls, tid, 9)
+                kda_recur(c, k, tk["req"], tk["h"], tk["ch"])
+                stamp(on, tls, tid, 10)
+                kda_norm(c, k, tk["req"], tk["h"], tk["ch"])
+                stamp(on, tls, tid, 11)
         stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
 
     @flyc.jit
