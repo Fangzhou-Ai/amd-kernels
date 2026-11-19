@@ -23,6 +23,7 @@ POOL = 8192  # entries of a row's pool at most: four 2048-entry blocks of the me
 QMAX = 6  # query rows a sequence may have
 MAX_ROWS = 256  # rows one call may hold
 INFO_OFFSET = MAX_ROWS * NCH_MAX * 16  # bytes: the per-row records follow the meta plane
+LIST_MAX = 576  # keys a list keeps at most (its stage fits a wave's histogram region)
 LIST_FLOOR = 64  # keys a list keeps at least: at most ~33 chunks can hold selected keys beyond their lists
 COUNTER_BYTES = 256  # a (sequence, row tile)'s ready and consumer counts: a cache line pair of their own
 COUNTER_GROUPS = 1024  # (sequence, row tile) groups a call may hold
@@ -49,7 +50,7 @@ def list_size(nch: int, cb: int) -> int:
     floor = LIST_FLOOR
     pool = (POOL_TARGET - cb) // max(nch - 1, 1) * 8 // 9 // 32 * 32 if nch > 1 else cb
     want = max(cb // TBDIV // 32 * 32, 32, SPREAD // max(nch, 1) // 32 * 32)
-    return min(max(floor, min(want, pool)), cb)
+    return min(max(floor, min(want, pool, LIST_MAX)), cb)
 
 
 def chunk_size_rt(max_end, target):
@@ -64,7 +65,7 @@ def list_size_rt(nch, cb):
     pool = ((I(POOL_TARGET) - cb) // fx.max(nch - 1, I(1)) * 8 // 9 // 32) * 32
     pool = (nch > 1).select(pool, cb)
     want = fx.max(fx.max(cb // TBDIV // 32 * 32, I(32)), I(SPREAD) // fx.max(nch, I(1)) // 32 * 32)
-    return fx.min(fx.max(floor, fx.min(want, pool)), cb)
+    return fx.min(fx.max(floor, fx.min(fx.min(want, pool), I(LIST_MAX))), cb)
 
 
 def slot_size(tb):
