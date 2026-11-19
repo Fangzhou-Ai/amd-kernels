@@ -9,13 +9,15 @@ import torch
 from amd_kernels.common.tensor_shim import _run_compiled
 
 from . import norm as _norm
+from . import prologue as _prologue
 from . import scan as _scan
 from .reference import D, NH, RECORD_BYTES
 
 SCAN_WAVES = 4
 SCAN_NVT = 1
-FOLD_WAVES = 4
+FOLD_WAVES = 1
 FOLD_NVT = 1
+FOLD_STAGES = 3
 MIN_CHUNKS = 4
 MAX_GROUPS = 32
 NUM_CUS = 256
@@ -33,7 +35,7 @@ def _chain_launcher():
 
 @functools.cache
 def _fold_launcher():
-    return _scan.compile_fold(FOLD_WAVES, FOLD_NVT)
+    return _scan.compile_fold(FOLD_WAVES, FOLD_NVT, FOLD_STAGES)
 
 
 @functools.cache
@@ -90,3 +92,13 @@ def gated_norm(o, gate, norm_weight, eps, out=None):
     _run_compiled(_norm_launcher(wf32), o.data_ptr(), gate.data_ptr(), norm_weight.data_ptr(), out.data_ptr(), gate.stride(0),
                   t * NH, span * 2, float(eps), torch.cuda.current_stream())
     return out
+
+
+def prefill(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices, has_initial_state,
+            cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale=D ** -0.5):
+    """The KDA prefill of one layer: conv + prologue, chunk scan, gated RMSNorm. Writes ``out`` [T, 12, 128] bf16, rolls
+    ``conv_state`` and updates ``state_cache`` rows in place."""
+    ws = _prologue.prologue(mixed, raw_g, beta_logit, A_log, dt_bias, lower_bound, scale, conv_weight, conv_state, state_indices,
+                            has_initial_state, cu_seqlens, chunk_indices)
+    scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_state, out)
+    return gated_norm(out, gate, norm_weight, norm_eps, out)

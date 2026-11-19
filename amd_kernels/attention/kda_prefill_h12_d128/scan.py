@@ -412,17 +412,21 @@ def compile_scan(waves: int, nvt: int, chain: bool):
 
 
 @launcher
-def compile_fold(waves: int, nvt: int):
+def compile_fold(waves: int, nvt: int, stages: int):
     nsl = waves * nvt
     assert 8 % nsl == 0
     ngrp = 8 // nsl
     nthreads = 64 * waves
-    ndma = -(-32 // waves)
-    name = f"kda_prefill_fold_h12_d128_w{waves}_v{nvt}"
+    b_bytes = nsl * 8192
+    a_off, b_off = FRAGS_C, FRAGS_C + 1024
+    stage_bytes = b_off + b_bytes
+    pieces = 32 + 1 + b_bytes // 1024
+    ndma = -(-pieces // waves)
+    name = f"kda_prefill_fold_h12_d128_w{waves}_v{nvt}_s{stages}"
 
     @fx.struct
     class Shared:
-        buf: fx.Array[fx.Uint8, 2 * FRAGS_C, 16]
+        buf: fx.Array[fx.Uint8, stages * stage_bytes, 16]
 
     @flyc.kernel(name=name, known_block_size=[nthreads, 1, 1])
     def kernel(
@@ -463,6 +467,26 @@ def compile_fold(waves: int, nvt: int):
                 lane16 = lane * 16
                 vs0 = (sg * waves + wave) * nvt
                 nh = pair * i32_groups
+                steps = gn - 1
+
+                def dma(gp, st):
+                    gpc = fx.min(gp, steps - 1)
+                    rc = _fp(arg_gc + fx.Int64(nh + gpc) * FRAGS_C, FRAGS_C)
+                    ra = _fp(arg_ga + fx.Int64(nh + gpc) * (D * 4), 1024)
+                    rb = _fp(arg_gb + fx.Int64(nh + gpc) * STATE_BYTES + fx.Int64(sg * nsl * 8192), b_bytes)
+                    for i in range_constexpr(ndma):
+                        j = fx.min(wave + i * waves, fx.Int32(pieces - 1))
+                        dst = lds_base + st * stage_bytes + j * 1024
+                        if j < 32:
+                            _dma_piece(rc, dst, j * 1024 + lane16)
+                        else:
+                            if j < 33:
+                                _dma_piece(ra, dst, lane16)
+                            else:
+                                _dma_piece(rb, dst, (j - 33) * 1024 + lane16)
+
+                for p in range_constexpr(stages - 1):
+                    dma(fx.Int32(p), fx.Int32(p))
                 src_r = _fp(arg_state + fx.Int64(slot) * i64_slot_bytes + fx.Int64(h) * STATE_BYTES, STATE_BYTES)
                 s0 = []
                 for vt in range_constexpr(nvt):
@@ -472,56 +496,29 @@ def compile_fold(waves: int, nvt: int):
                 for vt in range_constexpr(nvt):
                     for kt in range_constexpr(8):
                         buffer_ops.buffer_store(s0[vt * 8 + kt], sin0, (16 * (vs0 + vt) + l16) * D + 16 * kt + 4 * qg)
-
-                def dma(gp, st):
-                    rs = _fp(arg_gc + fx.Int64(nh + gp) * FRAGS_C, FRAGS_C)
-                    jobs = []
-                    for i in range_constexpr(ndma):
-                        def job(i=i):
-                            j = fx.min(wave + i * waves, fx.Int32(31))
-                            _dma_piece(rs, lds_base + st * FRAGS_C + j * 1024, j * 1024 + lane16)
-                        jobs.append(job)
-                    return jobs
-
-                def load_ab(gp):
-                    a_r = _fp(arg_ga + fx.Int64(nh + gp) * (D * 4), D * 4)
-                    b_r = _fp(arg_gb + fx.Int64(nh + gp) * STATE_BYTES, STATE_BYTES)
-                    a = [buffer_ops.buffer_load(a_r, 16 * kt + 4 * qg, vec_width=4, dtype=fx.Float32) for kt in range_constexpr(8)]
-                    b = [buffer_ops.buffer_load(b_r, (16 * (vs0 + vt) + l16) * D + 16 * kt + 4 * qg, vec_width=4, dtype=fx.Float32)
-                         for vt in range_constexpr(nvt) for kt in range_constexpr(8)]
-                    return a + b
-
-                for jb in dma(fx.Int32(0), fx.Int32(0)):
-                    jb()
-                init = [fx.as_ir_value(x) for x in s0 + load_ab(fx.Int32(0))]
-                for gp, st in range(0, fx.Int64(gn - 1), 1, init=init):
+                init = [fx.as_ir_value(x) for x in s0]
+                for gp, st in range(0, fx.Int64(steps), 1, init=init):
                     gi = fx.Int32(gp)
                     S = [[Vec(st[vt * 8 + kt]) for kt in range_constexpr(8)] for vt in range_constexpr(nvt)]
-                    A = [Vec(st[nvt * 8 + kt]) for kt in range_constexpr(8)]
-                    B = [[Vec(st[nvt * 8 + 8 + vt * 8 + kt]) for kt in range_constexpr(8)] for vt in range_constexpr(nvt)]
-                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                    fx.rocdl.s_waitcnt(vmcnt=(stages - 1) * 8 * nvt + (stages - 2) * ndma, lgkmcnt=0)
                     barrier()
-                    base = lds_base + (gi % 2) * FRAGS_C + lane16
-                    nxt = fx.min(gi + 1, gn - 2)
-                    jobs = dma(nxt, (gi + 1) % 2)
-                    ab_next = load_ab(nxt)
+                    base = lds_base + (gi % stages) * stage_bytes
+                    dma(gi + stages - 1, (gi + stages - 1) % stages)
                     sched_barrier()
-                    acc = [[S[vt][kt] * A[kt] + B[vt][kt] for kt in range_constexpr(8)] for vt in range_constexpr(nvt)]
+                    a4 = [lds_load4(base + a_off + (16 * kt + 4 * qg) * 4).bitcast(fx.Float32) for kt in range_constexpr(8)]
+                    acc = [[S[vt][kt] * a4[kt] + lds_load4(base + b_off + ((16 * (wave * nvt + vt) + l16) * D + 16 * kt + 4 * qg) * 4).bitcast(fx.Float32)
+                            for kt in range_constexpr(8)] for vt in range_constexpr(nvt)]
                     sf = [[_pack(S[vt][2 * ks], S[vt][2 * ks + 1]) for ks in range_constexpr(4)] for vt in range_constexpr(nvt)]
                     for ks in range_constexpr(4):
                         for kt in range_constexpr(8):
-                            f = lds_load4(base + (kt * 4 + ks) * 1024)
+                            f = lds_load4(base + (kt * 4 + ks) * 1024 + lane16)
                             for vt in range_constexpr(nvt):
                                 acc[vt][kt] = mfma(f, sf[vt][ks], acc[vt][kt])
-                            if jobs:
-                                jobs.pop(0)()
-                    for jb in jobs:
-                        jb()
                     dst = _fp(arg_sin + fx.Int64(nh + gi + 1) * STATE_BYTES, STATE_BYTES)
                     for vt in range_constexpr(nvt):
                         for kt in range_constexpr(8):
                             buffer_ops.buffer_store(acc[vt][kt], dst, (16 * (vs0 + vt) + l16) * D + 16 * kt + 4 * qg)
-                    results = yield [fx.as_ir_value(acc[vt][kt]) for vt in range_constexpr(nvt) for kt in range_constexpr(8)] + [fx.as_ir_value(x) for x in ab_next]
+                    results = yield [fx.as_ir_value(acc[vt][kt]) for vt in range_constexpr(nvt) for kt in range_constexpr(8)]
 
     @flyc.jit
     def launch(
