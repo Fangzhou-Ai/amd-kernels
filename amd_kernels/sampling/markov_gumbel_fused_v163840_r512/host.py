@@ -11,7 +11,8 @@ from amd_kernels import warm_up
 from .reference import RANK, V
 
 NWG = 256
-CNT_DWORDS = 16
+REC_DW = 4
+REC_OFF = 2048
 MAX_ROWS = 48
 NAME = "sampling/markov_gumbel_fused_v163840_r512"
 
@@ -21,15 +22,15 @@ def row_tiles(n: int) -> int:
 
 
 def scratch_dwords(n: int) -> int:
-    """Size of the int32 scratch for ``n`` rows: the ticket counter, then the per-workgroup (value, column) pairs."""
-    return CNT_DWORDS + n * NWG * 2
+    """Size of the int32 scratch for ``n`` rows: generation, per-row results, per-workgroup (value, column, tag) records."""
+    return REC_OFF + n * NWG * REC_DW
 
 
 @functools.cache
-def _step_exe(mt: int):
-    from .kernel import compile_markov_step
+def _chain_exe(mt: int, k: int):
+    from .kernel import compile_markov_chain
 
-    return compile_markov_step(mt)
+    return compile_markov_chain(mt, k)
 
 
 def _run_compiled(exe, *args):
@@ -43,7 +44,7 @@ def _run_compiled(exe, *args):
 
 
 def _mode(base, *args, **kwargs):
-    return None
+    return base.shape[1]
 
 
 def _sizes(mode):
@@ -52,7 +53,7 @@ def _sizes(mode):
 
 def _inputs(mode, n, base, w1, w2, input_ids, anchor_idx, draft_tokens, idx_mapping, sample_pos, temperature, seeds,
             cache, scratch, row_mapping=None):
-    dev, k = base.device, base.shape[1]
+    dev, k = base.device, mode
     zi = lambda *s: torch.zeros(*s, dtype=torch.int64, device=dev)
     return (torch.zeros(n, k, V, dtype=torch.bfloat16, device=dev), w1, w2, input_ids, zi(n), zi(n, k), zi(n, k),
             zi(n, k), temperature, seeds, cache, torch.zeros(scratch_dwords(n), dtype=torch.int32, device=dev),
@@ -86,13 +87,12 @@ def markov_gumbel_fused(base, w1, w2, input_ids, anchor_idx, draft_tokens, idx_m
     assert cache.numel() * 2 < (1 << 32) and base.numel() * 2 < (1 << 32)
     assert row_mapping is None or row_mapping.dtype == torch.int32
     assert scratch.dtype == torch.int32 and scratch.numel() >= scratch_dwords(n)
-    exe = _step_exe(row_tiles(n))
-    stream = torch.cuda.current_stream()
-    for s in range(k):
-        _run_compiled(
-            exe, base.data_ptr(), base.stride(0), w1.data_ptr(), w2.data_ptr(), input_ids.data_ptr(),
-            anchor_idx.data_ptr(), draft_tokens.data_ptr(), draft_tokens.stride(0), idx_mapping.data_ptr(),
-            idx_mapping.stride(0), sample_pos.data_ptr(), sample_pos.stride(0), temperature.data_ptr(),
-            seeds.data_ptr(), cache.data_ptr(), cache.stride(0), cache.stride(1),
-            0 if row_mapping is None else row_mapping.data_ptr(), scratch.data_ptr(), s, n, (1 << 30) - 1, stream,
-        )
+    exe = _chain_exe(row_tiles(n), k)
+    _run_compiled(
+        exe, base.data_ptr(), base.stride(0), w1.data_ptr(), w2.data_ptr(), input_ids.data_ptr(),
+        anchor_idx.data_ptr(), draft_tokens.data_ptr(), draft_tokens.stride(0), idx_mapping.data_ptr(),
+        idx_mapping.stride(0), sample_pos.data_ptr(), sample_pos.stride(0), temperature.data_ptr(),
+        seeds.data_ptr(), cache.data_ptr(), cache.stride(0), cache.stride(1),
+        0 if row_mapping is None else row_mapping.data_ptr(), scratch.data_ptr(), n, (1 << 30) - 1,
+        torch.cuda.current_stream(),
+    )

@@ -16,7 +16,7 @@ def test_variants():
     if not mk.available():
         pytest.skip("requires gfx950 with FlyDSL")
     dev = torch.device("cuda")
-    host._step_exe.cache_clear()
+    host._chain_exe.cache_clear()
     w = torch.zeros(mk.V, mk.RANK, dtype=torch.bfloat16, device=dev)
     ids = torch.zeros(64, dtype=torch.int32, device=dev)
     temp = torch.ones(64, dtype=torch.float32, device=dev)
@@ -28,5 +28,5 @@ def test_variants():
             torch.zeros(n, K, mk.V, dtype=torch.bfloat16, device=dev), w, w, ids, zi(n), zi(n, K), zi(n, K), zi(n, K),
             temp, seeds, cache, torch.zeros(mk.scratch_dwords(n), dtype=torch.int32, device=dev),
         )
-    info = host._step_exe.cache_info()
+    info = host._chain_exe.cache_info()
     assert (info.misses, info.currsize) == (3, 3)

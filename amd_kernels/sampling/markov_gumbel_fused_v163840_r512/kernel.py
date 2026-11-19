@@ -34,8 +34,15 @@ from .reference import RANK, V
 F, I = fx.Float32, fx.Int32
 NEG_INF = float("-inf")
 SC1 = 0x10  # agent-scope (cross-XCD) stores / loads
-CNT_DWORDS = 16
+REC_DW = 4  # dwords of a candidate record: value, column, tag, pad
+RES_OFF = 16  # dwords
+CNT_OFF = 1024
+REC_OFF = 2048
 NWG = 256
+XCD_TILES = tuple(int(x) for x in __import__('os').environ.get('KK_XT', '11,9,11,9,11,9,11,9').split(','))  # tiles per wave by workgroup id % 8
+TS = bool(int(__import__('os').environ.get('KK_TS', '0')))
+TS_OFF = 2048 + 48 * 256 * 4
+SPIN = int(__import__('os').environ.get('KK_SPIN', '1000000000'))
 WG_COLS = V // NWG
 ER = RANK // 2 + 4  # LDS row pitch in dwords
 KSTEPS = RANK // 32
@@ -134,7 +141,7 @@ def _comb(v1, i1, v2, i2):
 
 
 def _atomic_add(addr, v):
-    """Returning scalar global add (one active lane): the workgroup ticket."""
+    """Returning scalar global add (one active lane): the old value."""
     low = I(fx.rocdl.readfirstlane(T.i32, fx.Int64(addr).to(fx.Int32)))
     high = I(fx.rocdl.readfirstlane(T.i32, (fx.Int64(addr) >> 32).to(fx.Int32)))
     pointer = (low.to(fx.Uint32).to(fx.Uint64) | (high.to(fx.Uint32).to(fx.Uint64) << 32)).bitcast(fx.Int64)
@@ -142,6 +149,11 @@ def _atomic_add(addr, v):
     return I(_llvm.inline_asm(T.i32, [fx.as_ir_value(inc), fx.as_ir_value(pointer)],
                               "s_atomic_add $0, $2, 0 glc\n\ts_waitcnt lgkmcnt(0)", "=s,0,s,~{memory}",
                               has_side_effects=True, is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT))
+
+
+def _xcc_id():
+    return I(_llvm.inline_asm(T.i32, [], "s_getreg_b32 $0, hwreg(HW_REG_XCC_ID)\n\ts_waitcnt lgkmcnt(0)", "=s",
+                              has_side_effects=True, is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT)) & 15
 
 
 def _bf16_lo(w):
@@ -152,27 +164,44 @@ def _bf16_hi(w):
     return (w & -65536).bitcast(F)
 
 
-def compile_markov_step(mt: int):
+
+
+def _pick(vals, c):
+    out = I(vals[-1])
+    for i in range(len(vals) - 2, -1, -1):
+        out = (c == i).select(I(vals[i]), out)
+    return out
+
+
+def _wave_or(b, upper16, upper32):
+    for mm in (1, 2, 4, 8):
+        b = b | _xor_lane(b, mm, upper16)
+    b = b | _xor_lane(b, 16, upper16)
+    b = b | _xor_lane(b, 32, upper32)
+    return I(fx.rocdl.readfirstlane(T.i32, fx.as_ir_value(b)))
+
+
+def compile_markov_chain(mt: int, ksteps: int, sleep: int = 1):
     MT = mt
+    K = ksteps
     NW = 4
-    WAVE_COLS = WG_COLS // NW
-    TILES = WAVE_COLS // 16
-    HALF_TILES = TILES // 2
-    HALF_COLS = HALF_TILES * 16
-    HALF_CHUNKS = HALF_COLS // 8
-    PBD = WAVE_COLS // 2 + 4  # dwords per row of the wave's staging buffer (pitch 16 B aligned)
+    TMAX = max(XCD_TILES)
+    HMAXC = 2 * ((TMAX + 1) // 2)  # 8-column chunks per row of the larger half
+    QMAX = 2 * TMAX
+    pass
+    PBD = TMAX * 8 + 4  # dwords per row of the wave's staging buffer (pitch 16 B aligned)
     ROWS = MT * 16
-    assert 1 <= MT <= 3 and TILES % 2 == 0
-    name = f"markov_gumbel_step_v163840_r512_mt{MT}"
+    assert 1 <= MT <= 3 and K >= 1 and NW * 32 * sum(XCD_TILES) * 16 == V
+    name = f"markov_gumbel_chain_v163840_r512_mt{MT}_k{K}"
 
     @fx.struct
     class Shared:
         e: fx.Array[fx.Int32, ROWS * ER, 16]
         buf: fx.Array[fx.Int32, NW * ROWS * PBD, 16]
-        ct: fx.Array[fx.Int32, ROWS]
+        st: fx.Array[fx.Int32, K * 3 * 64]  # per step: h0, temperature bits, cache row offset (-1: none), by row
         pv: fx.Array[fx.Int32, NW * ROWS]
         pi: fx.Array[fx.Int32, NW * ROWS]
-        last: fx.Array[fx.Int32, 4]
+        tk: fx.Array[fx.Int32, 64]
 
     @flyc.kernel(name=name, known_block_size=[64 * NW, 1, 1])
     def kernel(
@@ -194,8 +223,7 @@ def compile_markov_step(mt: int):
         i32_cs0: fx.Int32,  # cache strides in elements
         i32_cs1: fx.Int32,
         arg_rowmap: fx.Int64,  # int32 [slots] cache row of a request, 0: the slot itself
-        arg_part: fx.Int64,  # ticket counter, then (fp32 value, int32 column) [n, NWG]
-        i32_step: fx.Int32,
+        arg_sync: fx.Int64,  # generation, per-row result records, per-workgroup candidate records
         i32_n: fx.Int32,
         i32_pos_add: fx.Int32,  # low word added to sample_pos: 2^30 (vLLM's draft noise salt) - 1
     ):
@@ -215,121 +243,66 @@ def compile_markov_step(mt: int):
         base_r = buffer_ops.create_buffer_resource_from_addr(arg_base, num_records_bytes=0x7FFFFFFF)
         cache_r = buffer_ops.create_buffer_resource_from_addr(arg_cache, num_records_bytes=0x7FFFFFFF)
         w2_r = buffer_ops.create_buffer_resource_from_addr(arg_w2, num_records_bytes=V * RANK * 2)
+        sy_r = buffer_ops.create_buffer_resource_from_addr(arg_sync, num_records_bytes=0x7FFFFFFF)
         has_map = arg_rowmap != 0
-        n0 = bid * WG_COLS + wave * WAVE_COLS
-        rows = [(lane % 16 + 16 * m) < i32_n for m in range_constexpr(MT)]
+        xcc = _xcc_id()
+        rank = _atomic_add(arg_sync + fx.Int64(CNT_OFF * 4) + fx.Int64(xcc) * 128, 1) & (32 * NW - 1)  # this wave's index in its XCC
+        tiles_w = I(fx.rocdl.readfirstlane(T.i32, fx.as_ir_value(_pick(XCD_TILES, xcc))))  # tiles of each wave
+        pre_w = I(fx.rocdl.readfirstlane(T.i32, fx.as_ir_value(_pick(
+            [32 * NW * sum(XCD_TILES[:c]) for c in range(8)], xcc))))
+        T1 = (tiles_w + 1) // 2
+        T2 = tiles_w - T1
+        n0 = (pre_w + rank * tiles_w) * 16
+        upper16 = (lane & 16) != 0
+        upper32 = (lane & 32) != 0
 
-        def load_tile(t):
+        def load_tile(t, mask=None):
             wi = n0 + t * 16 + lane % 16
             return [Vec(buffer_ops.buffer_load(w2_r, wi * (RANK // 2) + k * 16 + (lane // 16) * 4, vec_width=4,
-                                               dtype=I)) for k in range_constexpr(KSTEPS)]
+                                               dtype=I, mask=mask)) for k in range_constexpr(KSTEPS)]
 
+        gen = I(buffer_ops.buffer_load(sy_r, 0, vec_width=1, dtype=I, cache_modifier=SC1))
+        nxt = load_tile(0)
 
-        # previous token of row ``lane`` (lane < n): step 0 input_ids[anchor[r]], later draft_tokens[r, step - 1]
-        first = i32_step == 0
+        # previous token of row ``lane`` (lane < n) for step 0
         okl = lane < i32_n
         a_idx = I(buffer_ops.buffer_load(anc_r, lane * 2, vec_width=1, dtype=I, mask=okl))
-        t0 = I(buffer_ops.buffer_load(ids_r, a_idx, vec_width=1, dtype=I, mask=okl & first))
-        t1 = I(buffer_ops.buffer_load(tok_r, (lane * i32_tok_stride + first.select(I(0), i32_step - 1)) * 2,
-                                      vec_width=1, dtype=I, mask=okl & (i32_step != 0)))
-        tok_l = first.select(t0, t1)
+        tok_l = I(buffer_ops.buffer_load(ids_r, a_idx, vec_width=1, dtype=I, mask=okl))
 
-        rstate = []
-        for m in range_constexpr(MT):
-            r = lane % 16 + 16 * m
-            slot = I(buffer_ops.buffer_load(idx_r, (r * i32_idx_stride + i32_step) * 2, vec_width=1, dtype=I,
-                                            mask=rows[m]))
-            pos_lo = I(buffer_ops.buffer_load(pos_r, (r * i32_pos_stride + i32_step) * 2, vec_width=1, dtype=I,
-                                              mask=rows[m])) + i32_pos_add
-            rstate.append((slot, pos_lo))
-
-        # w1[prev] rows -> LDS
-        ws = []
-        for i in range_constexpr(ROWS // NW):
-            row = wave + NW * i
-            tok = I(fx.rocdl.readlane(T.i32, fx.as_ir_value(tok_l), fx.as_ir_value(row)))
-            ws.append(Vec(buffer_ops.buffer_load(w1_r, tok * (RANK // 2) + lane * 4, vec_width=4, dtype=I,
-                                                 mask=row < i32_n)))
-
-        temps, h0s, cvalid, crow_off = [], [], [], []
-        for m in range_constexpr(MT):
-            slot, pos_lo = rstate[m]
-            valid = rows[m] & (slot >= 0)
+        def build_state(s):
+            """Row ``lane``'s Gumbel seed state, temperature and cache offset of step ``s`` into the LDS table."""
+            slot = I(buffer_ops.buffer_load(idx_r, (lane * i32_idx_stride + s) * 2, vec_width=1, dtype=I, mask=okl))
+            pos_lo = I(buffer_ops.buffer_load(pos_r, (lane * i32_pos_stride + s) * 2, vec_width=1, dtype=I,
+                                              mask=okl)) + i32_pos_add
+            valid = okl & (slot >= 0)
             slot0 = valid.select(slot, I(0))
             tmp = I(buffer_ops.buffer_load(tmp_r, slot0, vec_width=1, dtype=I, mask=valid)).bitcast(F)
             sd = Vec(buffer_ops.buffer_load(sed_r, slot0 * 2, vec_width=2, dtype=I, mask=valid))
             crow = has_map.select(I(buffer_ops.buffer_load(rmp_r, slot0, vec_width=1, dtype=I, mask=valid & has_map)),
                                   slot)
             cv = valid & (crow >= 0)
-            cvalid.append(cv)
-            crow_off.append(cv.select(crow * i32_cs0 + i32_step * i32_cs1, I(-1)))
-            h0s.append(_mix(_mix(_mix(I(0), I(sd[0])), I(sd[1]) ^ i32_step), pos_lo))
-            temps.append(valid.select(tmp, F(0.0)))
+            smem.st.ptr[(s * 3 + 0) * 64 + lane] = _mix(_mix(_mix(I(0), I(sd[0])), I(sd[1]) ^ I(s)), pos_lo)
+            smem.st.ptr[(s * 3 + 1) * 64 + lane] = valid.select(tmp, F(0.0)).bitcast(I)
+            smem.st.ptr[(s * 3 + 2) * 64 + lane] = cv.select(crow * i32_cs0 + I(s) * i32_cs1, I(-1))
 
-        # the wave's base-logit slab (rows x WAVE_COLS), coalesced 16 B per lane, into LDS
-        bch = []
-        for it in range_constexpr((ROWS * (WAVE_COLS // 8) + 63) // 64):
-            j = lane + 64 * it
-            r, q = j // (WAVE_COLS // 8), j % (WAVE_COLS // 8)
-            ok = (j < ROWS * (WAVE_COLS // 8)) & (r < i32_n)
-            bch.append((r, q, Vec(buffer_ops.buffer_load(base_r, (r * i32_bs0 + i32_step * V + n0 + q * 8) // 2,
-                                                         vec_width=4, dtype=I, mask=ok))))
-
-        fx.rocdl.sched_barrier(0)
-        nxt = load_tile(0)
-        fx.rocdl.sched_barrier(0)
-        for r, q, v in bch:
-            for j in range_constexpr(4):
-                smem.buf.ptr[wave * ROWS * PBD + r * PBD + q * 4 + j] = v[j]
-        for i in range_constexpr(ROWS // NW):
-            row = wave + NW * i
-            for j in range_constexpr(4):
-                smem.e.ptr[row * ER + lane * 4 + j] = ws[i][j]
-        if wave == 0:  # noqa: SIM102
-            if lane < 16:
-                for m in range_constexpr(MT):
-                    smem.ct.ptr[lane + 16 * m] = crow_off[m]
-        fx.rocdl.s_waitcnt(lgkmcnt=0)
-        fx.gpu.barrier()
-
-        lds16 = fx.logical_divide(fx.make_view(fx.recast_iter(fx.Int32, smem.e.ptr),
-                                               fx.make_layout(ROWS * ER, 1)), fx.make_layout(4, 1))
-        buf16 = fx.logical_divide(fx.make_view(fx.recast_iter(fx.Int32, smem.buf.ptr),
-                                               fx.make_layout(NW * ROWS * PBD, 1)), fx.make_layout(4, 1))
-        atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
-
-        def a_frag(m, k):
-            rm = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
-            fx.copy(atom, fx.slice(lds16, (None, ((lane % 16 + 16 * m) * ER + k * 16 + (lane // 16) * 4) // 4)), rm)
-            return Vec(fx.memref_load_vec(rm))
-
-        upper16 = (lane & 16) != 0
-        upper32 = (lane & 32) != 0
-        flag = I(0)
-        for m in range_constexpr(MT):
-            gen = (temps[m] != F(0.0)) & (temps[m] != F(1.0))
-            flag = flag | gen.select(I(3), (temps[m] != F(0.0)).select(I(1), I(0)))
-        for mm in (1, 2, 4, 8):
-            flag = flag | _xor_lane(flag, mm, upper16)
-        flag = I(fx.rocdl.readfirstlane(T.i32, fx.as_ir_value(flag)))
-
-        def run(smem, noisy, divide):
-            afr = [a_frag(m, k) for m in range_constexpr(MT) for k in range_constexpr(KSTEPS)]
+        def finish_step(smem, s, noisy, divide, afr, temps, h0s, cur):
             best_v = [F(NEG_INF) for _ in range(MT)]
             best_i = [I(0) for _ in range(MT)]
-            cur = nxt
+            last_step = s == K - 1
             for h in range_constexpr(2):
                 init = [v.ir_value() for v in best_v] + [v.ir_value() for v in best_i] + [v.ir_value() for v in cur]
-                for t, old in range(fx.Index(0), fx.Index(HALF_TILES), fx.Index(1), init=init):
+                for t, old in range(fx.Index(0), fx.Index(T1 if h == 0 else T2), fx.Index(1), init=init):
                     best_v = [F(x) for x in old[:MT]]
                     best_i = [I(x) for x in old[MT:2 * MT]]
                     wv = [Vec(x) for x in old[2 * MT:]]
-                    ti = I(t) + h * HALF_TILES
+                    ti = I(t) + (T1 if h == 1 else 0)
                     nt = ti + 1
-                    nt = (nt < TILES).select(nt, ti)
+                    more = nt < tiles_w
+                    nt = more.select(nt, I(0))
                     nwi = n0 + nt * 16 + lane % 16
                     nwv = [Vec(buffer_ops.buffer_load(w2_r, nwi * (RANK // 2) + k * 16 + (lane // 16) * 4,
-                                                      vec_width=4, dtype=I)) for k in range_constexpr(KSTEPS)]
+                                                      vec_width=4, dtype=I,
+                                                      mask=None if not last_step else more)) for k in range_constexpr(KSTEPS)]
                     acc = [Vec.filled(4, 0.0, F) for _ in range(MT)]
                     for k in range_constexpr(KSTEPS):
                         for m in range_constexpr(MT):
@@ -363,6 +336,10 @@ def compile_markov_step(mt: int):
                             gt = v > best_v[m]
                             best_v[m] = gt.select(v, best_v[m])
                             best_i[m] = gt.select(c0 + e, best_i[m])
+                    if TS:
+                        if (tx == 0) & (ti < 14):
+                            t64 = fx.Int64(_llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
+                            buffer_ops.buffer_store(t64.to(fx.Int32), sy_r, TS_OFF + (bid * K + s) * 24 + 8 + ti)
                     result = yield ([v.ir_value() for v in best_v] + [v.ir_value() for v in best_i] +
                                     [v.ir_value() for v in nwv])
                 best_v = [F(x) for x in result[:MT]]
@@ -370,15 +347,15 @@ def compile_markov_step(mt: int):
                 cur = [Vec(x) for x in result[2 * MT:]]
                 # the half's cache slab, coalesced 16 B per lane
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
-                for it in range_constexpr((ROWS * HALF_CHUNKS + 63) // 64):
+                for it in range_constexpr((ROWS * HMAXC + 63) // 64):
                     j = lane + 64 * it
-                    r, q = j // HALF_CHUNKS, j % HALF_CHUNKS
-                    co = I(smem.ct.ptr[r % ROWS])
+                    r, q = j // HMAXC, j % HMAXC
+                    co = I(smem.st.ptr[(s * 3 + 2) * 64 + r % ROWS])
                     rm = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
-                    fx.copy(atom, fx.slice(buf16, (None, (wave * ROWS * PBD + r * PBD + (h * HALF_COLS + q * 8) // 2) // 4)), rm)
+                    fx.copy(atom, fx.slice(buf16, (None, (wave * ROWS * PBD + r * PBD + ((T1 * 8 if h == 1 else 0) + q * 4)) // 4)), rm)
                     buffer_ops.buffer_store(Vec(fx.memref_load_vec(rm)), cache_r,
-                                            (co + n0 + h * HALF_COLS + q * 8) // 2,
-                                            mask=(j < ROWS * HALF_CHUNKS) & (co >= 0))
+                                            (co + n0 + (T1 * 16 if h == 1 else 0) + q * 8) // 2,
+                                            mask=(j < ROWS * HMAXC) & (q < 2 * (T1 if h == 0 else T2)) & (co >= 0))
             for m in range_constexpr(MT):
                 av, ai = best_v[m], best_i[m]
                 for mm, up in ((16, upper16), (32, upper32)):
@@ -388,95 +365,176 @@ def compile_markov_step(mt: int):
                 if lane < 16:
                     smem.pv.ptr[(wave * MT + m) * 16 + lane] = av.bitcast(I)
                     smem.pi.ptr[(wave * MT + m) * 16 + lane] = ai
-            fx.gpu.barrier()
-            if tx < i32_n:
-                m_t, l_t = tx // 16, tx % 16
-                pv = [I(smem.pv.ptr[(w * MT + m_t) * 16 + l_t]).bitcast(F) for w in range_constexpr(NW)]
-                pi = [I(smem.pi.ptr[(w * MT + m_t) * 16 + l_t]) for w in range_constexpr(NW)]
-                v, i = pv[0], pi[0]
-                for w in range_constexpr(1, NW):
-                    v, i = _comb(v, i, pv[w], pi[w])
-                part_r = buffer_ops.create_buffer_resource_from_addr(arg_part, num_records_bytes=0x7FFFFFFF)
-                buffer_ops.buffer_store(Vec.from_elements([v.bitcast(I), i], I), part_r,
-                                        CNT_DWORDS + (tx * NWG + bid) * 2, cache_modifier=SC1)
+            return cur
 
-        if flag >= 2:
-            run(smem, True, True)
-        else:
-            if flag == 1:
-                run(smem, True, False)
-            else:
-                run(smem, False, False)
+        atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
+        lds16 = fx.logical_divide(fx.make_view(fx.recast_iter(fx.Int32, smem.e.ptr),
+                                               fx.make_layout(ROWS * ER, 1)), fx.make_layout(4, 1))
+        buf16 = fx.logical_divide(fx.make_view(fx.recast_iter(fx.Int32, smem.buf.ptr),
+                                               fx.make_layout(NW * ROWS * PBD, 1)), fx.make_layout(4, 1))
 
-        if MT == 1:
-            fx.rocdl.s_waitcnt(vmcnt=0)
-            fx.gpu.barrier()
-            # one ticket per 16-row group; the workgroup that takes a group's last ticket reduces that group
-            for g in range_constexpr(MT):
-                if tx == g:
-                    smem.last.ptr[g] = (_atomic_add(arg_part + fx.Int64(g * 4), 1) == NWG - 1).select(I(1), I(0))
-            fx.gpu.barrier()
-            for g in range_constexpr(MT):
-                if smem.last.ptr[g] != 0:
-                    pr = buffer_ops.create_buffer_resource_from_addr(arg_part, num_records_bytes=0x7FFFFFFF)
-                    r, q = g * 16 + tx // 16, tx % 16
-                    bv, bi = F(NEG_INF), I(0)
-                    for c in range_constexpr(NWG // 16 // 2):
-                        e = Vec(buffer_ops.buffer_load(pr, CNT_DWORDS + (r * NWG + q * (NWG // 16)) * 2 + c * 4,
-                                                       vec_width=4, dtype=I, cache_modifier=SC1, mask=r < i32_n))
-                        bv, bi = _comb(bv, bi, I(e[0]).bitcast(F), I(e[1]))
-                        bv, bi = _comb(bv, bi, I(e[2]).bitcast(F), I(e[3]))
-                    for mm in (1, 2, 4, 8):
-                        ov = _xor_lane(bv.bitcast(I), mm, upper16).bitcast(F)
-                        oi = _xor_lane(bi, mm, upper16)
-                        bv, bi = _comb(bv, bi, ov, oi)
-                    if (q == 0) & (r < i32_n) & (tx < 256):
-                        tr = buffer_ops.create_buffer_resource_from_addr(
-                            arg_tokens + (fx.Int64(r) * fx.Int64(i32_tok_stride) + fx.Int64(i32_step)) * 8,
-                            num_records_bytes=8)
-                        buffer_ops.buffer_store(Vec.from_elements([bi, I(0)], I), tr, 0)
-                    if tx == 0:
-                        buffer_ops.buffer_store(I(0), pr, g, cache_modifier=SC1)
+        def a_frag(m, k):
+            rm = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+            fx.copy(atom, fx.slice(lds16, (None, ((lane % 16 + 16 * m) * ER + k * 16 + (lane // 16) * 4) // 4)), rm)
+            return Vec(fx.memref_load_vec(rm))
 
-        else:
-            fx.rocdl.s_waitcnt(vmcnt=0)
-            fx.gpu.barrier()
-            if tx == 0:
-                smem.last.ptr[0] = (_atomic_add(arg_part, 1) == NWG - 1).select(I(1), I(0))
-            fx.gpu.barrier()
-            if smem.last.ptr[0] != 0:
-                pr = buffer_ops.create_buffer_resource_from_addr(arg_part, num_records_bytes=0x7FFFFFFF)
-                r, q = tx // 4, tx % 4
-                bv, bi = F(NEG_INF), I(0)
-                for c in range_constexpr(NWG // 4 // 2):
-                    e = Vec(buffer_ops.buffer_load(pr, CNT_DWORDS + (r * NWG + q * (NWG // 4)) * 2 + c * 4, vec_width=4,
-                                                   dtype=I, cache_modifier=SC1, mask=r < i32_n))
-                    bv, bi = _comb(bv, bi, I(e[0]).bitcast(F), I(e[1]))
-                    bv, bi = _comb(bv, bi, I(e[2]).bitcast(F), I(e[3]))
-                for mm in (1, 2):
-                    ov = _xor_lane(bv.bitcast(I), mm, upper16).bitcast(F)
-                    oi = _xor_lane(bi, mm, upper16)
-                    bv, bi = _comb(bv, bi, ov, oi)
-                if (q == 0) & (r < i32_n):
-                    tr = buffer_ops.create_buffer_resource_from_addr(
-                        arg_tokens + (fx.Int64(r) * fx.Int64(i32_tok_stride) + fx.Int64(i32_step)) * 8,
-                        num_records_bytes=8)
-                    buffer_ops.buffer_store(Vec.from_elements([bi, I(0)], I), tr, 0)
+        def stamp(s, stage):
+            if TS:
                 if tx == 0:
-                    buffer_ops.buffer_store(I(0), pr, 0, cache_modifier=SC1)
+                    t64 = fx.Int64(_llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
+                    buffer_ops.buffer_store(t64.to(fx.Int32), sy_r, TS_OFF + (bid * K + s) * 24 + stage)
 
+        if TS:
+            if tx == 0:
+                xcc = I(_llvm.inline_asm(T.i32, [], "s_getreg_b32 $0, hwreg(HW_REG_XCC_ID)", "=s", has_side_effects=True,
+                                         is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT))
+                buffer_ops.buffer_store(xcc, sy_r, TS_OFF + (bid * K) * 24 + 6)
+                buffer_ops.buffer_store(rank, sy_r, TS_OFF + (bid * K) * 24 + 22)
+                buffer_ops.buffer_store(n0, sy_r, TS_OFF + (bid * K) * 24 + 23)
+        stamp(0, 7)
+        for s in range_constexpr(K):
+            tag = gen + (s + 1)
+            stamp(s, 0)
+            # ---- prologue: w1[prev] rows and the base-logit slab into LDS
+            ws = []
+            for i in range_constexpr(ROWS // NW):
+                row = wave + NW * i
+                tok = I(fx.rocdl.readlane(T.i32, fx.as_ir_value(tok_l), fx.as_ir_value(row)))
+                ws.append(Vec(buffer_ops.buffer_load(w1_r, tok * (RANK // 2) + lane * 4, vec_width=4, dtype=I,
+                                                     mask=row < i32_n)))
+            bch = []
+            for it in range_constexpr((ROWS * QMAX + 63) // 64):
+                j = lane + 64 * it
+                r, q = j // QMAX, j % QMAX
+                ok = (j < ROWS * QMAX) & (q < 2 * tiles_w) & (r < i32_n)
+                bch.append((r, q, Vec(buffer_ops.buffer_load(base_r, (r * i32_bs0 + s * V + n0 + q * 8) // 2,
+                                                             vec_width=4, dtype=I, mask=ok))))
+            if s == 0:
+                for sb in range_constexpr(K):
+                    if wave == sb % NW:
+                        build_state(sb)
+            for it, (r, q, v) in enumerate(bch):
+                if (lane + 64 * it) < ROWS * QMAX:
+                    for j in range_constexpr(4):
+                        smem.buf.ptr[wave * ROWS * PBD + r * PBD + q * 4 + j] = v[j]
+            for i in range_constexpr(ROWS // NW):
+                row = wave + NW * i
+                for j in range_constexpr(4):
+                    smem.e.ptr[row * ER + lane * 4 + j] = ws[i][j]
+            fx.rocdl.s_waitcnt(lgkmcnt=0)
+            fx.gpu.barrier()
+            stamp(s, 1)
+            afr = [a_frag(m, k) for m in range_constexpr(MT) for k in range_constexpr(KSTEPS)]
+            temps = [I(smem.st.ptr[(s * 3 + 1) * 64 + lane % 16 + 16 * m]).bitcast(F) for m in range_constexpr(MT)]
+            h0s = [I(smem.st.ptr[(s * 3 + 0) * 64 + lane % 16 + 16 * m]) for m in range_constexpr(MT)]
+            flag = I(0)
+            for m in range_constexpr(MT):
+                gen_t = (temps[m] != F(0.0)) & (temps[m] != F(1.0))
+                flag = flag | gen_t.select(I(3), (temps[m] != F(0.0)).select(I(1), I(0)))
+            for mm in (1, 2, 4, 8):
+                flag = flag | _xor_lane(flag, mm, upper16)
+            flag = I(fx.rocdl.readfirstlane(T.i32, fx.as_ir_value(flag)))
+
+            nxt_out = nxt
+            if flag >= 2:
+                nxt_out = finish_step(smem, s, True, True, afr, temps, h0s, nxt)
+            else:
+                if flag == 1:
+                    nxt_out = finish_step(smem, s, True, False, afr, temps, h0s, nxt)
+                else:
+                    nxt_out = finish_step(smem, s, False, False, afr, temps, h0s, nxt)
+            nxt = nxt_out
+            fx.gpu.barrier()
+            stamp(s, 2)
+
+            # ---- publish this workgroup's candidate of every row; reduce a row; read the result
+            if wave == 0:
+                if tx < i32_n:
+                    m_t, l_t = tx // 16, tx % 16
+                    pv = [I(smem.pv.ptr[(w * MT + m_t) * 16 + l_t]).bitcast(F) for w in range_constexpr(NW)]
+                    pi = [I(smem.pi.ptr[(w * MT + m_t) * 16 + l_t]) for w in range_constexpr(NW)]
+                    v, i = pv[0], pi[0]
+                    for w in range_constexpr(1, NW):
+                        v, i = _comb(v, i, pv[w], pi[w])
+                    buffer_ops.buffer_store(Vec.from_elements([v.bitcast(I), i, tag, I(0)], I), sy_r,
+                                            REC_OFF + (tx * NWG + bid) * REC_DW, cache_modifier=SC1)
+                stamp(s, 3)
+                if bid < i32_n:
+                    def rd():
+                        return [Vec(buffer_ops.buffer_load(sy_r, REC_OFF + (bid * NWG + lane * 4 + j) * REC_DW,
+                                                           vec_width=4, dtype=I, cache_modifier=SC1))
+                                for j in range_constexpr(4)]
+
+                    def bad_of(rs):
+                        b = I(0)
+                        for r_ in rs:
+                            b = b | (I(r_[2]) != tag).select(I(1), I(0))
+                        return b
+                    rs = rd()
+                    bad = _wave_or(bad_of(rs), upper16, upper32)
+                    it = I(0)
+                    while (bad != 0) & (it < SPIN):
+                        if sleep:
+                            fx.rocdl.s_sleep(sleep)
+                        rs = rd()
+                        bad = _wave_or(bad_of(rs), upper16, upper32)
+                        it = it + 1
+                    if (bad != 0) & (lane == 0):
+                        buffer_ops.buffer_store(Vec.from_elements([I(s), bid, I(1), I(0)], I), sy_r, 8, cache_modifier=SC1)
+                    bv, bi = F(NEG_INF), I(0)
+                    for r_ in rs:
+                        bv, bi = _comb(bv, bi, I(r_[0]).bitcast(F), I(r_[1]))
+                    for mm, up in ((1, upper16), (2, upper16), (4, upper16), (8, upper16), (16, upper16), (32, upper32)):
+                        ov = _xor_lane(bv.bitcast(I), mm, up).bitcast(F)
+                        oi = _xor_lane(bi, mm, up)
+                        bv, bi = _comb(bv, bi, ov, oi)
+                    if lane == 0:
+                        buffer_ops.buffer_store(Vec.from_elements([bv.bitcast(I), bi, tag, I(0)], I), sy_r,
+                                                RES_OFF + bid * REC_DW, cache_modifier=SC1)
+                stamp(s, 4)
+                if (bid == 0) if s == K - 1 else (bid >= 0):
+                    def rdres():
+                        return Vec(buffer_ops.buffer_load(sy_r, RES_OFF + lane * REC_DW, vec_width=4, dtype=I,
+                                                          cache_modifier=SC1, mask=okl))
+
+                    def bad_res(rv):
+                        return (okl & (I(rv[2]) != tag)).select(I(1), I(0))
+                    rv = rdres()
+                    bad2 = _wave_or(bad_res(rv), upper16, upper32)
+                    it2 = I(0)
+                    while (bad2 != 0) & (it2 < SPIN):
+                        if sleep:
+                            fx.rocdl.s_sleep(sleep)
+                        rv = rdres()
+                        bad2 = _wave_or(bad_res(rv), upper16, upper32)
+                        it2 = it2 + 1
+                    if (bad2 != 0) & (lane == 0):
+                        buffer_ops.buffer_store(Vec.from_elements([I(s), bid, I(2), I(0)], I), sy_r, 12, cache_modifier=SC1)
+                    smem.tk.ptr[lane] = I(rv[1])
+                    if bid == 0:
+                        if okl:
+                            buffer_ops.buffer_store(Vec.from_elements([I(rv[1]), I(0)], I), tok_r,
+                                                    (lane * i32_tok_stride + s) * 2)
+                    fx.rocdl.s_waitcnt(lgkmcnt=0)
+                stamp(s, 5)
+            if s < K - 1:
+                fx.gpu.barrier()
+                tok_l = I(smem.tk.ptr[lane])
+        if bid == 0:
+            if tx == 0:
+                buffer_ops.buffer_store(gen + K, sy_r, 0, cache_modifier=SC1)
 
     @flyc.jit
-    def launch_markov_step(
+    def launch_markov_chain(
         arg_base: fx.Int64, i32_bs0: fx.Int32, arg_w1: fx.Int64, arg_w2: fx.Int64, arg_ids: fx.Int64,
         arg_anchor: fx.Int64, arg_tokens: fx.Int64, i32_tok_stride: fx.Int32, arg_idx: fx.Int64,
         i32_idx_stride: fx.Int32, arg_pos: fx.Int64, i32_pos_stride: fx.Int32, arg_temp: fx.Int64,
         arg_seed: fx.Int64, arg_cache: fx.Int64, i32_cs0: fx.Int32, i32_cs1: fx.Int32, arg_rowmap: fx.Int64,
-        arg_part: fx.Int64, i32_step: fx.Int32, i32_n: fx.Int32, i32_pos_add: fx.Int32, stream: fx.Stream,
+        arg_sync: fx.Int64, i32_n: fx.Int32, i32_pos_add: fx.Int32, stream: fx.Stream,
     ):
         kernel(arg_base, i32_bs0, arg_w1, arg_w2, arg_ids, arg_anchor, arg_tokens, i32_tok_stride, arg_idx,
                i32_idx_stride, arg_pos, i32_pos_stride, arg_temp, arg_seed, arg_cache, i32_cs0, i32_cs1,
-               arg_rowmap, arg_part, i32_step, i32_n, i32_pos_add).launch(grid=(NWG, 1, 1), block=(64 * NW, 1, 1),
-                                                                         stream=stream)
+               arg_rowmap, arg_sync, i32_n, i32_pos_add).launch(grid=(NWG, 1, 1), block=(64 * NW, 1, 1),
+                                                                stream=stream)
 
-    return launch_markov_step
+    return launch_markov_chain
