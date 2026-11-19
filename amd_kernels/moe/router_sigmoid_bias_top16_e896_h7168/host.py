@@ -9,7 +9,7 @@ import torch
 from amd_kernels.warm_up import entry
 
 from .aux import WORKSPACE_WORDS, aux_capacity
-from .kernel import FLAG_WORDS, MT_MAX, compile_router_e896_h7168, partial_bytes
+from .kernel import FLAG_WORDS, MT_MAX, compile_router_e896_h7168, partial_bytes, slab_rows
 from .reference import E, H, TOPK
 from .topk import compile_router_sigmoid_bias_top16_e896
 
@@ -71,13 +71,15 @@ def _run(exe, *args):
 _WORK: dict = {}
 
 
-def _workspace(device: torch.device, stream: int):
-    """The partial slabs, the arrival flags (zero, never reset: each call advances each by one) and the sort's masks
-    and flags (flags carry the call's epoch) of one (device, stream)."""
-    key = (device.index, stream)
+def _workspace(device: torch.device, stream: int, mt: int, config: tuple):
+    """The partial slabs, the epoch words (zero, never reset: each call advances each by one) and the sort's masks and
+    flags (flags carry the call's epoch) of one (device, stream, row tile, config). A call writes every word of its
+    slabs, so the words an epoch finds are those of the previous call of the same workspace (the slab parity tag)."""
+    key = (device.index, stream, mt, config)
     ws = _WORK.get(key)
     if ws is None:
-        ws = (torch.empty(max(partial_bytes(MAX_M, ks) for ks, _, _ in CONFIG_BY_MT.values()), dtype=torch.uint8, device=device),
+        ks, wn, _ = config
+        ws = (torch.zeros(partial_bytes(mt, ks, wn), dtype=torch.uint8, device=device),
               torch.zeros(FLAG_WORDS, dtype=torch.int32, device=device),
               torch.zeros(WORKSPACE_WORDS, dtype=torch.int32, device=device))
         _WORK[key] = ws
@@ -112,7 +114,7 @@ def _launch(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None, scale: 
     stream = torch.cuda.current_stream()
     mt = m_tile_fragments(m)
     ks, wn, nrw = CONFIG_BY_MT[mt]
-    part, counters, aux_ws = _workspace(x.device, stream.cuda_stream)
+    part, counters, aux_ws = _workspace(x.device, stream.cuda_stream, mt, (ks, wn, nrw))
     ptrs = [0] * 8
     cap = zvecs = 0
     if out is None:
@@ -150,7 +152,10 @@ def router_logits(x: torch.Tensor, w: torch.Tensor, *, shuffled: bool = False) -
     if m > MAX_M:
         return torch.cat([router_logits(x[i:i + MAX_M], w, shuffled=shuffled) for i in range(0, m, MAX_M)])
     part, ks = _launch(x, w, None, 1.0, None, shuffled)
-    slabs = part[:partial_bytes(m, ks)].view(torch.float32).view(ks, m, E)
+    mt = m_tile_fragments(m)
+    rows = slab_rows(mt, CONFIG_BY_MT[mt][1])
+    slabs = part.view(torch.int32).view(ks, rows, E)[:, :m] & -2  # the fused launch drops each word's lowest bit (parity tag)
+    slabs = slabs.view(torch.float32)
     logits = slabs[0].clone()
     for k in range(1, ks):
         logits += slabs[k]

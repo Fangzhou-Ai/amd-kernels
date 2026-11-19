@@ -99,16 +99,23 @@ def _lds_ptr(byte_addr):
 
 def topk_q_scores(pr, br, lane, tok, i32_m, ks, slab_cm, q):
     """Group ``q`` (an int or a wave-uniform Int32: the experts 256 q + 4 lane + j): the ``ks`` slab vectors summed in slice
-    order, AITER's sigmoid (rcp(1 + exp2(-log2(e) x)), the product in double), the biased score and its order-preserving
-    unsigned key. Returns [(sigmoid, key)] for j = 0..3."""
+    order, then ``topk_q_keys``. Returns [(sigmoid, key)] for j = 0..3."""
     dynamic = not isinstance(q, int)
     valid = ((q != NQ - 1) | (lane < 32)) if dynamic else ((lane < 32) if q == NQ - 1 else None)
     parts = [Vec(buffer_ops.buffer_load(pr, (s * i32_m + tok) * E + 256 * q + 4 * lane, vec_width=4, dtype=fx.Float32,
                                         mask=valid, cache_modifier=slab_cm)) for s in range_constexpr(ks)]
-    bv = Vec(buffer_ops.buffer_load(br, 256 * q + 4 * lane, vec_width=4, dtype=fx.Float32, mask=valid))
     acc = parts[0]
     for s in range_constexpr(1, ks):
         acc = acc + parts[s]
+    return topk_q_keys(acc, br, lane, q)
+
+
+def topk_q_keys(acc, br, lane, q):
+    """Group ``q``'s summed logits ``acc`` (a vector of 4 fp32 per lane): AITER's sigmoid (rcp(1 + exp2(-log2(e) x)), the
+    product in double), the biased score and its order-preserving unsigned key. Returns [(sigmoid, key)] for j = 0..3."""
+    dynamic = not isinstance(q, int)
+    valid = ((q != NQ - 1) | (lane < 32)) if dynamic else ((lane < 32) if q == NQ - 1 else None)
+    bv = Vec(buffer_ops.buffer_load(br, 256 * q + 4 * lane, vec_width=4, dtype=fx.Float32, mask=valid))
     out = []
     for j in range_constexpr(4):
         y = (fx.Float32(acc[j]).to(fx.Float64) * fx.Float64(NEG_LOG2E)).to(fx.Float32)
