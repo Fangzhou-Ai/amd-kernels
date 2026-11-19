@@ -17,6 +17,7 @@ collectives/pull_collectives_ranks4/test_slots4_reduce_scatter.py	4
 collectives/all_gather_sampler_i64_c8_ranks4/test_sampler_gather.py	4
 collectives/all_gather_i64_c7_ranks4/test_i64_c7_gather.py	4
 norm/allreduce_gemma_bf16_mxfp8_h6144	4
+norm/allreduce_attnres_rmsnorm_h7168_ranks8	8
 embedding/vocab_gather_h6144	4
 embedding/vocab_gather_h7168_v163840_ranks8	8
 gemm/bf16_concat_linear_n1536_k30720/test_gather.py	4
