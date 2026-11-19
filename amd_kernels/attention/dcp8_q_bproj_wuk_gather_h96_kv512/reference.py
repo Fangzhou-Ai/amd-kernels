@@ -31,3 +31,44 @@ def latent_reference(q, w_uk):
 def gathered_query_reference(q_a, w_qb, w_uk):
     """``w_qb``, ``w_uk``: the 8 ranks' weights (sequences); returns bf16 [M, 96, 576]."""
     return torch.cat([latent_reference(q_b_reference(q_a, w_qb[r]), w_uk[r]) for r in range(RANKS)], dim=1)
+
+
+L_LATENT, ROPE, BLOCK = 512, 64, 128
+Q_RECORD_BYTES, Q_HI, Q_LO, Q_ROPE, Q_SCALE = 1168, 0, 512, 1024, 1152
+
+
+def quantize_q(q):
+    """The fp8 hi/lo record of the sparse-MLA decode kernel (``quantize_q`` of
+    attention/fp8_sparse_mla_decode_dcp8_h96_kv512_top2048/reference.py) from bf16 ``q [rows, 96, 576]``: uint8
+    ``[rows, 96, 1168]``. Per (row, head) and block b of 128 latent dims ``s_b = max(exponent(amax_b) - 7, 1)`` (the E8M0
+    byte, ``exponent`` the biased f32 exponent), ``x = q * 2^(127 - s_b)``, hi = e4m3fn(x) (round to nearest even),
+    lo = e4m3fn((x - hi) * 32). Bytes: hi [0, 512), lo [512, 1024), rope bf16 [1024, 1152), s_0..s_3 [1152, 1156), zero
+    padding to 1168."""
+    rows, heads, _ = q.shape
+    x = q[..., :L_LATENT].float().view(rows, heads, 4, BLOCK)
+    amax = x.abs().amax(dim=-1)
+    e = (amax.view(torch.int32) >> 23) & 0xFF
+    s = (e - 7).clamp(min=1)
+    inv = ((254 - s) << 23).to(torch.int32).view(torch.float32)
+    xs = x * inv[..., None]
+    hi = xs.to(torch.float8_e4m3fn)
+    lo = ((xs - hi.float()) * 32.0).to(torch.float8_e4m3fn)
+    out = torch.zeros(rows, heads, Q_RECORD_BYTES, dtype=torch.uint8, device=q.device)
+    out[..., Q_HI:Q_LO] = hi.view(torch.uint8).view(rows, heads, L_LATENT)
+    out[..., Q_LO:Q_ROPE] = lo.view(torch.uint8).view(rows, heads, L_LATENT)
+    out[..., Q_ROPE:Q_SCALE] = q[..., L_LATENT:].contiguous().view(torch.uint8).view(rows, heads, 2 * ROPE)
+    out[..., Q_SCALE : Q_SCALE + 4] = s.to(torch.uint8)
+    return out
+
+
+def dequantize_q(q8):
+    """The bf16-valued f32 ``[rows, 96, 576]`` a consumer reconstructs from ``quantize_q``'s record: latent
+    ``(hi + lo / 32) * 2^(s_b - 127)``, rope unchanged."""
+    rows, heads, _ = q8.shape
+    hi = q8[..., Q_HI:Q_LO].contiguous().view(torch.float8_e4m3fn).float().view(rows, heads, 4, BLOCK)
+    lo = q8[..., Q_LO:Q_ROPE].contiguous().view(torch.float8_e4m3fn).float().view(rows, heads, 4, BLOCK)
+    s = q8[..., Q_SCALE : Q_SCALE + 4].int()
+    scale = ((s << 23).to(torch.int32).view(torch.float32))[..., None]
+    lat = ((hi + lo / 32.0) * scale).view(rows, heads, L_LATENT)
+    rope = q8[..., Q_ROPE:Q_SCALE].contiguous().view(torch.bfloat16).float()
+    return torch.cat((lat, rope), dim=-1)

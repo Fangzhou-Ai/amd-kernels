@@ -12,11 +12,12 @@ Every rank maps the other ranks' gather buffer (uncached device memory): a flag 
    ``e % 2``, and waits for ``e``: rank s started call ``e - 1``, so its consumer of call ``e - 2`` is done, and the
    wait never depends on this call's start skew between the ranks.
 2. ``push``: stores to the eight data areas, ``s_waitcnt vmcnt(0)`` and a barrier, then one store of ``e + 1`` to the
-   word ``ready[s][k]`` of each rank, k the index of the pushing workgroup (or of the token it pushed). The data area
-   is uncached: a store reaches the peer without a flush, and the words are plain stores to distinct addresses, so
-   there is no atomic to serialize.
+   word ``ready[s][k]`` of each rank, k the index of the pushed tile (token tile x column block, or the pushing
+   workgroup). The data area is uncached: a store reaches the peer without a flush, and the words are plain stores to
+   distinct addresses, so there is no atomic to serialize.
 3. ``wait``: a reader polls the ``ready[s][k]`` words of exactly the data it reads until each reaches ``e + 1``
-   (a signed difference: the words are never reset), then reads with system-scope loads.
+   (a signed difference: the words are never reset), then reads with system-scope loads; the q kernel polls the words
+   of all tiles it has not consumed, once per round, and reads the tiles whose words are all set.
 4. ``retire``: the last workgroup of the call (a ticket in ``state[1]``, reset by it) stores ``state[0] += 1``. Every
    workgroup has read ``state[0]`` at its start, and the next call's kernels run after this one on the stream.
 

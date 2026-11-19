@@ -10,7 +10,7 @@ import torch.distributed as dist
 
 from amd_kernels.common import hip_runtime as ops
 from amd_kernels.common.tensor_shim import _run_compiled
-from . import kernel_fused_q as KF
+from . import kernel_q_push as KP
 from . import kernel_qb as KQ
 from . import kernel_wuk as KW
 from .flags import DATA_OFF
@@ -47,8 +47,8 @@ def wuk_kernel(heads, mt, ns, mode):
 
 
 @functools.cache
-def fused_kernel(mt1, nt1, ns2, mmax, timing=False, skeleton=False, c_delay=0, nph=1, pf_cap=KF.PF_CAP):
-    return KF.compile_q_gather_wuk(mt1, nt1, ns2, mmax, timing, skeleton, c_delay, nph, pf_cap)
+def q_push_kernel(nt1, nsplit, mmax, nw, stag=0, fp8out=0, timing=False, skeleton=0):
+    return KP.compile_q_push(nt1, nsplit, mmax, timing, skeleton, fp8out, 96, nw, stag)
 
 
 class QueryGatherComm:
@@ -100,26 +100,24 @@ class QueryGatherComm:
         )
         return self.data[: m * 96 * KW.OW].view(m, 96, KW.OW)
 
-    def _q(self, q_a, w_qb, w_uk, out, cfg, timing=False, skeleton=False):
+    def _push(self, q_a, w_qb, w_uk, out, out8, cfg, fp8out, timing=False, skeleton=0):
         m = q_a.shape[0]
-        mt1, nt1, ns2, mmax, c_delay, nph = cfg
-        g1, _ = KF.grid_fused(m, mt1, nt1, ns2)
+        nt1, nsplit, nw, mmax, stag = cfg
         _run_compiled(
-            fused_kernel(mt1, nt1, ns2, mmax, timing, skeleton, c_delay, nph),
+            q_push_kernel(nt1, nsplit, mmax, nw, stag, fp8out, timing, skeleton),
             q_a.data_ptr(),
             q_a.stride(0),
             w_qb.data_ptr(),
             w_uk.data_ptr(),
-            out.data_ptr(),
+            out.data_ptr() if out is not None else 0,
+            out8.data_ptr() if out8 is not None else 0,
             m,
             *self.bufs,
             self.rank,
             self.state.data_ptr(),
-            g1,
             self.dbg.data_ptr(),
             torch.cuda.current_stream(),
         )
-        return out
 
     def close(self):
         torch.cuda.synchronize()

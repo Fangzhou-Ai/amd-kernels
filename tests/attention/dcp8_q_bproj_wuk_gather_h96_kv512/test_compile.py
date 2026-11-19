@@ -25,18 +25,26 @@ def worker(rank, errors, mode):
     heads = 12 if mode == "latent" else 96
     wq = pack_q_b(torch.zeros(2304, 1536, dtype=torch.bfloat16, device=dev))
     wu = pack_w_uk(torch.zeros(heads, 128, 512, dtype=torch.bfloat16, device=dev))
-    comm = QueryGatherComm(rank, dist.group.WORLD, dev, mode)
-    call = q_b_wuk_allgather_latent if mode == "latent" else q_b_allgather_wuk_all_heads
-    call(comm, torch.zeros(1, 1536, dtype=torch.bfloat16, device=dev), wq, wu)
+    comm = QueryGatherComm(rank, dist.group.WORLD, dev, "latent" if mode == "latent" else "q")
+
+    def call(m):
+        q_a = torch.zeros(m, 1536, dtype=torch.bfloat16, device=dev)
+        if mode == "latent":
+            return q_b_wuk_allgather_latent(comm, q_a, wq, wu)
+        out = torch.empty((m, 96, 576), dtype=torch.bfloat16, device=dev) if mode in ("q", "both") else None
+        q8 = torch.empty((m, 96, 1168), dtype=torch.uint8, device=dev) if mode in ("q8", "both") else None
+        return q_b_allgather_wuk_all_heads(comm, q_a, wq, wu, out=out, out_q8=q8)
+
+    call(1)
     before = warm_up.late_compiles()
     for m in ROWS:
-        call(comm, torch.zeros(m, 1536, dtype=torch.bfloat16, device=dev), wq, wu)
+        call(m)
     torch.cuda.synchronize()
     if warm_up.late_compiles() != before:
         errors.append(f"rank {rank}: {warm_up.late_compiles() - before} compiles after warm-up ({mode})")
     comm.close()
 
 
-@pytest.mark.parametrize("mode", ["latent", "q"])
+@pytest.mark.parametrize("mode", ["latent", "q", "q8", "both"])
 def test_no_compile_after_warm_up(mode):
     run_on_8_gpus(worker, mode, timeout=900)

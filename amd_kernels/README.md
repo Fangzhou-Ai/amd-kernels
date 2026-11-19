@@ -25,7 +25,8 @@ One line per kernel package. Each package's README has what it does, its entry p
 ## Attention
 
 - [`attention/dcp8_q_bproj_wuk_gather_h96_kv512`](attention/dcp8_q_bproj_wuk_gather_h96_kv512/README.md): the DSA
-  decode query path at DCP8: q_b projection, W_UK absorption and the push all-gather of the query over the eight ranks.
+  decode query path at DCP8: q_b projection, W_UK absorption and the push all-gather of the query over the eight ranks,
+  as bf16 and/or the hi/lo fp8 record the sparse-MLA decode kernel takes.
 - [`attention/nvfp4_sparse_prefill_gqa16_d128_p128_top16`](attention/nvfp4_sparse_prefill_gqa16_d128_p128_top16/README.md):
   sparse prefill attention over the NVFP4 KV cache (bf16, fp16 or fp8 compute).
 - [`attention/nvfp4_sparse_decode_gqa16_d128_p128_top16`](attention/nvfp4_sparse_decode_gqa16_d128_p128_top16/README.md):
