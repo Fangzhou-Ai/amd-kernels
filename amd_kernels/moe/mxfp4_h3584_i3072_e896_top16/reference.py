@@ -5,7 +5,8 @@
 Contract (checkpoint-layout inputs, no preshuffle): ``x`` bf16 [M, 3584]; ``w13`` u8 [E, 768, 1792] (e2m1 pairs, low
 nibble first; rows = 384 gate then 384 up), ``s13`` u8 [E, 768, 112] (e8m0 per 32); ``w2`` u8 [E, 3584, 192], ``s2``
 u8 [E, 3584, 12]; ``topk_ids`` int [M, 16], ``topk_weights`` fp32 [M, 16].
-  1. activation quant: MXFP4 per 32 along K; e8m0 = ceil exponent of fp32(amax * fp32(1/6)) (saturating at 254),
+  1. activation quant: MXFP4 per 32 along K; e8m0 = ceil exponent of fp32(amax * fp32(1/6)) (saturating at 254, floored
+     at 92 for the activations),
      codes RNE e2m1 of x / 2^(e - 127) (saturating at 6);
   2. gate/up = fp32 sum of dequantized products; act = beta tanh(g/beta) sigmoid(g) * (lb tanh(u/lb)), beta 4, lb 25, no clamp;
   3. the act is quantized the same way along I (per 32 columns) and multiplied by w2 in fp32;
@@ -29,14 +30,15 @@ def dequant_fp4(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     return v * sc
 
 
-def quant_mxfp4(x: torch.Tensor):
-    """fp32/bf16 [..., K] -> (u8 codes [..., K/2], e8m0 u8 [..., K/32]) by the aiter rule."""
+def quant_mxfp4(x: torch.Tensor, floor: int = 0):
+    """fp32/bf16 [..., K] -> (u8 codes [..., K/2], e8m0 u8 [..., K/32]) by the aiter rule; ``floor`` 92 for the
+    activation quant (aiter's HIP kernel), 0 for the intermediate (GEMM1's epilogue)."""
     x = x.float()
     g = x.reshape(*x.shape[:-1], -1, 32)
     amax = g.abs().amax(-1)
     wi = (amax * torch.tensor(1.0 / 6.0, dtype=torch.float32)).view(torch.int32)
     bexp = ((wi + 0x7FFFFF) >> 23) & 0xFF
-    bexp = torch.where(bexp.to(torch.int64) < 254, bexp, torch.full_like(bexp, 254))
+    bexp = torch.where(bexp.to(torch.int64) < 254, bexp, torch.full_like(bexp, 254)).clamp(min=floor)
     q = g / torch.pow(2.0, bexp.float() - 127.0).unsqueeze(-1)
     mag = q.abs().clamp(max=6.0)
     mid = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
@@ -53,17 +55,10 @@ def _tanh_act(g, u):
     return b * torch.tanh(g / b) * torch.sigmoid(g) * (lb * torch.tanh(u / lb))
 
 
-def stage1_ref(xq, xs, w13, s13, ids):
-    """Quantized activations [M,1792]/[M,112] + experts of ``ids`` [R] (one expert per row) -> fp32 act [R, 384]."""
-    out = torch.empty(ids.numel(), I, dtype=torch.float32, device=w13.device)
-    xd = dequant_fp4(xq, xs)
-    return xd, out
-
-
 def moe_ref(x, topk_ids, topk_weights, w13, s13, w2, s2):
     """Routed experts end to end; returns (out bf16 [M, 3584], slots fp32 [M, 16, 3584])."""
     m = x.shape[0]
-    xq, xs = quant_mxfp4(x.float())
+    xq, xs = quant_mxfp4(x.float(), floor=92)
     xd = dequant_fp4(xq, xs)
     slots = torch.zeros(m, TOPK, H, dtype=torch.float32, device=x.device)
     for e in topk_ids.unique().tolist():

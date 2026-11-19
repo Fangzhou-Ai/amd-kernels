@@ -37,9 +37,13 @@ def test_quant_matches_reference(m):
     x[0, :64] = 0  # an all-zero group
     x[-1, :32] *= 1e4
     codes, scales = quantize_activations(x)
-    rc, rs = R.quant_mxfp4(x.float())
+    rc, rs = R.quant_mxfp4(x.float(), floor=92)
     assert torch.equal(scales, rs)
     assert (codes != rc).float().mean().item() < 1e-4  # RNE ties only
+    from aiter import dtypes
+    from aiter.ops.quant import per_1x32_mx_quant_hip
+    qa, sa = per_1x32_mx_quant_hip(x, quant_dtype=dtypes.fp4x2, shuffle=False)
+    assert torch.equal(codes, qa.view(torch.uint8).reshape(m, -1)) and torch.equal(scales, sa.view(torch.uint8).reshape(m, -1))
 
 
 @pytest.mark.parametrize("dist", ["uniform", "zipf"])

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """BF16 [M, 3584] -> MXFP4 codes [M, 1792] + e8m0 scales [M, 112] (row-major), the activation format of GEMM1: one
-thread per (row, 32-column group), aiter's rounding (ceil exponent of amax / 6, RNE e2m1, saturating)."""
+thread per (row, 32-column group), aiter's rounding (ceil exponent of amax / 6 floored at 92, RNE e2m1, saturating)."""
 import functools
 import flydsl.compiler as flyc
 from amd_kernels.warm_up import launcher
@@ -13,6 +13,7 @@ from flydsl.expr.typing import Vector as Vec
 from .common import H, cvt_fp4, e8m0_roundup
 
 G = H // 32  # 112 groups per row
+E8M0_FLOOR = 92  # aiter's activation quant never goes below 2^-35 (all-zero groups)
 
 
 @functools.cache
@@ -42,6 +43,7 @@ def compile_quant(*, name_suffix=""):
                 z = fx.math.absf(v[i])
                 amax = (amax > z).select(amax, z)
             e = e8m0_roundup(amax)
+            e = (e > E8M0_FLOOR).select(e, fx.Int32(E8M0_FLOOR))
             scale = (e << 23).bitcast(fx.Float32)
             pk = []
             for w in range_constexpr(4):
