@@ -1,49 +1,48 @@
 # bf16 GEMM, N 20480 x K 7168 (the TP8 lm_head vocabulary shard)
 
 ## What it does
-`out [M, 20480] = x [M, 7168] @ W^T`, bf16 operands, fp32 sums in ascending K from a per-workgroup start block, one bf16
-rounding: the TP8 vocabulary shard of the Kimi-K3.1 lm_head (`lm_head.weight` bf16 [163840, 7168], rank r holds rows
-[20480 r, 20480 (r + 1)); W stays row-major, no load-time transform). One tensor serves the target lm_head and the
-DSpark draft head (target-tied). No split-K, partials or output atomics. Contract (`reference.py`): the fp64 product
-rounded once to bf16; per-row cosine >= 0.99999, rel. L2 <= 1e-3, deterministic; NaN / inf propagate as in an fp32
-sum. 256 workgroups (one CU round) take 80 weight rows each and all rows of the activation (`band.BANDS`: eight M
-bands up to 256 rows). Based on AITER's FlyDSL band-stream decode GEMM for this shape (`gemm_a16w16_band_gfx950`,
-AMD-AGI/AKLR), with a runtime row count, bands above 128 rows, a device row map and the push epilogue.
-Callers: `collectives/all_to_all_bf16_n20480_ranks8` (push modes), the Kimi-K3.1 logits and draft logits.
+`out [M, 20480] = x [M, 7168] @ W^T`, bf16 operands, fp32 sums, one bf16 rounding: the TP8 vocabulary shard of the Kimi-K3.1
+lm_head (`lm_head.weight` bf16 [163840, 7168], rank r holds rows [20480 r, 20480 (r + 1)); W stays row-major, no load-time
+transform). One tensor serves the target lm_head and the DSpark draft head (target-tied). Contract (`reference.py`): the fp64
+product rounded once to bf16; per-row cosine >= 0.99999, rel. L2 <= 1e-3, deterministic bits, a row's bits independent of the
+batch size and the row's position within one kernel band; NaN / inf propagate as in an fp32 sum. No atomics on the output.
+Up to 96 rows the band-stream kernel (`band.py`, adapted from AITER's FlyDSL decode GEMM): 256 workgroups, 80 weight rows and all
+activation rows each, fixed K order from a staggered start. From 97 rows the split-K kernel (`splitk.py`): 128 pairs of
+workgroups on one XCD, each pair owning 160 columns and each member one half of K, so the activation traffic of a workgroup
+halves; the two partial tiles meet through a fixed-order L2 exchange (workspace + self-clearing flags), member order 0, 1 for every row.
 
 ## Entry points
-- `bf16_gemm_n20480_k7168`: the logits of 1-256 rows, graph-safe, no host sync, no allocation with `out`; with a device
-  row map (`row_indices`) and `push=(exchange.send_args(), counts)` it sends the mapped rows straight to the rank that
-  owns each (`counts` int32 [8], rows sorted by owner) or, with `counts=None`, to every rank, and publishes the
-  exchange; the caller then runs the exchange's `wait` and reads the rows in place. An `amd_kernels.warm_up` entry: the
-  first call of each mode (contiguous / owner / all) compiles its eight band variants.
+- `bf16_gemm_n20480_k7168`: the logits of 1-256 rows, graph-safe, no host sync; `row_indices` fuses the hidden-row gather (device
+  int64 [M]); `push=(exchange.send_args(), counts)` sends the rows straight to the rank that owns each (counts int32 [8], rows
+  sorted by owner) or, with `counts=None`, to every rank, and publishes the exchange (the caller runs `RowAllToAll.wait`).
+  An `amd_kernels.warm_up` entry: the first call of each mode (contiguous / gather / owner / all) compiles its band variants.
 - `supports`: whether a weight is the [20480, 7168] bf16 contiguous shard and there is no bias.
-
-`host.py` picks the band by row count.
+- `host.band_of`: the kernel configuration of a row count (the dispatch is `host._kernel`); the split-K bands share one workspace
+  per device, so two split-K launches must not run concurrently on different streams.
+- `collectives/all_to_all_bf16_n20480_ranks8`: `RowAllToAll.gemm_exchange` picks between the GEMM's own push and a local write plus
+  one contiguous push by row count.
 
 ## Performance
-One MI355X (shared node: minimum of 15 rounds of ten replays, graph replay of six calls over three weight copies, 880 MB),
-us per call. `served` = AITER's `tgemm.mm` as vLLM calls it with VLLM_ROCM_USE_AITER=1 (the FlyDSL band-stream kernel up to 128
-rows, a slow path above); `hipBLASLt` = `torch.nn.functional.linear`. Ceiling = max(293.6 MB at the measured 6.5 TB/s HBM read,
-2 M N K at the library-measured 1.5 PFLOP/s bf16).
+One MI355X (`gpurun 3`, minimum of 15 rounds of ten replays, graph replay of six calls over three weight copies, 880 MB), us per
+call. `served` = AITER's `tgemm.mm` as vLLM calls it (the FlyDSL band-stream kernel up to 128 rows, a slow path above);
+`previous` = this entry before the split-K bands. Ceiling = max(293.6 MB at 6.5 TB/s measured HBM read, 2 M N K at the 1.5 PF
+measured library bf16 GEMM).
 
 | M | 1 | 12 | 24 | 40 | 65 | 80 | 96 | 128 | 160 | 192 | 256 |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| served | 42.8 | 43.1 | 43.7 | 45.5 | 51.4 | 52.7 | 54.1 | 59.4 | 98.7 | 103.4 | 143.7 |
-| hipBLASLt | 51.8 | 52.3 | 47.9 | 59.4 | 65.4 | 62.4 | 58.1 | 65.2 | 74.1 | 80.3 | 91.3 |
-| this entry | 43.0 | 43.1 | 43.9 | 45.7 | 49.7 | 50.9 | 53.7 | 59.4 | 73.1 | 78.2 | 92.6 |
-| TB/s | 6.83 | 6.82 | 6.72 | 6.47 | 5.98 | 5.85 | 5.57 | 5.06 | 4.13 | 3.89 | 3.32 |
+| served | 43.1 | 43.3 | 43.9 | 45.9 | 51.6 | 53.3 | 55.2 | 60.0 | 100.0 | 103.9 | 144.8 |
+| previous | 43.1 | 43.4 | 44.1 | 46.2 | 50.3 | 51.6 | 54.1 | 60.4 | 74.4 | 80.6 | 95.1 |
+| this entry | 43.2 | 43.3 | 44.0 | 45.9 | 50.4 | 51.6 | 53.9 | 57.6 | 65.4 | 66.2 | 85.4 |
 | ceiling | 45.2 | 45.3 | 45.4 | 45.5 | 45.7 | 45.8 | 46.0 | 46.3 | 46.5 | 46.8 | 50.1 |
-| % of ceiling | 105 | 105 | 103 | 100 | 92 | 90 | 86 | 78 | 64 | 60 | 54 |
+| % of ceiling | 104 | 104 | 103 | 99 | 91 | 89 | 85 | 80 | 71 | 71 | 59 |
+| memory-side floor of the design | 42 | 42 | 42 | 43 | 43 | 44 | 46 | 47 | 49 | 50 | 61 |
 
-The contiguous call equals the served kernel to 3 % up to 128 rows (the same design; 65-80 rows: a BM 80 / BN 80 band, -3 %) and is
-1.3-1.55x the served path above 128 rows (hipBLASLt-class). The push epilogue adds 4.3 us (owner) / 4.3-9.9 us (all ranks, 8x the
-stores) when the destinations are local (a one-GPU test); the cross-GPU numbers are `collectives/all_to_all_bf16_n20480_ranks8`'s README.
-
-Limiters (ablations, `s_memtime` stamps and sweeps in the report): up to ~40 rows the HBM weight stream; above, the L2 -> LDS stream of
-the activation (every workgroup reads all of A: 1.8 MB / CU at M 128, 2.8 MB at 192, against 1.1 MB of weights) and the MFMA / LDS-read
-loop (48 us alone at M 192 against 28 us at 1.98 PF), which the DMA pipeline overlaps only partly.
+The floor row is a kernel that only streams the same operands through the same rings (no math, no exchange; graph-timed, launch
+included): the weight stream at HBM speed plus the activation re-read; the L2 -> LDS path carries both, so above ~64 rows the
+activation traffic adds to the weight time. The split-K kernel reaches 92-97 % of that floor at 128-192 rows; the rest is the
+dispatch ramp and the end of the kernel (partial exchange 2-3 us, output store drain 1.5 us) and the 6-8 us spread of the
+CUs' finishing times (`analysis/kernels/bf16_n20480_k7168.md`: timestamps, ablations, every attempt that did not help).
 
 ## Tests
-- `python3 -m pytest tests/gemm/bf16_n20480_k7168 -q` (`test_push.py`: 8 GPUs)
+- `python3 -m pytest tests/gemm/bf16_n20480_k7168 -q` (`test_push.py`: 8 GPUs, `gpurun ranks8`)
 - `python3 benchmarks/gemm/bf16_n20480_k7168/benchmark_gemm.py [M ...]`

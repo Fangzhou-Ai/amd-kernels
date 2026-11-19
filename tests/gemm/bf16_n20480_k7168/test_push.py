@@ -57,7 +57,7 @@ def _worker(rank, port):
         for requests in (dense, random):
             for steps in (1, 4):
                 patterns.append([v * steps for v in requests])
-    patterns += [[0, 0, 24, 0, 0, 0, 0, 0], [40, 0, 0, 0, 0, 0, 0, 0], [0, 7, 0, 1, 0, 0, 0, 0], [16] * 8]
+    patterns += [[0, 0, 24, 0, 0, 0, 0, 0], [40, 0, 0, 0, 0, 0, 0, 0], [0, 7, 0, 1, 0, 0, 0, 0], [16] * 8, [24] * 8, [32] * 8, [11, 0, 0, 0, 0, 0, 0, 0]]
     for k, counts in enumerate(patterns):
         m = sum(counts)
         cs = torch.tensor(counts, dtype=torch.int32, device=dev)
@@ -65,7 +65,9 @@ def _worker(rank, port):
         maps = [torch.randperm(256, generator=torch.Generator().manual_seed(1000 * k + j))[:m].to(dev) for j in range(3)]
         outs = [torch.empty(max(n, 1), WORLD * N, dtype=torch.bfloat16, device=dev) for _ in maps]
         refs = [_a2a_reference(bf16_gemm_n20480_k7168(x[rm], w), counts, rank) for rm in maps]
+        outs_serial = [torch.empty_like(out) for out in outs]
         ag_out = torch.empty(m, WORLD * N, dtype=torch.bfloat16, device=dev)
+        ag_serial = torch.empty_like(ag_out)
         ag_ref = _ag_reference(bf16_gemm_n20480_k7168(x[maps[0]], w))
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -76,15 +78,24 @@ def _worker(rank, port):
             bf16_gemm_n20480_k7168(x, w, row_indices=maps[0], push=(comm.send_args(1), None))
             comm.wait()
             ag_out.copy_(comm.recv(m, 1))
+            for j, (rm, out) in enumerate(zip(maps, outs_serial)):
+                comm.gemm_exchange(x, w, rm, cs, j % 2, serial_above=1000 if j % 2 else 0)
+                out[:n].copy_(comm.recv(n, j % 2))
+            comm.gemm_exchange(x, w, maps[0], None, 1, serial_above=0)
+            ag_serial.copy_(comm.recv(m, 1))
         for repeat in range(3):
-            for out in outs:
+            for out in outs + outs_serial:
                 out.fill_(float("nan"))
             ag_out.fill_(float("nan"))
+            ag_serial.fill_(float("nan"))
             graph.replay()
             torch.cuda.synchronize()
             for out, ref in zip(outs, refs):
                 assert torch.equal(out[:n].view(torch.int16), ref.view(torch.int16)), (rank, k, repeat, "owner")
             assert torch.equal(ag_out.view(torch.int16), ag_ref.view(torch.int16)), (rank, k, repeat, "gather")
+            for out, ref in zip(outs_serial, refs):
+                assert torch.equal(out[:n].view(torch.int16), ref.view(torch.int16)), (rank, k, repeat, "serial owner")
+            assert torch.equal(ag_serial.view(torch.int16), ag_ref.view(torch.int16)), (rank, k, repeat, "serial gather")
         del graph
     comm.close()
     dist.barrier()

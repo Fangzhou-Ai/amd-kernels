@@ -3,16 +3,16 @@
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 # Adapted from AMD-AGI/AKLR BF16 decode kernels (MIT), revision 551613c81ea1f232cadb72e6f4647f96152e67d4, through
 # aiter `ops/flydsl/kernels/gemm_a16w16_band_gfx950.py` (build_band_stream).
-"""Band-stream bf16 GEMM, N 20480 x K 7168, 1-256 rows: the lm_head shard with a row map and a push epilogue.
+"""Band-stream bf16 GEMM, N 20480 x K 7168, 1-96 rows: the lm_head shard with a row map and a push epilogue.
 
 Each of 256 workgroups owns 64 line-aligned weight rows plus a 16-row strip grouped by XCD (80 vocabulary columns) and
-all rows of the activation (one M band, BM <= 128). A and B stream HBM / L2 -> LDS by staged `buffer_load ... lds`
+all rows of the activation (one M band, BM <= 96). A and B stream HBM / L2 -> LDS by staged `buffer_load ... lds`
 DMAs into a ring of STAGES slots (BLOCK_K = 128); fragment reads and the next stage's DMAs are interleaved with the
 MFMAs. B is non-temporal; A stays cached; each workgroup starts its K loop at a staggered block (K_STAGGER) so the
 concurrent reads of A spread over L2 channels; each output keeps one fixed K summation order, no split-K, no atomics.
 
 Differences from the aiter kernel: the row count is a runtime argument (rows past it read zero through the buffer
-bound), the bands above 128 rows run BLOCK_K = 64, the activation rows are read through an optional device row map, and
+bound), the activation rows are read through an optional device row map, and
 the push modes send the output rows straight to the receivers' buffers of the exchange
 (`collectives/all_to_all_bf16_n20480_ranks8`: the owner of each row, or every rank) with system-scope stores, then
 publish with a two-level ticket (per XCD, then across the eight XCDs).
@@ -39,10 +39,6 @@ BANDS = (
     (64, 64, 96, 3, 2, 2, 1, 2, 128),
     (80, 80, 80, 3, 1, 5, 1, 17, 128),
     (96, 96, 96, 3, 2, 2, 1, 2, 128),
-    (128, 128, 80, 3, 4, 1, 1, 17, 128),
-    (160, 160, 80, 4, 5, 1, 1, 17, 64),
-    (192, 192, 80, 2, 4, 1, 1, 17, 128),
-    (256, 256, 80, 3, 4, 1, 1, 17, 64),
 )
 MAX_ROWS = BANDS[-1][0]
 _OOB = 0x7FFFFFF0  # a byte offset past every buffer bound: the DMA reads zeros with no traffic
@@ -91,8 +87,9 @@ def band_of(m: int) -> tuple:
     return next(row for row in BANDS if m <= row[0])
 
 
-def compile_band_gemm(band: tuple, push: str | None = None):
-    """The launcher of one M band; ``push``: the row-mapped GEMM sending its rows to ``owner`` ranks or ``all``."""
+def compile_band_gemm(band: tuple, push: str | None = None, gather: bool = False):
+    """The launcher of one M band; ``gather``: the activation rows come through a device row map; ``push``: the
+    row-mapped GEMM sending its rows to ``owner`` ranks or ``all`` (implies the row map)."""
     _, TILE_M, TILE_N, STAGES, BLOCK_M_WARPS, BLOCK_N_WARPS, K_STAGGER, C_AUX, BLOCK_K = band
     WARP_SIZE = 64
     VMCNT_MAX = 63
@@ -150,7 +147,9 @@ def compile_band_gemm(band: tuple, push: str | None = None):
     _nd = len(PIPE_ITEMS)
     PIPE_BOUNDS = [0, (_nd + 1) // 2, _nd] + [_nd] * (WARP_K_STEPS - 2)
     assert push in (None, "owner", "all")
-    name = f"bf16_gemm_n20480_k7168_band_tm{TILE_M}_bk{BLOCK_K}" + (f"_push_{push}" if push else "")
+    rowmap = gather or bool(push)
+    name = (f"bf16_gemm_n20480_k7168_band_tm{TILE_M}_bk{BLOCK_K}" + (f"_push_{push}" if push else "")
+            + ("_gather" if gather and not push else ""))
 
     @flyc.kernel(name=name, known_block_size=[BLOCK_THREADS, 1, 1])
     def kernel(arg_x: fx.Int64, arg_w: fx.Int64, arg_y: fx.Int64, arg_indices: fx.Tensor, i32_xrows: fx.Int32,
@@ -217,7 +216,7 @@ def compile_band_gemm(band: tuple, push: str | None = None):
             k_local_idx = global_tid % LDG_X_THREADS_AS * LDG_ASYNC_VEC_SIZE
             a_col_sw.append(_swizzle_xor16(m_local_idx, k_local_idx * DTYPE_BYTES, k_blocks16))
             live = fx.Int32(m_local_idx) < i32_m
-            if const_expr(push):
+            if const_expr(rowmap):
                 src_row = fx.Int32(arg_indices[live.select(fx.Int32(m_local_idx), fx.Int32(0))])
             else:
                 src_row = fx.Int32(m_local_idx)

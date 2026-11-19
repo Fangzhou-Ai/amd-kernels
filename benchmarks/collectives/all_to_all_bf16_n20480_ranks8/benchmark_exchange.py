@@ -36,8 +36,7 @@ def worker(rank, ms, tokens, port):
     from vllm.distributed.parallel_state import get_tp_group, graph_capture
     from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
     from amd_kernels.collectives.all_to_all_bf16_n20480_ranks8 import RowAllToAll
-    from amd_kernels.gemm.bf16_n20480_k7168 import bf16_gemm_n20480_k7168
-
+    
     with set_current_vllm_config(VllmConfig()):
         init_distributed_environment(WORLD, rank, f"tcp://127.0.0.1:{port}", rank, "nccl")
         initialize_model_parallel(tensor_model_parallel_size=WORLD)
@@ -101,12 +100,10 @@ def worker(rank, ms, tokens, port):
                 return recv.view(WORLD, counts[rank], N).permute(1, 0, 2).reshape(counts[rank], WORLD * N)
 
             def this_ag(i):
-                bf16_gemm_n20480_k7168(xs[i], ws[i % 3], row_indices=ident, push=(comm.send_args(i % 2), None))
-                return comm.wait().recv(m, i % 2)
+                return comm.gemm_exchange(xs[i], ws[i % 3], ident, None, i % 2).recv(m, i % 2)
 
             def this_owner(i):
-                bf16_gemm_n20480_k7168(xs[i], ws[i % 3], row_indices=idx, push=(comm.send_args(i % 2), cs))
-                return comm.wait().recv(max(counts[rank], 1), i % 2)
+                return comm.gemm_exchange(xs[i], ws[i % 3], idx, cs, i % 2).recv(max(counts[rank], 1), i % 2)
 
             res = [timed(f) for f in (vllm_ag, vllm_a2a, this_ag, this_owner)]
             if rank == 0:
@@ -122,7 +119,7 @@ def worker(rank, ms, tokens, port):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("ms", type=int, nargs="*", default=[12, 24, 40, 65, 80, 128, 192])
+    p.add_argument("ms", type=int, nargs="*", default=[12, 24, 40, 65, 80, 96, 128, 160, 192])
     p.add_argument("--tokens", type=int, default=4, help="rows per request")
     a = p.parse_args()
     mp.spawn(worker, args=(a.ms, a.tokens, 29700 + os.getpid() % 200), nprocs=WORLD)

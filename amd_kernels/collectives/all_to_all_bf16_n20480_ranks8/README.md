@@ -16,8 +16,11 @@ block per rank mapped into every peer over HIP IPC, system-scope stores, a two-l
 - `RowAllToAll.warmup`: a collective before capture; compiles both pushes and the wait.
 - `RowAllToAll.__call__`: push of rows `[rows, 20480]` (owner-sorted with `counts`, a CUDA int32 `[8]` the same on every
   rank; or all-gather without) and wait; read the rows with `recv(n)`.
-- `RowAllToAll.send_args`, `RowAllToAll.wait`, `RowAllToAll.recv`: for a producer that pushes the rows itself
-  (`gemm/bf16_n20480_k7168`), then the wait and the in-place view.
+- `RowAllToAll.gemm_exchange`: the lm_head shard GEMM (`gemm/bf16_n20480_k7168`) of `x[row_indices]` and the exchange of its
+  output in one call: the GEMM pushes its rows itself up to 96 rows (owner mode) / 24 rows (all-gather), above that it writes them
+  locally and one contiguous push moves them. This is the entry the model calls.
+- `RowAllToAll.send_args`, `RowAllToAll.wait`, `RowAllToAll.recv`: for a producer that pushes the rows itself, then the wait and
+  the in-place view.
 - `RowAllToAll.close`: a collective, after every graph that uses the communicator is retired.
 
 All ranks call every exchange in the same order, empty receivers included; one communicator per stream.
@@ -28,25 +31,27 @@ MI355X, eight ranks, `benchmark_exchange.py`: hidden rows replicated, owner-sort
 request), the lm_head GEMM included in every column, graph replay of 6 distinct inputs over three weight copies (880 MB),
 minimum of nine rounds, MAX over ranks, us per call. `vLLM AG` = `rocm_unquantized_gemm_impl` +
 `tensor_model_parallel_all_gather` (served today); `vLLM A2A` = GEMM + `all_to_all_single` + permute (vLLM's batch-sharded
-sampling); `this AG` / `this owner` = `bf16_gemm_n20480_k7168` pushing to every rank / to the owners + `wait` (rows read in
-place). Ceiling = the GEMM at its HBM or MFMA ceiling (6.5 TB/s / 1.5 PF) + 2.4 us (wait launch gap 1.6 + one flag hop 0.8)
-+ the busiest link's bytes at 49 GB/s (the measured 8-GPU all-to-all, 343 GB/s out over seven links).
+sampling); `this AG` / `this owner` = `gemm_exchange` to every rank / to the owners (rows read in place). Ceiling = the GEMM at
+its HBM or MFMA ceiling (6.5 TB/s / 1.5 PF) + 2.4 us (wait launch gap 1.6 + one flag hop 0.8) + the busiest link's bytes at
+49 GB/s (the measured 8-GPU all-to-all: 343 GB/s out over seven links), the push counted after the GEMM.
 
-| M | 12 | 24 | 40 | 65 | 80 | 128 | 192 |
-|---|---|---|---|---|---|---|---|
-| vLLM AG | 88.3 | 102.6 | 137.0 | 175.3 | 193.3 | 257.8 | 354.1 |
-| vLLM A2A | 76.4 | 72.6 | 86.8 | 95.1 | 99.2 | 105.7 | 129.5 |
-| this AG | 61.8 | 81.2 | 99.4 | 137.3 | 158.1 | 224.4 | 308.1 |
-| this owner | 53.1 | 54.6 | 58.7 | 63.9 | 68.0 | 83.8 | 116.3 |
-| owner vs AG / vs A2A | 1.66x / 1.44x | 1.88x / 1.33x | 2.33x / 1.48x | 2.74x / 1.49x | 2.84x / 1.46x | 3.08x / 1.26x | 3.04x / 1.11x |
-| owner ceiling | 50.9 | 51.0 | 54.3 | 55.2 | 57.8 | 61.2 | 68.1 |
-| owner % of ceiling | 96 | 93 | 93 | 86 | 85 | 73 | 59 |
-| AG % of ceiling | 93 | 83 | 82 | 74 | 73 | 69 | 68 |
+| M | 12 | 24 | 40 | 65 | 80 | 96 | 128 | 160 | 192 |
+|---|---|---|---|---|---|---|---|---|---|
+| vLLM AG | 88.5 | 102.1 | 136.5 | 174.8 | 192.4 | 206.6 | 255.6 | 307.2 | 351.5 |
+| vLLM A2A | 77.3 | 72.5 | 86.8 | 95.5 | 99.6 | 92.2 | 107.2 | 122.3 | 130.3 |
+| this AG | 61.9 | 80.0 | 90.5 | 114.4 | 128.5 | 144.1 | 174.1 | 208.4 | 238.9 |
+| this owner | 53.1 | 54.1 | 59.0 | 63.5 | 68.3 | 72.6 | 80.9 | 91.8 | 97.8 |
+| owner vs vLLM AG / A2A | 1.67x / 1.46x | 1.89x / 1.34x | 2.31x / 1.47x | 2.75x / 1.50x | 2.82x / 1.46x | 2.85x / 1.27x | 3.16x / 1.33x | 3.35x / 1.33x | 3.59x / 1.33x |
+| owner ceiling | 50.9 | 51.0 | 54.3 | 55.2 | 57.8 | 57.8 | 61.2 | 64.6 | 68.1 |
+| owner % of ceiling | 96 | 94 | 92 | 87 | 85 | 80 | 76 | 70 | 70 |
+| AG % of ceiling | 93 | 85 | 90 | 89 | 89 | 89 | 89 | 87 | 87 |
 
-The part above the ceiling at M >= 128 is mostly the GEMM (80 us at 192 against a 47 us ceiling: `gemm/bf16_n20480_k7168`'s README);
-the exchange itself: owner mode costs 9 us (M 12) to 36 us (M 192) over the plain GEMM, ~87 % of (our GEMM + the exchange
-ceiling) at M 192. Skeleton measurements of the earlier pull design (stage 3.6-6.1 us, pull 6.1 / 16.7 / 29.6 us at M 12 / 80 /
-192, all-gather pull at 94 % of the measured 8-GPU ingress): the push cut one remote round trip (about -10 us at small M).
+The GEMM's own push loses to a local write and one contiguous push above 96 rows (owner) / ~24 rows (all-gather): the tile's 320-byte
+row segments reach the receivers' HBM at a fraction of the rate of full-row streams (store-only pushes at 192 rows: 160 B segments 68 us,
+320 B 54, 640 B 49, 1280 B 43, this entry's 20 KB streams 35). Standalone push + wait: 13.3 / 18.6 / 23.7 / 32.8 us at M 12 / 80 / 128 / 192
+against link floors of 4 / 11 / 16 / 22.5 us at 49 GB/s: 80 % of the floor at 192 rows (below 4 MB per peer the xGMI ramp, not the
+link, binds). Pipelining the push with the GEMM is not possible: every output tile completes with the last K block, and
+splitting the rows into two passes re-reads the weights (+42 us); the evidence is in `analysis/kernels/bf16_n20480_k7168.md`.
 
 ## Tests
 ```bash
