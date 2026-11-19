@@ -21,6 +21,8 @@ One line per kernel package. Each package's README has what it does, its entry p
 
 - [`moe/mxfp4_h6144_i768_e128_top4`](moe/mxfp4_h6144_i768_e128_top4/README.md): routed MXFP4 experts (A4W4) with the
   MXFP8 shared expert.
+- [`moe/mxfp4_h3584_i3072_e896_top16`](moe/mxfp4_h3584_i3072_e896_top16/README.md): routed MXFP4 experts (A4W4, SiTUv2)
+  of one Kimi-K3.1 TP8 rank: activation quant, GEMM1 + GEMM2 in one launch, deterministic top-16 sum.
 
 ## Attention
 

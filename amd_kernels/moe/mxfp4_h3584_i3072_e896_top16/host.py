@@ -132,19 +132,17 @@ def _experts(x_codes: torch.Tensor, x_scales: torch.Tensor, weights: MoeWeights,
     stream = torch.cuda.current_stream()
     ws = _workspace(dev, stream.cuda_stream)
     xq, xs = x_codes.view(torch.uint8).view(-1), x_scales.view(torch.uint8).view(-1)
-    args = (sort.sorted_token_ids, sort.sorted_expert_ids, sort.num_valid_ids)
+    ids, wt, eids, nv = sort.sorted_token_ids, sort.sorted_weights, sort.sorted_expert_ids, sort.num_valid_ids
     if fused:
-        _run(compile_fused(reduce=False), xq, xs, weights.w13.view(-1), weights.s13.view(-1), weights.w2.view(-1),
-             weights.s2.view(-1), ws["q"].view(-1), ws["qs"].view(-1), ws["slots"].view(-1), out.view(-1),
-             sort.sorted_token_ids, sort.sorted_weights, sort.sorted_expert_ids, sort.num_valid_ids,
-             sort.reverse_sorted, m, cap, ws["ready"].data_ptr(), 0, stream)
+        _run(compile_fused(), xq, xs, weights.w13.view(-1), weights.s13.view(-1), weights.w2.view(-1), weights.s2.view(-1),
+             ws["q"].view(-1), ws["qs"].view(-1), ws["slots"].view(-1), ids, wt, eids, nv, m, cap,
+             ws["ready"].data_ptr(), stream)
     else:
-        _run(compile_gemm1(), xq, xs, weights.w13.view(-1), weights.s13.view(-1), ws["q"].view(-1),
-             ws["qs"].view(-1), *args, m, cap, stream)
-        _run(compile_gemm2(reduce=False, pf=3), ws["q"].view(-1), ws["qs"].view(-1), weights.w2.view(-1),
-             weights.s2.view(-1), ws["slots"].view(-1), out.view(-1), sort.sorted_token_ids, sort.sorted_weights,
-             sort.sorted_expert_ids, sort.num_valid_ids, sort.reverse_sorted, m, cap, 0, stream)
-    _run(compile_reduce(), ws["slots"].view(-1), out.view(-1), sort.num_valid_ids, sort.reverse_sorted, m, cap, stream)
+        _run(compile_gemm1(), xq, xs, weights.w13.view(-1), weights.s13.view(-1), ws["q"].view(-1), ws["qs"].view(-1),
+             ids, eids, nv, m, cap, stream)
+        _run(compile_gemm2(), ws["q"].view(-1), ws["qs"].view(-1), weights.w2.view(-1), weights.s2.view(-1),
+             ws["slots"].view(-1), ids, wt, eids, nv, m, cap, stream)
+    _run(compile_reduce(), ws["slots"].view(-1), out.view(-1), sort.reverse_sorted, m, cap, stream)
     return out
 
 

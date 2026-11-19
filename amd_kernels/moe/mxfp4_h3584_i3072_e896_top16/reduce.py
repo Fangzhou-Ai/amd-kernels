@@ -1,33 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Sum of the 16 slot partials of every token in slot order (fp32), rounded once to BF16."""
+"""Sum of the 16 slot rows of every token in slot order (fp32), rounded once to BF16: two workgroups (column halves of
+224 threads x 8 columns) per token, the slot rows found by ``reverse_sorted``."""
 import functools
 import flydsl.compiler as flyc
-from amd_kernels.warm_up import launcher
 import flydsl.expr as fx
 from amd_kernels.common import buffer_ops
+from amd_kernels.warm_up import launcher
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
 from .common import H, TOPK
-from .sync import poll_first, wait_count
 
-HALF = H // 2  # columns per tile: 224 threads x 8
+HALF = H // 2  # columns per workgroup
 
 
 @functools.cache
-def compile_reduce_tile(*, bm=16, tiles_per_block=14):
-    """Tile (token, half) of the reduction (256 threads, 224 used). With ``done`` != 0 it first waits until the counter
-    shows every GEMM2 tile of the call stored (``tiles_per_block`` per active m-block); the last of the 2 m tiles
-    resets it."""
+@launcher
+def compile_reduce(*, name_suffix=""):
+    name = f"moe_reduce_slots_h{H}_top{TOPK}{name_suffix}"
 
-    @flyc.jit
-    def tile(rb, SL, OUT, NV, REV, m, rows, done):
+    @flyc.kernel(name=name, known_block_size=[256, 1, 1])
+    def kernel(SL: fx.Tensor, OUT: fx.Tensor, REV: fx.Tensor, m: fx.Int32, rows: fx.Int32):
         tx = fx.thread_idx.x
+        rb = fx.Int32(fx.block_idx.x)
         t, half = rb // 2, rb % 2
-        if done != fx.Int64(0):
-            need = fx.Int32(NV[0]) // bm * tiles_per_block
-            wait_count(done, need, fx.Int32(2) * m, poll_first(done))
         if tx < HALF // 8:
             sr = buffer_ops.create_buffer_resource(SL, max_size=False, num_records_bytes=rows * H * 2)
             orr = buffer_ops.create_buffer_resource(OUT, max_size=False, num_records_bytes=m * H * 2)
@@ -44,23 +41,9 @@ def compile_reduce_tile(*, bm=16, tiles_per_block=14):
                   for i in range_constexpr(4)]
             buffer_ops.buffer_store(Vec.from_elements(pk, fx.Int32), orr, (t * H + half * HALF) // 2 + tx * 4)
 
-    return tile
-
-
-@functools.cache
-@launcher
-def compile_reduce(*, name_suffix=""):
-    tile = compile_reduce_tile()
-    name = f"moe_reduce_slots_h{H}_top{TOPK}{name_suffix}"
-
-    @flyc.kernel(name=name, known_block_size=[256, 1, 1])
-    def kernel(SL: fx.Tensor, OUT: fx.Tensor, NV: fx.Tensor, REV: fx.Tensor, m: fx.Int32, rows: fx.Int32):
-        tile(fx.Int32(fx.block_idx.x), SL, OUT, NV, REV, m, rows, fx.Int64(0))
-
     @flyc.jit
-    def launch(SL: fx.Tensor, OUT: fx.Tensor, NV: fx.Tensor, REV: fx.Tensor, m: fx.Int32, rows: fx.Int32,
-               stream: fx.Stream):
-        kernel(SL, OUT, NV, REV, m, rows).launch(grid=(m * 2, 1, 1), block=(256, 1, 1), stream=stream)
+    def launch(SL: fx.Tensor, OUT: fx.Tensor, REV: fx.Tensor, m: fx.Int32, rows: fx.Int32, stream: fx.Stream):
+        kernel(SL, OUT, REV, m, rows).launch(grid=(m * 2, 1, 1), block=(256, 1, 1), stream=stream)
 
     launch.kernel_name = name
     return launch
