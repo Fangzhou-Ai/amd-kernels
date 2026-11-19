@@ -153,6 +153,25 @@ def test_negative_scores():
     check_selection(idx, val, reference_logits(inputs), rtol=LOGIT_RTOL)
 
 
+@pytest.mark.parametrize("kind", ["tied", "hot", "random"])
+def test_repeated_calls_are_stable(kind):
+    """Back-to-back launches (the merge workgroups wait on counts the chunk workgroups leave; LDS and scratch hold the
+    last call's data) all give the same selection."""
+    require_gfx950()
+    kw = dict(hot=((10000, 14000, 4),)) if kind == "hot" else {}
+    inputs = make_inputs(2, 2, 16384, lengths=[16384, 16000], seed=4, positive_weights=kind == "tied", **kw)
+    if kind == "tied":
+        payload, scales = host.cache_views(inputs["cache"])
+        payload.fill_(0x24)
+        scales.fill_(121)
+    first = run(inputs)
+    for _ in range(40):
+        idx, val = run(inputs)
+        assert (idx >= 0).sum(1).tolist() == (first[0] >= 0).sum(1).tolist()
+        assert torch.equal(val.sort(1).values, first[1].sort(1).values)
+    check_selection(first[0], first[1], reference_logits(inputs), rtol=LOGIT_RTOL)
+
+
 def test_deterministic():
     require_gfx950()
     inputs = make_inputs(6, 4, 24576, seed=8, hot=((10000, 14000, 4),))

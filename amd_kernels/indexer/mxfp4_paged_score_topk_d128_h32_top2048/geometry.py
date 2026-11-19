@@ -24,6 +24,8 @@ QMAX = 6  # query rows a sequence may have
 MAX_ROWS = 256  # rows one call may hold
 INFO_OFFSET = MAX_ROWS * NCH_MAX * 16  # bytes: the per-row records follow the meta plane
 OVF_KEYS = 7 * 2048  # keys of chunks the merge reads whole
+COUNTER_BYTES = 256  # a (sequence, row tile)'s ready and consumer counts: a cache line pair of their own
+COUNTER_GROUPS = 1024  # (sequence, row tile) groups a call may hold
 FULL_STRIDE = NCH_MAX * CHUNK_MAX  # a row's plane of all scores of its truncated chunks
 import os
 TBDIV = int(os.environ.get('KK_TBDIV', '4'))
@@ -72,6 +74,8 @@ def slot_size(tb):
     return tb + tb // 8
 
 
-def scratch_words(max_rows: int) -> tuple[int, int, int, int]:
-    """Words of the key plane, the position plane, the meta plane and the full-score plane for ``max_rows`` rows."""
-    return max_rows * POOL, max_rows * POOL, max_rows * NCH_MAX * 4 + MAX_ROWS * 4, max_rows * FULL_STRIDE
+def scratch_words(max_rows: int) -> tuple[int, int, int, int, int]:
+    """Words of the key plane, the position plane, the meta plane, the full-score plane for ``max_rows`` rows and the
+    ready counts."""
+    return (max_rows * POOL, max_rows * POOL, max_rows * NCH_MAX * 4 + MAX_ROWS * 4, max_rows * FULL_STRIDE,
+            COUNTER_GROUPS * COUNTER_BYTES // 4)

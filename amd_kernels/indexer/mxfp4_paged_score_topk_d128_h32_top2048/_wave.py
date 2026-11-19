@@ -14,6 +14,15 @@ from flydsl.expr.typing import T, as_ir_value
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 
 I, F, I64 = fx.Int32, fx.Float32, fx.Int64
+SC1 = 16  # cache modifier: agent-scope (write-through stores, coherent loads); the XCDs' L2s are not coherent
+AtomicBinOp = llvm.AtomicBinOp
+
+
+def atomic_agent(op, addr_i64, value):
+    """``old = *addr; *addr (op)= value`` on a global i32, device (agent) scope, relaxed."""
+    ptr = fx.inttoptr(fx.PointerType.get(T.i32, address_space=fx.AddressSpace.Global, alignment=4), I64(addr_i64))
+    return I(llvm.AtomicRMWOp(op, ptr.llvm_ptr, I(value).ir_value(), llvm.AtomicOrdering.monotonic, syncscope="agent",
+                              alignment=4).result)
 INT_MIN = -(1 << 31)
 INT_MAX = (1 << 31) - 1
 
@@ -93,6 +102,27 @@ def score_key(bits):
 
 def key_to_float(key):
     return (key < 0).select(key ^ I(0x7FFFFFFF), key).bitcast(F)
+
+
+class _View:
+    def __init__(self, ptr):
+        self.ptr = ptr
+
+
+def layout(**sizes):
+    """Word offsets (16-byte aligned) of fields of the given sizes in one block, and the block's size."""
+    offs, at = {}, 0
+    for name, n in sizes.items():
+        offs[name] = at
+        at += -(-n // 4) * 4
+    return offs, at
+
+
+def carve(raw, **fields):
+    """Views (``.ptr``) of fields at word offsets of one shared array: roles of a fused kernel share one LDS block."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(**{name: _View(fx.add_offset(raw.ptr, off)) for name, off in fields.items()})
 
 
 def store_lds(field, idx, v):

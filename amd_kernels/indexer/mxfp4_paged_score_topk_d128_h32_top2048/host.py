@@ -8,10 +8,11 @@ import torch
 
 from amd_kernels.warm_up import entry
 
+from . import fused as _fused
 from . import lists as _lists
 from . import merge as _merge
 from .geometry import (CHUNK_MAX, CHUNKS_TARGET, MAX_ROWS, NCH_MAX, QMAX, TOPK, chunk_size, list_size, num_chunks,
-                       scratch_words, slot_size)
+                       scratch_words, slot_size, COUNTER_GROUPS)
 
 HEADS = 32
 _WIDE_BATCH = 16  # sequences above which a workgroup scores all rows of a sequence
@@ -93,6 +94,11 @@ def merge_blocks(width: int, target: int) -> int:
 
 
 @functools.cache
+def _fused_exe(rows: int, blocks: int, uniform: bool = False, timing: bool = False):
+    return _fused.compile_fused(rows, blocks, uniform, timing)
+
+
+@functools.cache
 def _merge_exe(blocks: int, uniform: bool = False, timing: bool = False):
     return _merge.compile_merge(blocks, uniform, timing)
 
@@ -110,6 +116,7 @@ def _score_topk(
     out_scores: torch.Tensor,
     uniform: bool = False,
     dbg: torch.Tensor | None = None,
+    split: bool = False,
 ) -> None:
     rows = q_payload.shape[0]
     batch = query_start_loc.numel() - 1
@@ -126,7 +133,7 @@ def _score_topk(
         raise ValueError(f"at most {NCH_MAX * CHUNK_MAX} keys a sequence, got a block table of {width}")
     tile, target = plan(max_query_len, batch)
     nch = grid_chunks(width, target)
-    keys, pos, meta, full = _scratch(cache.device)
+    keys, pos, meta, full, cnt = _scratch(cache.device)
     stream = torch.cuda.current_stream()
     common = (
         q_payload.data_ptr(), q_scales.data_ptr(), payload.data_ptr(), scales.data_ptr(), block_table.data_ptr(),
@@ -134,13 +141,22 @@ def _score_topk(
     )
     geom = (block_table.stride(0), cache.stride(0), cache.shape[0] - 1, batch)
     tiles = -(-max_query_len // tile)
+    tiles = -(-max_query_len // tile)
+    assert batch * tiles <= COUNTER_GROUPS
+    blocks = merge_blocks(width, target)
+    dbg_ptr = dbg.data_ptr() if dbg is not None else 0
+    if not split:
+        _run_compiled(_fused_exe(tile, blocks, uniform, dbg is not None), *common, keys.data_ptr(), pos.data_ptr(),
+                      meta.data_ptr(), full.data_ptr(), cnt.data_ptr(), out_indices.data_ptr(), out_scores.data_ptr(),
+                      *geom, nch, max_query_len, target, out_indices.stride(0), out_scores.stride(0), tiles, tile,
+                      batch * nch * tiles, dbg_ptr, batch * nch * tiles + rows, stream)
+        return
     _run_compiled(_chunk_exe(tile, uniform, dbg is not None), *common, keys.data_ptr(), pos.data_ptr(), meta.data_ptr(),
-                  full.data_ptr(), *geom, nch, max_query_len, target, dbg.data_ptr() if dbg is not None else 0,
-                  batch * nch * tiles, stream)
-    _run_compiled(_merge_exe(merge_blocks(width, target), uniform, dbg is not None), query_start_loc.data_ptr(), keys.data_ptr(), pos.data_ptr(),
+                  full.data_ptr(), *geom, nch, max_query_len, target, dbg_ptr, batch * nch * tiles, stream)
+    _run_compiled(_merge_exe(blocks, uniform, dbg is not None), query_start_loc.data_ptr(), keys.data_ptr(), pos.data_ptr(),
                   meta.data_ptr(), full.data_ptr(), out_indices.data_ptr(), out_scores.data_ptr(), batch,
                   out_indices.stride(0), out_scores.stride(0), max_query_len,
-                  dbg.data_ptr() + 4 * 4096 * 16 if dbg is not None else 0, rows, stream)
+                  dbg_ptr + 4 * 4096 * 16 if dbg is not None else 0, rows, stream)
 
 
 def prefer_fused(batch: int, width: int) -> bool:

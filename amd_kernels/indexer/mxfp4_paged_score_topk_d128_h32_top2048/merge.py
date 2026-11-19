@@ -25,8 +25,8 @@ from flydsl.expr import rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import T
 
-from ._wave import F, I, I64, INT_MAX, INT_MIN, ballot, inclusive_scan, key_to_float, now, readlane, store_lds, vop, wave_reduce
-from .geometry import FULL_STRIDE, INFO_OFFSET, NCH_MAX, OVF_KEYS, POOL, TOPK, list_size_rt, slot_size
+from ._wave import SC1, AtomicBinOp, atomic_agent, carve, layout, popcount, F, I, I64, INT_MAX, INT_MIN, ballot, inclusive_scan, key_to_float, now, readlane, store_lds, vop, wave_reduce
+from .geometry import COUNTER_BYTES, FULL_STRIDE, INFO_OFFSET, NCH_MAX, OVF_KEYS, POOL, TOPK, list_size_rt, slot_size
 
 NT = 512
 NWAVES = NT // 64
@@ -38,32 +38,50 @@ NUM_REC = 0x7FFFF000
 NEG_INF_BITS = 0xFF800000 - (1 << 32)
 
 
-@launcher
-def compile_merge(blocks: int, uniform: bool = False, timing: bool = False):
+@flyc.jit
+def wait_group(tid, lane, row, arg_qsl, arg_cnt, i32_batch, i32_tiles, i32_tile_rows, i32_nch_grid):
+    """Blocks the workgroup until every chunk workgroup of ``row``'s (sequence, row tile) has stored its lists and
+    taken its count (agent scope), then counts itself in; the group's last row resets both counts for the next call
+    (every row has passed its wait by then, and no chunk workgroup of the group is left)."""
+    qsl = buffer_ops.create_buffer_resource_from_addr(arg_qsl)
+    seq = I(0)
+    for k, st in range(0, (i32_batch + 63) // 64, 1, init=[I(0)]):
+        i = I(k) * 64 + lane
+        e = I(buffer_ops.buffer_load(qsl, fx.min(i + 1, i32_batch), vec_width=1, dtype=I))
+        seq = yield [st[0] + popcount(ballot((i < i32_batch) & (e <= row)))]
+    first = I(buffer_ops.buffer_load(qsl, seq, vec_width=1, dtype=I, is_scalar=True))
+    last = I(buffer_ops.buffer_load(qsl, seq + 1, vec_width=1, dtype=I, is_scalar=True))
+    t = (row - first) // i32_tile_rows
+    rows_in = fx.min(i32_tile_rows, last - first - t * i32_tile_rows)
+    addr = arg_cnt + I64((seq * i32_tiles + t) * COUNTER_BYTES)
+    if tid == 0:
+        got = atomic_agent(AtomicBinOp.add, addr, 0)
+        while got < i32_nch_grid:
+            rocdl.s_sleep(2)
+            got = atomic_agent(AtomicBinOp.add, addr, 0)
+        old = atomic_agent(AtomicBinOp.add, addr + I64(4), 1)
+        if old == rows_in - 1:
+            atomic_agent(AtomicBinOp.xchg, addr, 0)
+            atomic_agent(AtomicBinOp.xchg, addr + I64(4), 0)
+    fx.gpu.barrier()
+
+
+def merge_parts(blocks: int, uniform: bool = False, timing: bool = False, sync: bool = False):
     """``blocks``: 2048-entry pool blocks a thread holds (the host picks the fewest that hold the widest pool)."""
     BLOCKS = blocks
-    name = f"mxfp4_paged_topk_merge_d128_h32_b{blocks}" + ("_u" if uniform else "") + ("_t" if timing else "")
+    CM = SC1 if sync else 0  # loads of what chunk workgroups of other XCDs stored: coherent
+    OFFS, WORDS = layout(bins=2 * BUF, scan=NWAVES + 1, acc=32, sidx=TOPK + NT + 4, sval=TOPK + NT + 4,
+                         ckey=NCAND + NT, cidx=NCAND + NT, cof=32)
 
-    @fx.struct
-    class Shared:
-        bins: fx.Array[fx.Int32, 2 * BUF]
-        scan: fx.Array[fx.Int32, NWAVES + 1]
-        acc: fx.Array[fx.Int32, 32]
-        sidx: fx.Array[fx.Int32, TOPK + NT + 4]
-        sval: fx.Array[fx.Int32, TOPK + NT + 4]
-        ckey: fx.Array[fx.Int32, NCAND + NT]
-        cidx: fx.Array[fx.Int32, NCAND + NT]
-        cof: fx.Array[fx.Int32, 32]
-
-    @flyc.kernel(name=name, known_block_size=[NT, 1, 1])
-    def kernel(arg_qsl: fx.Int64, arg_keys: fx.Int64, arg_idx: fx.Int64, arg_meta: fx.Int64, arg_full: fx.Int64,
-               arg_oidx: fx.Int64, arg_oval: fx.Int64, i32_batch: fx.Int32, i32_oidx_stride: fx.Int32,
-               i32_oval_stride: fx.Int32, i32_qlen: fx.Int32, arg_dbg: fx.Int64):
+    @flyc.jit
+    def role(smem, row, arg_qsl: fx.Int64, arg_keys: fx.Int64, arg_idx: fx.Int64, arg_meta: fx.Int64, arg_full: fx.Int64,
+             arg_oidx: fx.Int64, arg_oval: fx.Int64, i32_batch: fx.Int32, i32_oidx_stride: fx.Int32,
+             i32_oval_stride: fx.Int32, i32_qlen: fx.Int32, arg_cnt: fx.Int64, i32_tiles: fx.Int32, i32_tile_rows: fx.Int32,
+             i32_nch_grid: fx.Int32, arg_dbg: fx.Int64):
+        """The merge of row ``row``."""
         tid = I(fx.thread_idx.x)
         lane = tid % 64
         wave = I(rocdl.readfirstlane(T.i32, tid // 64))
-        row = I(fx.block_idx.x)
-        smem = fx.SharedAllocator().allocate(Shared).peek()
         lds_copy4 = fx.make_copy_atom(fx.UniversalCopy128b(), I)
         dbg = buffer_ops.create_buffer_resource_from_addr(arg_dbg, num_records_bytes=NUM_REC)
 
@@ -107,7 +125,7 @@ def compile_merge(blocks: int, uniform: bool = False, timing: bool = False):
             ok = e0 < nkeys
             q = fx.min(e0 // cb_, I(31))
             at = I(smem.cof.ptr[q]) * cb_ + (e0 - q * cb_)
-            v4 = fx.Vector(buffer_ops.buffer_load(full_, at, vec_width=4, dtype=I, mask=ok))
+            v4 = fx.Vector(buffer_ops.buffer_load(full_, at, vec_width=4, dtype=I, mask=ok, cache_modifier=CM))
             return [ok.select(I(v4[k]), I(INT_MIN)) for k in range(4)], at
 
         def hist_scan(base, need):
@@ -139,6 +157,7 @@ def compile_merge(blocks: int, uniform: bool = False, timing: bool = False):
                     lds_store4(smem.bins, base + j * 4, z)
 
         def radix_init():
+            fx.gpu.barrier()  # every wave has read the scanned histogram
             zero_bins(0, 0, NT)
             if tid == 0:
                 store_lds(smem.acc, 0, I(0))
@@ -278,23 +297,17 @@ def compile_merge(blocks: int, uniform: bool = False, timing: bool = False):
                         lds_add(smem.bins, (b1 != I(0)).select(b1 + ((b1 >> 5) << 2), I(HPAD) + tid), I(1))
 
         def scan_bin():
-            """Wave 0: the bin of the 2048th key into ``acc`` (0 and 13: the bin above which keys are taken, and
-            the bin whose keys are ranked; 1: keys above it; 2: keys in it). -> the bin, whether there are at most
-            2048 keys."""
+            """Every wave: the bin of the 2048th key of the histogram. -> the bin above which keys are taken, the bin
+            whose keys are ranked, the keys above it, the keys in it, whether there are at most 2048 keys, the bin."""
             d, above, total = hist_scan(0, I(TOPK))
             short = total <= TOPK
-            if lane == 0:
-                store_lds(smem.acc, 0, short.select(I(0), d))
-                store_lds(smem.acc, 13, short.select(I(0xFFFF), d))
-                store_lds(smem.acc, 1, short.select(total, above))
-                store_lds(smem.acc, 2, short.select(I(0), I(smem.bins.ptr[d + ((d >> 5) << 2)])))
-            return d, short
+            nc = short.select(I(0), I(smem.bins.ptr[d + ((d >> 5) << 2)]))
+            return short.select(I(0), d), short.select(I(0xFFFF), d), short.select(total, above), nc, short, d
 
-        def finish(keys, idxs, active, packed, st, inv, offset):
-            """The scanned bin is in ``acc``: place the keys above it, rank the keys in it, store. ``st``: streamed
-            replacement keys (None: the pool is all)."""
-            gt_thr, cand_val = I(smem.acc.ptr[0]), I(smem.acc.ptr[13])
-            above_n, nc = I(smem.acc.ptr[1]), I(smem.acc.ptr[2])
+        def finish(keys, idxs, active, packed, st, inv, offset, scanned):
+            """Place the keys above the scanned bin, rank the keys in it, store. ``st``: streamed replacement keys
+            (None: the pool is all)."""
+            gt_thr, cand_val, above_n, nc = scanned[0], scanned[1], scanned[2], scanned[3]
             if nc <= NCAND:
                 cg, cn = I(0), I(0)
                 for blk in range_constexpr(len(active)):
@@ -378,54 +391,41 @@ def compile_merge(blocks: int, uniform: bool = False, timing: bool = False):
                 idxv += [idx_raw[blk][k] for k in range(4)]
             nblk = (npool + (NT * 4 - 1)) // (NT * 4)
             active = [I(blk) < nblk for blk in range_constexpr(BLOCKS)]
-            if wave == 0:
-                inr = lane < nch
-                top = key_to_float(wave_reduce(inr.select(I(mt[2]), I(INT_MIN)), fx.max))
-                low = key_to_float(wave_reduce(inr.select(I(mt[3]), I(INT_MAX)), fx.min))
-                span = top - low
-                inv = (span > F(0.0)).select(F(TOPK - 2) / span, F(0.0))
-                if lane == 0:
-                    store_lds(smem.acc, 8, inv.bitcast(I))
-                    store_lds(smem.acc, 9, (F(0.0) - low * inv).bitcast(I))
-                    store_lds(smem.acc, 12, low.bitcast(I))
-            fx.gpu.barrier()
+            # every wave reduces the chunks' extremes itself (lane = chunk): no exchange
+            inr = lane < nch
+            top = key_to_float(wave_reduce(inr.select(I(mt[2]), I(INT_MIN)), fx.max))
+            low = key_to_float(wave_reduce(inr.select(I(mt[3]), I(INT_MAX)), fx.min))
+            span = top - low
+            inv = (span > F(0.0)).select(F(TOPK - 2) / span, F(0.0))
+            offset = F(0.0) - low * inv
             stamp(2)
-            inv = I(smem.acc.ptr[8]).bitcast(F)
-            offset = I(smem.acc.ptr[9]).bitcast(F)
             packed = bins_of(keys, active, inv, offset)
             hist_add(packed, active)
             fx.gpu.barrier()
-            if wave == 0:
-                d, short = scan_bin()
-                # chunks that may hold keys above the bin's lower edge beyond their lists
-                low = I(smem.acc.ptr[12]).bitcast(F)
-                edge = (inv > F(0.0)).select(low + (d - 1).to(F) / inv, low)
-                counts = I(mt[1])
-                sat = (lane < nch - 1) & ((counts >> 16) > (counts & 0xFFFF)) & (short | (key_to_float(I(mt[0])) > edge))
-                m = fx.Int64(rocdl.ballot(T.i64, sat))
-                if lane == 0:
-                    store_lds(smem.acc, 4, m.to(I))
-                    store_lds(smem.acc, 5, (m >> I64(32)).to(I))
-                if m != 0:
+            scanned = scan_bin()
+            # chunks that may hold keys above the bin's lower edge beyond their lists
+            edge = (inv > F(0.0)).select(low + (scanned[5] - 1).to(F) / inv, low)
+            counts = I(mt[1])
+            sat = (lane < nch - 1) & ((counts >> 16) > (counts & 0xFFFF)) & (scanned[4] | (key_to_float(I(mt[0])) > edge))
+            m = fx.Int64(rocdl.ballot(T.i64, sat))
+            stamp(3)
+            if m == 0:
+                finish(keys, idxv, active, packed, None, inv, offset, scanned)
+                stamp(5)
+            else:
+                nsat = I(fx.math.ctpop(m).to(I))
+                if wave == 0:
                     for q, sq in range(0, 32, 1, init=[m]):
                         left = I64(sq[0])
                         if left != 0:
                             if lane == 0:
                                 store_lds(smem.cof, I(q), I(fx.math.cttz(left).to(I)))
                         rest = yield [left & (left - 1)]
-            fx.gpu.barrier()
-            stamp(3)
-            m_lo, m_hi = I(smem.acc.ptr[4]), I(smem.acc.ptr[5])
-            if (m_lo | m_hi) == 0:
-                finish(keys, idxv, active, packed, None, inv, offset)
-                stamp(5)
-            else:
-                msat = (I64(m_hi) << I64(32)) | (I64(m_lo) & I64(0xFFFFFFFF))
-                nsat = I(fx.math.ctpop(msat).to(I))
+                fx.gpu.barrier()
                 keys2 = []
                 for blk in range_constexpr(BLOCKS):
                     li = fx.min((blk * (NT * 4) + tid * 4) // slot, I(63))
-                    is_sat = ((msat >> I64(li)) & I64(1)) != I64(0)
+                    is_sat = ((m >> I64(li)) & I64(1)) != I64(0)
                     for k in range_constexpr(4):
                         keys2.append(is_sat.select(I(INT_MIN), keys[blk * 4 + k]))
                 full = buffer_ops.create_buffer_resource_from_addr(arg_full + I64(row) * (FULL_STRIDE * 4), num_records_bytes=FULL_STRIDE * 4)
@@ -441,10 +441,9 @@ def compile_merge(blocks: int, uniform: bool = False, timing: bool = False):
                         b1 = bin_key(ks[k], inv, offset)
                         lds_add(smem.bins, (b1 != I(0)).select(b1 + ((b1 >> 5) << 2), I(HPAD) + tid), I(1))
                 fx.gpu.barrier()
-                if wave == 0:
-                    scan_bin()
+                scanned2 = scan_bin()
                 fx.gpu.barrier()
-                finish(keys2, idxv, active, packed2, st, inv, offset)
+                finish(keys2, idxv, active, packed2, st, inv, offset, scanned2)
                 stamp(5)
 
         stamp(0)
@@ -452,23 +451,24 @@ def compile_merge(blocks: int, uniform: bool = False, timing: bool = False):
             qsl_end = i32_batch * i32_qlen
         else:
             qsl_end = I(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_qsl), i32_batch, vec_width=1, dtype=I, is_scalar=True))
-        inf = fx.Vector(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_meta + INFO_OFFSET, num_records_bytes=NUM_REC), row * 4, vec_width=4, dtype=I, is_scalar=True))
-        cb, nch = I(inf[0]), I(inf[1])
-        tb = list_size_rt(nch, cb)
-        npool = (nch - 1) * slot_size(tb) + cb
-        nblk = (npool + (NT * 4 - 1)) // (NT * 4)
+        if fx.const_expr(sync):
+            if row < qsl_end:
+                wait_group(tid, lane, row, arg_qsl, arg_cnt, i32_batch, i32_tiles, i32_tile_rows, i32_nch_grid)
+        info_r = buffer_ops.create_buffer_resource_from_addr(arg_meta + INFO_OFFSET, num_records_bytes=NUM_REC)
+        if fx.const_expr(sync):
+            inf = fx.Vector(buffer_ops.buffer_load(info_r, row * 4, vec_width=4, dtype=I, cache_modifier=CM))
+            cb, nch = I(rocdl.readfirstlane(T.i32, inf[0])), I(rocdl.readfirstlane(T.i32, inf[1]))
+        else:
+            inf = fx.Vector(buffer_ops.buffer_load(info_r, row * 4, vec_width=4, dtype=I, is_scalar=True))
+            cb, nch = I(inf[0]), I(inf[1])
         lk = buffer_ops.create_buffer_resource_from_addr(arg_keys + I64(row) * (POOL * 4), num_records_bytes=POOL * 4)
         lx = buffer_ops.create_buffer_resource_from_addr(arg_idx + I64(row) * (POOL * 4), num_records_bytes=POOL * 4)
         meta = buffer_ops.create_buffer_resource_from_addr(arg_meta, num_records_bytes=NUM_REC)
-        zero4 = fx.Vector.from_elements([I(INT_MIN)] * 4, dtype=I)
         keys_raw, idx_raw = [], []
         for blk in range_constexpr(BLOCKS):
-            kv4, iv4 = zero4, zero4
-            kv4 = fx.Vector(buffer_ops.buffer_load(lk, blk * (NT * 4) + tid * 4, vec_width=4, dtype=I))
-            iv4 = fx.Vector(buffer_ops.buffer_load(lx, blk * (NT * 4) + tid * 4, vec_width=4, dtype=I))
-            keys_raw.append(kv4)
-            idx_raw.append(iv4)
-        mt = fx.Vector(buffer_ops.buffer_load(meta, (row * NCH_MAX + fx.min(tid, I(NCH_MAX - 1))) * 4, vec_width=4, dtype=I))
+            keys_raw.append(fx.Vector(buffer_ops.buffer_load(lk, blk * (NT * 4) + tid * 4, vec_width=4, dtype=I, cache_modifier=CM)))
+            idx_raw.append(fx.Vector(buffer_ops.buffer_load(lx, blk * (NT * 4) + tid * 4, vec_width=4, dtype=I, cache_modifier=CM)))
+        mt = fx.Vector(buffer_ops.buffer_load(meta, (row * NCH_MAX + lane) * 4, vec_width=4, dtype=I, cache_modifier=CM))
         init_stage()
         zero_bins(0, 0, NT)
         fx.gpu.barrier()
@@ -477,6 +477,26 @@ def compile_merge(blocks: int, uniform: bool = False, timing: bool = False):
             serve(cb, nch, keys_raw, idx_raw, mt)
         else:
             store_stage()
+
+    return role, OFFS, WORDS
+
+
+@launcher
+def compile_merge(blocks: int, uniform: bool = False, timing: bool = False):
+    name = f"mxfp4_paged_topk_merge_d128_h32_b{blocks}" + ("_u" if uniform else "") + ("_t" if timing else "")
+    role, OFFS, WORDS = merge_parts(blocks, uniform, timing)
+
+    @fx.struct
+    class Raw:
+        u: fx.Array[fx.Int32, WORDS]
+
+    @flyc.kernel(name=name, known_block_size=[NT, 1, 1])
+    def kernel(arg_qsl: fx.Int64, arg_keys: fx.Int64, arg_idx: fx.Int64, arg_meta: fx.Int64, arg_full: fx.Int64,
+               arg_oidx: fx.Int64, arg_oval: fx.Int64, i32_batch: fx.Int32, i32_oidx_stride: fx.Int32,
+               i32_oval_stride: fx.Int32, i32_qlen: fx.Int32, arg_dbg: fx.Int64):
+        smem = carve(fx.SharedAllocator().allocate(Raw).peek().u, **OFFS)
+        role(smem, I(fx.block_idx.x), arg_qsl, arg_keys, arg_idx, arg_meta, arg_full, arg_oidx, arg_oval, i32_batch,
+             i32_oidx_stride, i32_oval_stride, i32_qlen, I64(0), I(0), I(1), I(1), arg_dbg)
 
     @flyc.jit
     def launch_merge(arg_qsl: fx.Int64, arg_keys: fx.Int64, arg_idx: fx.Int64, arg_meta: fx.Int64, arg_full: fx.Int64,
