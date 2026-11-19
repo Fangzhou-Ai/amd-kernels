@@ -18,6 +18,8 @@ Padded rows (past the sequence end) are zero in every tile. The chunk-0 workgrou
 and rolls conv_state.
 """
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -40,26 +42,28 @@ RCP_LN2 = 1.4426950408889634
 EPS_QK = 1e-6
 REC_W, REC_QG, REC_KGT, REC_AQK, REC_DEC, REC_U, RECORD_BYTES = 0, 16384, 32768, 49152, 57344, 58368, 74752
 
-PITCH_T = 272  # [64][136] bf16 rows
-PITCH_C = 144  # [128][72] bf16 rows
+PITCH_T = 272  # [64][136] bf16 rows (Kd, Ki)
+PITCH_C = 136  # [128][68] bf16 rows (kb^T, vb^T)
 SZ_T = BT * PITCH_T
-SZ_C = D * PITCH_C
-R_KD = 0
-R_KI = R_KD + SZ_T
-R_KBT = R_KI + SZ_T
-R_VBT = R_KBT + SZ_C
-R_L = R_VBT + SZ_C
+R_X = 0  # Kd, then Qd, then inverse blocks and scratch, then kb^T
+R_Y = R_X + SZ_T  # Ki, then A (bf16 blocks), vb^T from R_Y + 8192
+R_L = R_Y + SZ_T  # L blocks (fp32)
 R_GN = R_L + 10 * 1024
 R_GL = R_GN + 4 * D * 4
 R_BETA = R_GL + D * 4
 R_BR = R_BETA + BT * 4
 R_HIST = R_BR + 6 * D * 4
 R_TOTAL = R_HIST + 9 * D * 2
-R_RT = R_KD  # run totals of the scan, dead before Kd is written
-R_AINV = R_KD  # inverse blocks, scratch and bf16 A reuse the dead Kd / Ki tiles
+R_RT = R_X  # run totals of the scan, dead before Kd is written
+R_AINV = R_X
 R_SCR = R_AINV + 10 * 1024
-R_A = R_SCR + 4 * 1024
+R_A = R_Y
+R_KBT = R_X
+R_VBT = R_Y + 8192
+R_KD, R_KI = R_X, R_Y
 LDS_BYTES = R_TOTAL
+import os
+WPE = int(os.environ.get("K1_WPE", "2"))
 
 PAIRS = [(i, j) for i in range(4) for j in range(i + 1)]
 OFFD = [(1, 0), (2, 0), (2, 1), (3, 0), (3, 1), (3, 2)]
@@ -114,18 +118,19 @@ def stf(val, addr):
 
 
 def barrier():
-    llvm.inline_asm(None, [], "s_barrier", "~{memory}", has_side_effects=True)
+    fx.gpu.barrier()
+
+
+def pack_bf16(vals):
+    """fp32 values -> bf16 (RNE) packed two per dword; a compiler-visible conversion, so MFMA hazards are handled."""
+    n = len(vals)
+    v = Vec.from_elements([fx.Float32(x) for x in vals], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+    return [fx.Int32(v[k]) for k in range(n // 2)]
 
 
 def pk_bf16(a, b):
+    """Two fp32 -> two bf16 in a dword (RNE) by inline asm: cheaper to schedule, invisible to the MFMA hazard recognizer."""
     return fx.Int32(fx.rocdl.cvt_pk_bf16_f32(fx.as_ir_value(fx.Float32(a)), fx.as_ir_value(fx.Float32(b))))
-
-
-def pk_bf16_int(a, b):
-    """pk_bf16 for MFMA results: integer rounding is visible to the hazard recognizer."""
-    ra = round_bf16(a).bitcast(fx.Int32)
-    rb = round_bf16(b).bitcast(fx.Int32)
-    return ((ra >> 16) & 0xFFFF) | (rb & -65536)
 
 
 def bf_lo(w):
@@ -209,16 +214,16 @@ def unpack8(v4):
 
 
 def pack8(vals):
-    return [pk_bf16(vals[2 * k], vals[2 * k + 1]) for k in range(4)]
+    return [pk_bf16(vals[2 * k], vals[2 * k + 1]) for k in range(len(vals) // 2)]
 
 
 @launcher
-def compile_prologue(stage: int = 3):
+def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
     @fx.struct
     class Shared:
         buf: fx.Array[fx.Uint8, LDS_BYTES, 16]
 
-    @flyc.kernel(name=f"kda_prefill_prologue_h12_d128_s{stage}", known_block_size=[256, 1, 1])
+    @flyc.kernel(name=f"kda_prefill_prologue_h12_d128_s{stage}_p{prof}_w{wpe}", known_block_size=[256, 1, 1])
     def kernel(
         arg_mixed: fx.Int64,
         i32_ldx: fx.Int32,
@@ -242,6 +247,7 @@ def compile_prologue(stage: int = 3):
         i32_nc: fx.Int32,
         f32_lb: fx.Float32,
         f32_scale: fx.Float32,
+        arg_prof: fx.Int64,
     ):
         smem = fx.SharedAllocator().allocate(Shared).peek()
         base = fx.Int32(fx.ptrtoint(smem.buf.ptr))
@@ -285,9 +291,14 @@ def compile_prologue(stage: int = 3):
             arg_ws + fx.Int64(h * i32_nc + cid) * fx.Int64(RECORD_BYTES), num_records_bytes=RECORD_BYTES
         )
 
-        def wstore(v, byte_off, dt_bytes=4):
-            buffer_ops.buffer_store(v, wsr, byte_off // dt_bytes)
+        profr = buffer_ops.create_buffer_resource_from_addr(arg_prof, num_records_bytes=fx.Int32(0x7FFFFFF0))
 
+        def mark(i):
+            if prof:
+                ts = fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memtime", [], [], []))
+                buffer_ops.buffer_store(ts, profr, ((h * i32_nc + cid) * 4 + wave) * 16 + i, mask=lane == 0)
+
+        mark(0)
         # ---- conv history of the sequence's slot (chunk 0 only) -> LDS [band][pos][128]
         hit = tx < 144
         hb_i = tx // 48
@@ -302,7 +313,7 @@ def compile_prologue(stage: int = 3):
         if hit:
             st4([hv[2 * k] | (hv[2 * k + 1] << 16) for k in range_constexpr(4)], base + R_HIST + tx * 16, fx.Int32)
 
-        def band_loads(band):
+        def band_rows(band):
             rowsv = []
             for j in range_constexpr(7):
                 s = t0 + r0 - 3 + j
@@ -310,14 +321,18 @@ def compile_prologue(stage: int = 3):
                 rowsv.append(
                     Vec(buffer_ops.buffer_load(mr, ((bos + s) * i32_ldx + band * LP + h * D + cg * 8) // 2, vec_width=4, dtype=fx.Int32, mask=valid))
                 )
+            return rowsv
+
+        def band_wts(band):
             wts = []
             for tap in range_constexpr(4):
                 for k in range_constexpr(2):
                     wts.append(Vec(buffer_ops.buffer_load(cwr, (band * 4 + tap) * LP + h * D + cg * 8 + 4 * k, vec_width=4)))
-            return rowsv, wts
+            return wts
 
         # ---- loads that start the HBM latency early: k band, gate, beta
-        k_rows, k_wts = band_loads(1)
+        k_rows = band_rows(1)
+        k_wts = band_wts(1)
         dtr = buffer_ops.create_buffer_resource_from_addr(arg_dtb, num_records_bytes=LP * 4)
         dtb = []
         for k in range_constexpr(2):
@@ -332,7 +347,7 @@ def compile_prologue(stage: int = 3):
         betas = []
         for j in range_constexpr(4):
             bl = buffer_ops.buffer_load(br, (bos + t0 + r0 + j) * i32_ldb + h, vec_width=1, dtype=fx.Int16, mask=(r0 + j) < rows)
-            betas.append(sigmoid(((fx.Int32(bl) & 0xFFFF) << 16).bitcast(fx.Float32)))
+            betas.append(((r0 + j) < rows).select(sigmoid(((fx.Int32(bl) & 0xFFFF) << 16).bitcast(fx.Float32)), fx.Float32(0.0)))
 
         # ---- gate: glog, chunk cumsum (log2 units)
         gl = []
@@ -345,14 +360,16 @@ def compile_prologue(stage: int = 3):
         st4(gc[3][0:4], base + R_RT + (run * D + cg * 8) * 4, fx.Float32)
         st4(gc[3][4:8], base + R_RT + (run * D + cg * 8) * 4 + 16, fx.Float32)
         barrier()
-        pref = [fx.Float32(0.0)] * 8
-        for r in range_constexpr(15):
-            a = ld4f(base + R_RT + (r * D + cg * 8) * 4)
-            b = ld4f(base + R_RT + (r * D + cg * 8) * 4 + 16)
-            use = r < run
-            for c in range_constexpr(4):
-                pref[c] = pref[c] + use.select(a[c], fx.Float32(0.0))
-                pref[4 + c] = pref[4 + c] + use.select(b[c], fx.Float32(0.0))
+        if tx < D:
+            tots = [ldf(base + R_RT + (r * D + tx) * 4) for r in range_constexpr(16)]
+            acc_p = fx.Float32(0.0)
+            for r in range_constexpr(16):
+                stf(acc_p, base + R_RT + (r * D + tx) * 4)
+                acc_p = acc_p + tots[r]
+        barrier()
+        pa = ld4f(base + R_RT + (run * D + cg * 8) * 4)
+        pb = ld4f(base + R_RT + (run * D + cg * 8) * 4 + 16)
+        pref = [pa[c] for c in range_constexpr(4)] + [pb[c] for c in range_constexpr(4)]
         g = [[(pref[c] + gc[j][c]) * RCP_LN2 for c in range_constexpr(8)] for j in range_constexpr(4)]
 
         if (run % 4) == 0:
@@ -368,6 +385,7 @@ def compile_prologue(stage: int = 3):
             for j in range_constexpr(4):
                 stf(betas[j], base + R_BETA + (r0 + j) * 4)
         barrier()
+        mark(1)
         glast = [ldf(base + R_GL + (cg * 8 + c) * 4) for c in range_constexpr(8)]
         gnb = ld4f(base + R_GN + ((run // 4) * D + cg * 8) * 4)
         gnb2 = ld4f(base + R_GN + ((run // 4) * D + cg * 8) * 4 + 16)
@@ -397,15 +415,14 @@ def compile_prologue(stage: int = 3):
                 xs.append(unpack8(v4))
             ys = []
             for r in range_constexpr(4):
-                row = []
+                ys_pre = []
                 for c in range_constexpr(8):
                     wk = [wts[tap * 2 + c // 4][c % 4] for tap in range_constexpr(4)]
                     acc = xs[r][c] * wk[0]
                     for tap in range_constexpr(1, 4):
                         acc = fma(xs[r + tap][c], wk[tap], acc)
-                    y = round_bf16(acc * rcp(fx.Float32(1.0) + exp2(acc * fx.Float32(-LOG2E))))
-                    row.append(((r0 + r) < rows).select(y, fx.Float32(0.0)))
-                ys.append(row)
+                    ys_pre.append(acc * rcp(fx.Float32(1.0) + exp2(acc * fx.Float32(-LOG2E))))
+                ys.append(unpack8(pack8(ys_pre)))
             return ys
 
         def row_scale(ys):
@@ -414,7 +431,7 @@ def compile_prologue(stage: int = 3):
                 ss = fx.Float32(0.0)
                 for c in range_constexpr(8):
                     ss = fma(ys[r][c], ys[r][c], ss)
-                out.append(rsqrt(sum16(ss) + EPS_QK))
+                out.append(((r0 + r) < rows).select(rsqrt(sum16(ss) + EPS_QK), fx.Float32(0.0)))
             return out
 
         def tile_store(res, vals_per_row):
@@ -429,12 +446,11 @@ def compile_prologue(stage: int = 3):
             kn = [ys[r][c] * rk[r] for c in range_constexpr(8)]
             kd.append([kn[c] * exp2(g[r][c] - gn[c]) for c in range_constexpr(8)])
             ki.append([kn[c] * exp2(gn[c] - g[r][c]) for c in range_constexpr(8)])
-            kg.append([((r0 + r) < rows).select(kn[c] * exp2(glast[c] - g[r][c]), fx.Float32(0.0)) for c in range_constexpr(8)])
+            kg.append([kn[c] * exp2(fx.min(glast[c] - g[r][c], fx.Float32(0.0))) for c in range_constexpr(8)])
             kb.append([kn[c] * betas[r] * exp2(g[r][c]) for c in range_constexpr(8)])
         tile_store(R_KD, kd)
         tile_store(R_KI, ki)
-        for c in range_constexpr(8):
-            st2i([pk_bf16(kb[0][c], kb[1][c]), pk_bf16(kb[2][c], kb[3][c])], base + R_KBT + (cg * 8 + c) * PITCH_C + r0 * 2)
+        kb_pk = [[pk_bf16(kb[0][c], kb[1][c]), pk_bf16(kb[2][c], kb[3][c])] for c in range_constexpr(8)]
 
         # kg straight to the workspace: fragment (mt = cg // 2, ks_t), lane qq * 16 + i, slot half hf
         for pp in range_constexpr(4):
@@ -455,9 +471,9 @@ def compile_prologue(stage: int = 3):
         if stage < 0:
             return
 
+        mark(2)
         # ---- loads of the q and v bands issued ahead of the Akk matrix phase
-        q_rows, q_wts = band_loads(0)
-        v_rows, v_wts = band_loads(2)
+        q_rows = band_rows(0)
 
         barrier()
 
@@ -476,7 +492,7 @@ def compile_prologue(stage: int = 3):
             b1 = ld4f(base + R_BR + (pidx * D + 32 * ks + 4 * lg + 16) * 4)
             vals = unpack8([frag[k] for k in range_constexpr(4)])
             bs = [b0[k] for k in range_constexpr(4)] + [b1[k] for k in range_constexpr(4)]
-            return Vec.from_elements(pack8([vals[k] * bs[k] for k in range_constexpr(8)]), fx.Int32)
+            return Vec.from_elements(pack_bf16([vals[k] * bs[k] for k in range_constexpr(8)]), fx.Int32)
 
         def pair_acc(ib, jb, qd_res):
             acc = Vec.filled(4, 0.0, fx.Float32)
@@ -488,6 +504,7 @@ def compile_prologue(stage: int = 3):
                 acc = mfma_bf16(a, b, acc)
             return acc
 
+        mark(3)
         zero = fx.Float32(0.0)
         # Akk -> L (fp32 blocks)
         for w_i in range_constexpr(4):
@@ -505,8 +522,9 @@ def compile_prologue(stage: int = 3):
                     st4(outv, base + R_L + pi * 1024 + (cg * 16 + 4 * lg) * 4, fx.Float32)
         barrier()
 
+        mark(4)
         # ---- q band and v band
-        ys = band_conv(0, q_rows, q_wts)
+        ys = band_conv(0, q_rows, band_wts(0))
         rq = row_scale(ys)
         qd, qg = [], []
         for r in range_constexpr(4):
@@ -528,12 +546,15 @@ def compile_prologue(stage: int = 3):
             tok16 = 4 * (run % 4) + r
             frag = ((run // 4) * 4 + cg // 4) * 64 + q_c * 16 + tok16
             buffer_ops.buffer_store(Vec.from_elements(lo + hi_, fx.Int32), wsr, (REC_QG + frag * 16) // 4)
-        ys = band_conv(2, v_rows, v_wts)
+        v_rows = band_rows(2)
+        ys = band_conv(2, v_rows, band_wts(2))
+        vb_pk = []
         for c in range_constexpr(8):
             vb = [ys[r][c] * betas[r] for r in range_constexpr(4)]
-            st2i([pk_bf16(vb[0], vb[1]), pk_bf16(vb[2], vb[3])], base + R_VBT + (cg * 8 + c) * PITCH_C + r0 * 2)
+            vb_pk.append([pk_bf16(vb[0], vb[1]), pk_bf16(vb[2], vb[3])])
         barrier()
 
+        mark(5)
         # Aqk straight to the workspace
         groups = [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1), (3, 0), (3, 1)]
         for w_i in range_constexpr(4):
@@ -550,10 +571,11 @@ def compile_prologue(stage: int = 3):
                             if ib == jb:
                                 vals = [(4 * lg + e <= cg).select(vals[e], zero) for e in range_constexpr(4)]
                             tiles.append(vals)
-                    words = [pk_bf16_int(tiles[0][0], tiles[0][1]), pk_bf16_int(tiles[0][2], tiles[0][3]), pk_bf16_int(tiles[1][0], tiles[1][1]), pk_bf16_int(tiles[1][2], tiles[1][3])]
+                    words = pack_bf16(tiles[0] + tiles[1])
                     buffer_ops.buffer_store(Vec.from_elements(words, fx.Int32), wsr, (REC_AQK + ((ib * 2 + ks2) * 64 + lane) * 16) // 4)
         barrier()
 
+        mark(6)
         # ---- (I + L)^-1: diagonal blocks by forward substitution (wave 0, one block per 16-lane group)
         def lblk(i, j):
             return i * (i + 1) // 2 + j
@@ -580,6 +602,7 @@ def compile_prologue(stage: int = 3):
                 stf(xs[i], ai_addr + (i * 16 + cg) * 4)
         barrier()
 
+        mark(7)
         def mm_acc(a_addr_fn, b_addr_fn, acc):
             for kk in range_constexpr(0, 16, 4):
                 acc = mfma_f32(ldf(a_addr_fn(kk)), ldf(b_addr_fn(kk)), acc)
@@ -609,6 +632,7 @@ def compile_prologue(stage: int = 3):
                         stf(zero - r_[e], base + R_AINV + lblk(i_b, j_b) * 1024 + ((4 * lg + e) * 16 + cg) * 4)
             barrier()
 
+        mark(8)
         # A as bf16 blocks [ib][jb][16][16], zero above the diagonal
         jb_t = tx % 4
         r_t = (tx // 4) % 16
@@ -626,7 +650,12 @@ def compile_prologue(stage: int = 3):
         st4(wd[0:4], a_addr, fx.Int32)
         st4(wd[4:8], a_addr + 16, fx.Int32)
         barrier()
+        for c in range_constexpr(8):
+            st2i(kb_pk[c], base + R_KBT + (cg * 8 + c) * PITCH_C + r0 * 2)
+            st2i(vb_pk[c], base + R_VBT + (cg * 8 + c) * PITCH_C + r0 * 2)
+        barrier()
 
+        mark(9)
         def rd_a(ib, ks):
             a = base + R_A + ((ib * 4 + 2 * ks) * 16 + cg) * 32 + 8 * lg
             x, y = ld2i(a), ld2i(a + 512)
@@ -643,7 +672,7 @@ def compile_prologue(stage: int = 3):
                     b = rd_a(nt, ks)
                     acc = mfma_bf16(a, b, acc)
                 accs.append(acc)
-            words = [pk_bf16_int(zero - accs[0][0], zero - accs[0][1]), pk_bf16_int(zero - accs[0][2], zero - accs[0][3]), pk_bf16_int(zero - accs[1][0], zero - accs[1][1]), pk_bf16_int(zero - accs[1][2], zero - accs[1][3])]
+            words = pack_bf16([zero - accs[0][e] for e in range_constexpr(4)] + [zero - accs[1][e] for e in range_constexpr(4)])
             buffer_ops.buffer_store(Vec.from_elements(words, fx.Int32), wsr, (REC_W + ((nt * 4 + wave) * 64 + lane) * 16) // 4)
         # u = A (beta v): wave w owns v tiles 2w, 2w + 1
         for vt2 in range_constexpr(2):
@@ -653,25 +682,29 @@ def compile_prologue(stage: int = 3):
                     a = rd_a(mt, ks)
                     b = rd_c(R_VBT, 16 * (2 * wave + vt2) + cg, ks)
                     acc = mfma_bf16(a, b, acc)
-                words = [pk_bf16_int(acc[0], acc[1]), pk_bf16_int(acc[2], acc[3])]
+                words = pack_bf16([acc[e] for e in range_constexpr(4)])
                 buffer_ops.buffer_store(Vec.from_elements(words, fx.Int32), wsr, (REC_U + (((2 * wave + vt2) * 4 + mt) * 64 + lane) * 8) // 4)
 
+        mark(10)
         # ---- roll the conv state: the last 3 raw inputs of the sequence (chunk 0 only; history is in LDS)
-        for it in range_constexpr(2):
-            chn = tx + it * 256
-            band = chn // 128
-            cc = chn % 128
-            okc = (chn < 384) & first
-            dim = band * LP + h * D + cc
-            for p in range_constexpr(3):
-                s = tn - 3 + p
-                rv = buffer_ops.buffer_load(mr, (bos + s) * i32_ldx + dim, vec_width=1, dtype=fx.Int16, mask=(s >= 0) & okc)
-                hp = fx.min(fx.max(s + 3, fx.Int32(0)), fx.Int32(2))
-                hvv = fx.Int32(fx.Int16(lds_ld(base + R_HIST + ((band * 3 + hp) * 128 + cc) * 2, T.i16, 2)))
-                val = (s >= 0).select(fx.Int32(rv) & 0xFFFF, hvv & 0xFFFF)
-                buffer_ops.buffer_store(
-                    raw(val.to(fx.Int16)), csr, slot * i32_cs_slot + dim * i32_cs_dim + p * i32_cs_pos, mask=okc
-                )
+        if first:
+            for it in range_constexpr(2):
+                chn = tx + it * 256
+                band = chn // 128
+                cc = chn % 128
+                okc = (chn < 384) & first
+                dim = band * LP + h * D + cc
+                for p in range_constexpr(3):
+                    s = tn - 3 + p
+                    rv = buffer_ops.buffer_load(mr, (bos + s) * i32_ldx + dim, vec_width=1, dtype=fx.Int16, mask=(s >= 0) & okc)
+                    hp = fx.min(fx.max(s + 3, fx.Int32(0)), fx.Int32(2))
+                    hvv = fx.Int32(fx.Int16(lds_ld(base + R_HIST + ((band * 3 + hp) * 128 + cc) * 2, T.i16, 2)))
+                    val = (s >= 0).select(fx.Int32(rv) & 0xFFFF, hvv & 0xFFFF)
+                    buffer_ops.buffer_store(
+                        raw(val.to(fx.Int16)), csr, slot * i32_cs_slot + dim * i32_cs_dim + p * i32_cs_pos, mask=okc
+                    )
+
+        mark(11)
 
     @flyc.jit
     def launch(
@@ -697,29 +730,36 @@ def compile_prologue(stage: int = 3):
         i32_nc: fx.Int32,
         f32_lb: fx.Float32,
         f32_scale: fx.Float32,
+        arg_prof: fx.Int64,
         stream: fx.Stream,
     ):
         kernel(
             arg_mixed, i32_ldx, i32_mixed_bytes, arg_rawg, i32_ldg, arg_beta, i32_ldb, arg_alog, arg_dtb, arg_cw, arg_cs,
-            i32_cs_slot, i32_cs_dim, i32_cs_pos, arg_cu, arg_ci, arg_sidx, arg_hasinit, arg_ws, i32_nc, f32_lb, f32_scale,
+            i32_cs_slot, i32_cs_dim, i32_cs_pos, arg_cu, arg_ci, arg_sidx, arg_hasinit, arg_ws, i32_nc, f32_lb, f32_scale, arg_prof,
+            **({"value_attrs": {"rocdl.waves_per_eu": wpe, "rocdl.flat_work_group_size": "256,256"}} if wpe else {}),
         ).launch(grid=(fx.Int64(i32_nc), NH, 1), block=(256, 1, 1), stream=stream)
 
     return launch
 
 
+@functools.cache
+def _launcher(stage, prof, wpe=WPE):
+    return compile_prologue(stage, prof, wpe)
+
+
 def prologue(mixed, raw_g, beta_logit, A_log, dt_bias, lower_bound, scale, conv_weight, conv_state, state_indices,
-             has_initial_state, cu_seqlens, chunk_indices, ws=None, stage=3):
+             has_initial_state, cu_seqlens, chunk_indices, ws=None, stage=3, prof=None):
     """Workspace records [H, Nc, RECORD_BYTES] uint8 of the chunks of ``cu_seqlens``; rolls ``conv_state`` in place."""
     nc = chunk_indices.shape[0]
     if ws is None:
         ws = torch.empty(NH, nc, RECORD_BYTES, dtype=torch.uint8, device=mixed.device)
     cs = conv_state
     _run_compiled(
-        compile_prologue(stage),
+        _launcher(stage, prof is not None),
         mixed.data_ptr(), mixed.stride(0), mixed.shape[0] * mixed.stride(0) * 2,
         raw_g.data_ptr(), raw_g.stride(0) if raw_g.dim() == 2 else raw_g.stride(0), beta_logit.data_ptr(), beta_logit.stride(0),
         A_log.data_ptr(), dt_bias.data_ptr(), conv_weight.data_ptr(), cs.data_ptr(), cs.stride(0), cs.stride(1), cs.stride(2),
         cu_seqlens.data_ptr(), chunk_indices.data_ptr(), state_indices.data_ptr(), has_initial_state.data_ptr(),
-        ws.data_ptr(), nc, float(lower_bound), float(scale), torch.cuda.current_stream(),
+        ws.data_ptr(), nc, float(lower_bound), float(scale), (prof if prof is not None else ws).data_ptr(), torch.cuda.current_stream(),
     )
     return ws
