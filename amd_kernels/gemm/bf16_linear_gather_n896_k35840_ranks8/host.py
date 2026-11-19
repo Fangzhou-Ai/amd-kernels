@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """Host side of the sharded drafter context projection: tier choice, launches, warm-up."""
-import functools
-
 import torch
 from amd_kernels import warm_up
 
 from . import kernel as K1
-from .comm import MAX_ROWS, ProjComm
+from .comm import MAX_ROWS, SLAB_SPLIT, ProjComm
 from .ipc import f32_bits, run_compiled
 from .pack import pack_rows, pack_weight
 from .pack_rows import compile_pack_rows
@@ -20,13 +18,15 @@ KSTEPS = K // 32
 # (rows up to, (mt, g, split, depth, wr, wk)): activation row tiles per workgroup, weight groups, K split, loads in
 # flight, wave grid (rows x K)
 TIERS = (
-    (16, (1, 4, 16, 4, 1, 4)),
-    (32, (2, 4, 16, 4, 1, 4)),
-    (48, (3, 4, 16, 4, 1, 4)),
-    (80, (5, 4, 16, 4, 1, 4)),
-    (128, (8, 4, 16, 3, 2, 2)),
-    (192, (12, 4, 16, 3, 2, 2)),
+    (16, (1, 4, 16, 4, 1, 2)),
+    (32, (2, 4, 16, 4, 1, 2)),
+    (48, (3, 4, 16, 4, 1, 2)),
+    (80, (5, 4, 16, 4, 1, 2)),
+    (128, (8, 4, 16, 4, 1, 2)),
+    (192, (12, 7, 32, 4, 2, 1)),
 )
+
+assert max(cfg[2] for _, cfg in TIERS) <= SLAB_SPLIT
 
 
 def config_for(rows: int) -> tuple:

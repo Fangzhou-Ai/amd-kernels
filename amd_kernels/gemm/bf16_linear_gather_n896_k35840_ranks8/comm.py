@@ -12,7 +12,7 @@ from .ipc import exchange
 from .reference import N_SHARD
 from .reduce_gather import BUF_BYTES, COUNTS, MAX_ROWS
 
-SLAB_SPLIT = 16
+SLAB_SPLIT = 32
 
 
 class _DevicePointer:

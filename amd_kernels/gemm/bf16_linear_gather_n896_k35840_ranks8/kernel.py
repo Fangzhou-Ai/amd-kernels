@@ -29,7 +29,7 @@ from .reference import K, N_SHARD
 KSTEPS = K // 32
 GROUPS = N_SHARD // 16
 LDS_MAX = 160 * 1024
-NT = 0x2  # weights stream past the L2 so the activation tiles stay resident (R 80: 14.9 -> 10.9 us)
+NT = 0x2  # non-temporal weights keep the activation tiles in L2: 80 rows 17.2 -> 16.3 us (graph loop)
 
 
 def _lds_ptr(addr):
