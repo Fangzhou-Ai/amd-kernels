@@ -16,8 +16,9 @@ def require_gfx950():
         pytest.skip("needs gfx950")
 
 
-def make_case(seq_lens, seed=0, slots=None, init=None, dev="cuda", lower_bound=-5.0):
-    """A layer's inputs for sequences of ``seq_lens`` tokens; ``init[n]`` False starts sequence n from zero states."""
+def make_case(seq_lens, seed=0, slots=None, init=None, dev="cuda", lower_bound=-5.0, dt_shift=0.0):
+    """A layer's inputs for sequences of ``seq_lens`` tokens; ``init[n]`` False starts sequence n from zero states; a negative
+    ``dt_shift`` slows the gate decay (long memory: every chunk transfer matters)."""
     g = torch.Generator(device=dev).manual_seed(seed)
     r = lambda *s, sc=1.0: (torch.randn(*s, device=dev, generator=g) * sc)
     n = len(seq_lens)
@@ -33,7 +34,7 @@ def make_case(seq_lens, seed=0, slots=None, init=None, dev="cuda", lower_bound=-
     init = [True] * n if init is None else init
     return dict(
         mixed=mixed, raw_g=raw_g, beta_logit=beta_logit, gate=gate,
-        A_log=(r(R.NH, sc=0.5)).float(), dt_bias=(r(R.LP, sc=0.1)).float(), lower_bound=lower_bound,
+        A_log=(r(R.NH, sc=0.5)).float(), dt_bias=(r(R.LP, sc=0.1) + dt_shift).float(), lower_bound=lower_bound,
         conv_weight=(r(3, 4, R.LP, sc=0.4)).float(),
         conv_state=r(slots, 3 * R.LP, 3).bfloat16(),
         state_cache=(r(slots, R.NH, R.D, R.D, sc=0.05)).float(),

@@ -50,3 +50,13 @@ def mfma(a, b, acc):
     a = Vec(a).bitcast(fx.BFloat16)
     b = Vec(b).bitcast(fx.BFloat16)
     return Vec(fx.rocdl.mfma_f32_16x16x32_bf16(Vec.make_type(4, fx.Float32), [a, b, acc, 0, 0, 0]))
+
+
+def lds_load2(byte_addr):
+    """8 bytes of LDS as two i32."""
+    return Vec(llvm.load(T.vec(2, T.i32), lds_ptr(byte_addr), alignment=8))
+
+
+def lds_store_i16(byte_addr, value):
+    """Store the low 16 bits of an i32 to LDS."""
+    llvm.store(raw(fx.Int32(value).to(fx.Int16)), lds_ptr(byte_addr), alignment=2)

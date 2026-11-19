@@ -10,14 +10,14 @@ from amd_kernels.attention.kda_prefill_h12_d128 import reference as R
 from .inputs import make_case, require_gfx950
 
 OUT_TOL = 6e-3
-STATE_TOL = 1e-3
+STATE_TOL = 4e-3
 
 
 def rel(a, b):
     return ((a.float() - b.float()).norm() / b.float().norm()).item()
 
 
-def workspace(c):
+def workspace(c):  # noqa: D103
     cu = c["cu_seqlens"]
     conv, _ = R.conv_reference(c["mixed"], c["conv_weight"], c["conv_state"], c["state_indices"], c["has_initial_state"], cu)
     pro = R.prologue_reference(conv[:, :R.LP], conv[:, R.LP:2 * R.LP], conv[:, 2 * R.LP:], c["raw_g"], c["beta_logit"],
@@ -29,25 +29,27 @@ def offsets(cu):
     return torch.tensor(R.chunk_table(cu)[1], dtype=torch.int64, device=cu.device)
 
 
-@pytest.mark.parametrize("seq,init", [
-    ([64], [True]), ([130], [False]), ([2048], [True]), ([300, 64, 77, 1], [True, False, True, True]), ([5, 3], [False, True]),
-], ids=["64", "130_noinit", "2048", "ragged4", "tiny"])
+@pytest.mark.parametrize("seq,init,groups,dt_shift", [
+    ([64], [True], 1, 0.0), ([130], [False], 1, 0.0), ([2048], [True], 1, 0.0), ([300, 64, 77, 1], [True, False, True, True], 1, 0.0),
+    ([5, 3], [False, True], 1, 0.0), ([2048], [True], 4, 0.0), ([2048], [True], 4, -6.0), ([2048], [False], 8, -6.0),
+    ([1500, 700, 64, 3000], [True, False, True, True], 6, -6.0), ([4096], [True], 10, -6.0),
+], ids=["64", "130_noinit", "2048", "ragged4", "tiny", "2048_g4", "2048_g4_slow", "2048_noinit_g8_slow", "ragged_g6_slow", "4096_g10_slow"])
 @torch.inference_mode()
-def test_scan(seq, init):
+def test_scan(seq, init, groups, dt_shift):
     require_gfx950()
-    c = make_case(seq, init=init)
+    c = make_case(seq, init=init, dt_shift=dt_shift)
     rec, pro = workspace(c)
     cu = c["cu_seqlens"]
     ref_state = c["state_cache"].clone()
     o_ref = R.chunk_reference(R.unpack_record(rec), cu, ref_state, c["state_indices"], c["has_initial_state"])
     state = c["state_cache"].clone()
     out = torch.zeros(sum(seq), R.NH, R.D, dtype=torch.bfloat16, device="cuda")
-    host.scan(rec, cu, offsets(cu), state, c["state_indices"], c["has_initial_state"], out)
+    host.scan(rec, cu, offsets(cu), state, c["state_indices"], c["has_initial_state"], out, groups=groups)
     assert rel(out, o_ref) < OUT_TOL
     assert rel(state, ref_state) < STATE_TOL
     again = c["state_cache"].clone()
     out2 = torch.zeros_like(out)
-    host.scan(rec, cu, offsets(cu), again, c["state_indices"], c["has_initial_state"], out2)
+    host.scan(rec, cu, offsets(cu), again, c["state_indices"], c["has_initial_state"], out2, groups=groups)
     assert torch.equal(out, out2) and torch.equal(state, again)
 
 
