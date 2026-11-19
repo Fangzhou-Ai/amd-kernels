@@ -231,7 +231,7 @@ def _thresholds(smem, tx, lane, wave, nt, keys, wts, t_mid, t_a, t_c, full=True)
 # K1: per-row thresholds
 # =====================================================================================================================
 @launcher
-def compile_threshold(NT=512, CAP=8192):
+def compile_threshold(NT=512):
     NW = NT // 64
 
     @fx.struct
@@ -279,7 +279,7 @@ def compile_threshold(NT=512, CAP=8192):
 # K2: one stream pass at the threshold of K1
 # =====================================================================================================================
 @launcher
-def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
+def compile_stream(NT=512, V=4, NC_ST=2):
     NW = NT // 64
     CH = NT * 4 * V
     SW = V * 256
@@ -386,7 +386,7 @@ def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
 # K2b: retry passes of the rows whose first pass count fell outside [2048, CAP]
 # =====================================================================================================================
 @launcher
-def compile_retry(NT=512, V=4, CAP=6144, NC_ST=2):
+def compile_retry(NT=512, V=4, NC_ST=2):
     NW = NT // 64
     CH = NT * 4 * V
     SW = V * 256

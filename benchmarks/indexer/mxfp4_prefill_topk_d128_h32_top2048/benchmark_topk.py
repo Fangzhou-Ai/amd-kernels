@@ -25,7 +25,7 @@ HBM_PLAIN_TBS = 6.5
 HBM_NT_TBS = 6.9
 LLC_BYTES = 256 * 2**20
 # (rows, width, windows): per-rank rows of a 5720-token chunk at 150K / 500K / 790K, a 4096-token chunk, a 16384-token chunk,
-# and a chunk of several requests
+# a chunk of several requests, and a 2048-token chunk
 CASES = [
     (512, 150_000, "causal"),
     (715, 150_000, "causal"),
@@ -34,6 +34,7 @@ CASES = [
     (715, 500_000, "causal"),
     (715, 790_000, "causal"),
     (715, 500_000, "requests"),
+    (256, 150_000, "causal"),
 ]
 
 

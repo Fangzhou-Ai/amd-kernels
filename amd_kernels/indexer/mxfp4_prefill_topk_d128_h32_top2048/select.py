@@ -17,6 +17,7 @@ from amd_kernels.common import buffer_ops
 from amd_kernels.warm_up import launcher
 
 from .kernel import (
+    CAP,
     HSZA,
     I64,
     INT_MIN,
@@ -46,7 +47,7 @@ from .kernel import (
 # K3: exact select over the candidate list (registers), exact fallback for rows whose list is unusable
 # =====================================================================================================================
 @launcher
-def compile_select(NT=256, CAP=6144, POPMAX=64):
+def compile_select(NT=256, POPMAX=64):
     NW = NT // 64
     PER = CAP // NT
     NCH = NT * 4
