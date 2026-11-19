@@ -19,6 +19,8 @@ One line per kernel package. Each package's README has what it does, its entry p
 - [`gemm/bf16_n20480_k7168`](gemm/bf16_n20480_k7168/README.md): the Kimi-K3.1 lm_head vocabulary shard (TP8), with a row
   map and a publish epilogue into the logits exchange.
 - [`gemm/bf16_n200064_k256`](gemm/bf16_n200064_k256/README.md): the draft's Markov projection over selected rows.
+- [`gemm/bf16_latent_down_mxfp4_quant_k7168_n3584`](gemm/bf16_latent_down_mxfp4_quant_k7168_n3584/README.md): the
+  latent MoE down projection (7168 -> 3584) with the routed experts' MXFP4 activation quant fused into its epilogue.
 - [`gemm/bf16_concat_linear_n1536_k30720`](gemm/bf16_concat_linear_n1536_k30720/README.md): the draft's input fc over
   five taps, and the four-rank gather.
 - [`gemm/bf16_linear_gather_n896_k35840_ranks8`](gemm/bf16_linear_gather_n896_k35840_ranks8/README.md): the drafter's
