@@ -119,6 +119,32 @@ def test_concentrated_scores(hot):
     check_selection(idx, val, reference_logits(inputs), rtol=LOGIT_RTOL)
 
 
+@pytest.mark.parametrize("hot", HOT)
+def test_concentrated_scores_wide_batch(hot):
+    """The same with whole rows a workgroup and half chunks a list (more than four sequences)."""
+    require_gfx950()
+    inputs = make_inputs(6, 4, 32768, seed=7, hot=hot)
+    idx, val = run(inputs)
+    check_selection(idx, val, reference_logits(inputs), rtol=LOGIT_RTOL)
+
+
+@pytest.mark.parametrize("kind", ["tied", "hot"])
+def test_repeated_calls_wide_batch(kind):
+    require_gfx950()
+    kw = dict(hot=((10000, 14000, 4),)) if kind == "hot" else {}
+    inputs = make_inputs(7, 4, 24576, seed=4, positive_weights=kind == "tied", **kw)
+    if kind == "tied":
+        payload, scales = host.cache_views(inputs["cache"])
+        payload.fill_(0x24)
+        scales.fill_(121)
+    first = run(inputs)
+    for _ in range(20):
+        idx, val = run(inputs)
+        assert (idx >= 0).sum(1).tolist() == (first[0] >= 0).sum(1).tolist()
+        assert torch.equal(val.sort(1).values, first[1].sort(1).values)
+    check_selection(first[0], first[1], reference_logits(inputs), rtol=LOGIT_RTOL)
+
+
 def test_short_empty_and_padding_rows():
     require_gfx950()
     inputs = make_inputs(5, 3, 8192, lengths=[1, 64, 2047, 2048, 8192], seed=2)

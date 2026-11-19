@@ -38,7 +38,8 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
     """``rows``: query rows a workgroup scores of a sequence (1 - 6; a sequence of more rows takes several workgroups
     a chunk)."""
     assert 1 <= rows <= QMAX
-    OFFS, WORDS = layout(keys=rows * CHUNK_MAX, hist=rows * HIST, st=128 if timing else 0)
+    split = 2 if rows in (3, 4) else 1  # waves a row's chunk is selected by (virtual chunks of ``cb / split`` keys)
+    OFFS, WORDS = layout(keys=rows * CHUNK_MAX, hist=rows * split * HIST, st=128 if timing else 0)
     CM = (SC1 if os.environ.get('KK_CM', '1') == '1' else 0) if sync else 0  # stores a merge workgroup of another XCD reads: write-through
 
     @flyc.jit
@@ -92,8 +93,14 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
         ends = [row_bound(tile * rows + r) for r in range_constexpr(rows)]
         cb = chunk_size_rt(max_end, i32_target)
         nch = fx.max((max_end + cb - 1) // cb, I(1))
-        tb = list_size_rt(nch, cb)
-        slot = slot_size(tb)
+        hh = I(1)  # lists are of chunks of cbv keys: cb, or half of it while that leaves at most NCH_MAX of them
+        if fx.const_expr(split == 2):
+            half = cb // 2
+            hh = (fx.max((max_end + half - 1) // half, I(1)) <= NCH_MAX).select(I(2), I(1))
+        cbv = cb // hh
+        nvch = fx.max((max_end + cbv - 1) // cbv, I(1))
+        tbv = list_size_rt(nvch, cbv)
+        slotv = slot_size(tbv)
         lkeys = buffer_ops.create_buffer_resource_from_addr(arg_keys, num_records_bytes=NUM_REC)
         lidx = buffer_ops.create_buffer_resource_from_addr(arg_idx, num_records_bytes=NUM_REC)
         meta = buffer_ops.create_buffer_resource_from_addr(arg_meta, num_records_bytes=NUM_REC)
@@ -204,19 +211,21 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
                         kt, ties, tk, listed, fl = exact, need - above, exact, need0, I(1)
             return kt, ties, tk, listed
 
-        def select_row(r, cc):
+        def select_row(w, r, h, cc):
+            """Wave ``w``: the list of chunk ``h`` (of ``hh``) of the workgroup chunk ``cc`` of row ``r``."""
             row = row0 + r
             end_r = ends[0]
             for rr in range_constexpr(1, rows):
                 end_r = (r == rr).select(ends[rr], end_r)
-            wb = r * HIST
-            region = r * CHUNK_MAX
-            nblk = cb // 256
-            last_chunk = cc == nch - 1
-            cap = last_chunk.select(cb, slot)
-            nvalid = fx.max(fx.min(end_r - cc * cb, cb), I(0))
+            vcc = cc * hh + h
+            wb = w * HIST
+            region = r * CHUNK_MAX + h * cbv
+            nblk = cbv // 256
+            last_chunk = vcc == nvch - 1
+            cap = last_chunk.select(cbv, slotv)
+            nvalid = fx.max(fx.min(end_r - vcc * cbv, cbv), I(0))
             stamp(3)
-            lbase = row * POOL + cc * slot
+            lbase = row * POOL + vcc * slotv
             both = cap * 2 + 64 <= HIST
 
             def stats_pass():
@@ -248,7 +257,7 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
                         if keys_at is not None:
                             store_lds(smem.hist, wb + put.select(keys_at + rank, dummy_at + lane), key)
                         if idx_at is not None:
-                            store_lds(smem.hist, wb + put.select(idx_at + rank, dummy_at + lane), cc * cb + j * 256 + lane * 4 + k)
+                            store_lds(smem.hist, wb + put.select(idx_at + rank, dummy_at + lane), vcc * cbv + j * 256 + lane * 4 + k)
                         rg = rg + popcount(m)
                     above_total = yield [rg]
                 if ties > 0:
@@ -265,7 +274,7 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
                             if keys_at is not None:
                                 store_lds(smem.hist, wb + take.select(keys_at + above_total + p, dummy_at + lane), key)
                             if idx_at is not None:
-                                store_lds(smem.hist, wb + take.select(idx_at + above_total + p, dummy_at + lane), cc * cb + j * 256 + lane * 4 + k)
+                                store_lds(smem.hist, wb + take.select(idx_at + above_total + p, dummy_at + lane), vcc * cbv + j * 256 + lane * 4 + k)
                             re = re + popcount(m)
                         tied = yield [re]
                 return above_total
@@ -307,7 +316,7 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
             tk, listed, chunk_max, chunk_min, total = I(INT_MIN), nvalid, I(INT_MIN), I(INT_MAX), I(0)
             if nvalid > cap:
                 chunk_max, chunk_min, smax_, smin_ = stats_pass()
-                kt, ties, tk, listed = threshold(wb, region, nblk, tb, cap, smax_, smin_)
+                kt, ties, tk, listed = threshold(wb, region, nblk, tbv, cap, smax_, smin_)
                 stamp(4)
                 total = emit_list(kt, ties)
             else:
@@ -318,25 +327,25 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
                     kmax, kmin = st[0], st[1]
                     ks = []
                     for e in range_constexpr(4):
-                        key = (off < cb).select(I(v4[e]), I(INT_MIN))  # past the chunk: no key
+                        key = (off < cbv).select(I(v4[e]), I(INT_MIN))  # past the chunk: no key
                         ks.append(key)
                         kmax = fx.max(kmax, key)
                         kmin = fx.min(kmin, (key != I(INT_MIN)).select(key, I(INT_MAX)))
                     buffer_ops.buffer_store(fx.Vector.from_elements(ks, dtype=I), lkeys, lbase + off, mask=off < cap, cache_modifier=CM)
-                    pos4 = fx.Vector.from_elements([cc * cb + off + e for e in range(4)], dtype=I)
+                    pos4 = fx.Vector.from_elements([vcc * cbv + off + e for e in range(4)], dtype=I)
                     buffer_ops.buffer_store(pos4, lidx, lbase + off, mask=off < cap, cache_modifier=CM)
                     stats = yield [kmax, kmin]
                 chunk_max, chunk_min = wave_reduce(stats[0], fx.max), wave_reduce(stats[1], fx.min)
                 stamp(4)
             stamp(7)
             if lane == 0:
-                buffer_ops.buffer_store(fx.Vector.from_elements([tk, (nvalid << 16) | listed, chunk_max, chunk_min], dtype=I), meta, (row * NCH_MAX + cc) * 4, cache_modifier=CM)
-                if cc == 0:
-                    buffer_ops.buffer_store(fx.Vector.from_elements([cb, nch, b, I(0)], dtype=I), info, row * 4, cache_modifier=CM)
+                buffer_ops.buffer_store(fx.Vector.from_elements([tk, (nvalid << 16) | listed, chunk_max, chunk_min], dtype=I), meta, (row * NCH_MAX + vcc) * 4, cache_modifier=CM)
+                if vcc == 0:
+                    buffer_ops.buffer_store(fx.Vector.from_elements([cbv, nvch, b, I(0)], dtype=I), info, row * 4, cache_modifier=CM)
             if nvalid > cap:
                 for jj in range(0, nblk, 1):
                     buffer_ops.buffer_store(lds_load4(smem.keys, region + I(jj) * 256 + lane * 4), full,
-                                            row * FULL_STRIDE + cc * cb + I(jj) * 256 + lane * 4, cache_modifier=CM)
+                                            row * FULL_STRIDE + vcc * cbv + I(jj) * 256 + lane * 4, cache_modifier=CM)
 
         if (tile * rows < count) & ((c * cb < max_end) | (c == 0)):
             stamp(0)
@@ -347,8 +356,11 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
             if fx.const_expr(SKIP == 1):
                 if wave == 0:
                     buffer_ops.buffer_store(I(smem.keys.ptr[lane]), meta, c)
-            if fx.const_expr(SKIP != 1) and (wave < rows) & (tile * rows + wave < count):
-                select_row(wave, c)
+            if fx.const_expr(SKIP != 1):
+                sel_row = wave // hh  # waves of a row are consecutive
+                sel_h = wave - sel_row * hh
+                if (sel_row < rows) & (tile * rows + sel_row < count) & ((c * hh + sel_h) < nvch):
+                    select_row(wave, sel_row, sel_h, c)
             stamp(2)
         if fx.const_expr(sync):
             fx.rocdl.s_waitcnt(vmcnt=0)
