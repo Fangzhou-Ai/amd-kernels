@@ -48,6 +48,8 @@ One line per kernel package. Each package's README has what it does, its entry p
 
 - [`embedding/vocab_gather_h6144`](embedding/vocab_gather_h6144/README.md): vocabulary lookup over four shards without
   an all-reduce.
+- [`embedding/vocab_gather_h7168_v163840_ranks8`](embedding/vocab_gather_h7168_v163840_ranks8/README.md): vocabulary
+  lookup over eight shards without an all-reduce (Kimi-K3.1 TP8).
 - [`embedding/vocab_gather_gemma_mxfp8_h6144`](embedding/vocab_gather_gemma_mxfp8_h6144/README.md): the same lookup +
   Gemma norm + MXFP8 quant in one launch.
 - [`activation/swiglu_oai_mxfp8_i3072`](activation/swiglu_oai_mxfp8_i3072/README.md): SwiGLU + MXFP8 quant for the
