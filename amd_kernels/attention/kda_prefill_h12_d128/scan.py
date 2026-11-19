@@ -39,7 +39,7 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from .common import barrier, bf16x2_hi, bf16x2_lo, lds_load2, lds_load4, lds_store_i16, mfma, sched_barrier
+from .common import barrier, bf16x2_hi, bf16x2_lo, lds_load2, lds_load4, lds_store_i16, mfma, sched_barrier, touch_args
 from .reference import (BT, D, NH, RECORD_AQK, RECORD_BYTES, RECORD_DEC, RECORD_KGT, RECORD_QG, RECORD_U,
                         RECORD_W)
 
@@ -157,6 +157,8 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2, ckpt: bool 
         arg_ckrow: fx.Int64,
         i32_nbfold: fx.Int32,
     ):
+        touch_args(arg_ws, i32_nc, arg_state, i64_slot_bytes, arg_sidx, arg_has, arg_cu, arg_choff, arg_out, i32_ostride, arg_gb, arg_gc,
+                   arg_ga, arg_sin, i32_groups, i32_minc, i32_npairs, arg_ck, i64_ck_row_bytes, arg_ckoff, arg_ckrow, i32_nbfold)
         tx = fx.thread_idx.x
         bid = fx.block_idx.x
         smem = fx.SharedAllocator().allocate(Shared).peek()

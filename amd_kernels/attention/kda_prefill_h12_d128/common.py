@@ -60,3 +60,9 @@ def lds_load2(byte_addr):
 def lds_store_i16(byte_addr, value):
     """Store the low 16 bits of an i32 to LDS."""
     llvm.store(raw(fx.Int32(value).to(fx.Int16)), lds_ptr(byte_addr), alignment=2)
+
+
+def touch_args(*args):
+    """Read every kernel argument at the top: one batch of scalar loads instead of one dependent round per use."""
+    vals = [raw(a) for a in args]
+    llvm.inline_asm(None, vals, "", ",".join("s" for _ in vals), has_side_effects=True)
