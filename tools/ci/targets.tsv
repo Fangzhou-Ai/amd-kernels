@@ -74,3 +74,4 @@ moe/allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8/test_latent_tail.py	8
 moe/allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8/test_warm_up.py	8
 moe/allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8/test_slots.py	8
 moe/layer_tail_k2_h7168_ranks8/test_layer_tail.py	8
+collectives/dcp8_topk_gather_merge_top2048/test_topk_gather_merge.py	8
