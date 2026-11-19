@@ -10,7 +10,7 @@ from amd_kernels.attention.fp8_sparse_mla_decode_dcp8_h96_kv512_top2048.referenc
 PAGE = 64
 SM_SCALE = D**-0.5
 SERVED_ROWS = (12, 24, 40, 65, 80, 128, 192)
-GRAPH_ROWS = (5, 10, 15, 20, 25, 30, 35, 40, 65, 80, 192)
+GRAPH_ROWS = (5, 10, 15, 20, 25, 30, 35, 40, 42, 43, 65, 80, 192)
 SPEC = 4
 NAN_BYTE = 0x7F
 

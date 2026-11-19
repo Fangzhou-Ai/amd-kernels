@@ -101,7 +101,7 @@ def test_key_counts(counts):
     run_case(counts, sum(counts) + 5)
 
 
-@pytest.mark.parametrize("rows", [24, 80])
+@pytest.mark.parametrize("rows", [24, 42, 43, 80])
 @torch.inference_mode()
 def test_key_counts_across_tiers(rows):
     require_gfx950()

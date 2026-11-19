@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Entry and support check of the DCP sparse MLA decode (see ``kernel_wr.py`` and ``kernel_kt.py``)."""
+"""Entry and support check of the DCP sparse MLA decode (see ``kernel_row.py`` and ``kernel_tile.py``)."""
 
 import functools
 
@@ -8,34 +8,25 @@ import torch
 from amd_kernels.common.tensor_shim import _run_compiled
 from amd_kernels.warm_up import entry
 
-from .kernel import HEADS, KV_LORA_RANK, QK_ROPE_HEAD_DIM, RECORD_BYTES, compile_sparse_mla_decode
-from .kernel_kt import compile_decode_kt
-from .kernel_wr import compile_decode_wr
+from ._primitives import HEADS, KV_LORA_RANK, QK_ROPE_HEAD_DIM, RECORD_BYTES
+from .kernel_row import compile_decode_row
+from .kernel_tile import compile_decode_tile
 from .reference import Q_RECORD_BYTES
 
 LOG2E = 1.4426950408889634
 D_QK = KV_LORA_RANK + QK_ROPE_HEAD_DIM
 _MAX_SLOTS = 1 << 29
 
-# rows -> (kind, head groups per workgroup, options); first entry whose bound holds wins
-_PLAN_BF16 = ((48, "wr", 1, ("nog", "w8")), (1 << 30, "kt", 3, ()))
-_PLAN_PQ = ((48, "wr", 1, ("nog", "w8", "pq")), (1 << 30, "kt", 3, ("pq",)))
+_ROW_MAX = 42  # rows up to this run the whole-row kernel, larger counts the tile-loop kernel
 
 
-def _plan(rows, pq):
-    for bound, kind, nh, opts in _PLAN_PQ if pq else _PLAN_BF16:
-        if rows <= bound:
-            return kind, nh, opts
-    raise AssertionError(rows)
+def _kernel(rows):
+    return "row" if rows <= _ROW_MAX else "tile"
 
 
 @functools.cache
-def _launcher(kind, nh, opts):
-    if kind == "wr":
-        return compile_decode_wr(False, opts)
-    if kind == "kt":
-        return compile_decode_kt(nh, False, opts)
-    return compile_sparse_mla_decode()
+def _launcher(kind, pre_quantized):
+    return (compile_decode_row if kind == "row" else compile_decode_tile)(pre_quantized)
 
 
 @functools.lru_cache(maxsize=16)
@@ -113,7 +104,7 @@ def _mode(q, kv_cache, indptr, slots, sm_scale, out=None, q8=None):
 
 
 def _sizes(mode):
-    return [1, 48, 49]
+    return [1, _ROW_MAX + 1]
 
 
 def _inputs(mode, n, q, kv_cache, indptr, slots, sm_scale, out=None, q8=None):
@@ -140,9 +131,8 @@ def fp8_sparse_mla_decode(q, kv_cache, indptr, slots, sm_scale, out=None, q8=Non
     nnz = slots.numel()
     if nnz == 0:
         slots = torch.zeros(1, dtype=torch.int32, device=qt.device)
-    kind, nh, opts = _plan(rows, q8 is not None)
     _run_compiled(
-        _launcher(kind, nh, opts),
+        _launcher(_kernel(rows), q8 is not None),
         qt,
         _kv_rows(kv_cache),
         slots,
