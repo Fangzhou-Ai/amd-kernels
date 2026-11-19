@@ -32,6 +32,12 @@ CASES = [
     ("staged", 1000, 2560, 6144, _Config(128, 256, 128, 2, 4, 3, "staged_ab", 2, 4)),
     ("fourwave", 1200, 6144, 3072, _Config(256, 128, 128, 1, 1, 1, "4wave", 2, 2)),
     ("fourwave_nt", 5000, 6144, 3072, _Config(256, 256, 128, 1, 1, 1, "4wave_nt", 2, 2)),
+    # rows of the 12288 / 4608 / 3072 x 6144 and 6144 x 1536 shapes
+    ("decode_fq_n12288", 7, 12288, 6144, _Config(8, 48, 128, 0, 0, 1, "decode_fq", 4, 0)),
+    ("decode_cm0_n4608", 300, 4608, 6144, _Config(64, 64, 128, 0, 0, 1, "decode", 1, 0, w_cm=0)),
+    ("decode_k1536", 500, 6144, 1536, _Config(128, 96, 128, 0, 0, 1, "decode", 2, 0)),
+    ("staged_n3072", 1000, 3072, 6144, _Config(128, 256, 128, 2, 4, 2, "staged_ab", 2, 4)),
+    ("fourwave_nt_n12288", 4096, 12288, 6144, _Config(256, 256, 128, 1, 1, 1, "4wave_nt", 2, 2)),
 ]
 IDS = [case[0] for case in CASES]
 
