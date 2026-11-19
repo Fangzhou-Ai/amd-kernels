@@ -328,6 +328,7 @@ def build(key: K2Build):
 
     # the route table: a slot's kof row (``few_rows``), else its pick tiles
     few = k2b.few_rows(s)
+    pad = few and k2b.inter_lds(s)
     nkof = k2b.max_u(s) * s if few else 1
     nslot = 1 if few else k2b.max_u(s) + 1
     npick = 1 if few else s * k2b.TOPK
@@ -371,15 +372,15 @@ def build(key: K2Build):
 
     @fx.struct
     class UgLds:
-        latq: fx.Array[fx.Int32, s * k2b.LAT // 8, 16]
-        latsc: fx.Array[fx.Int32, k2b.latsc_words(s), 16]
+        latq: fx.Array[fx.Int32, s * k2b.lq_row(pad), 16]
+        latsc: fx.Array[fx.Int32, s * k2b.ls_row(pad) if few else k2b.latsc_words(s), 16]
 
     # every pick's INTER in LDS, or (polled at use) none
     nq = s * k2b.TOPK if k2b.inter_lds(s) else 1
 
     @fx.struct
     class DownLds:
-        interq: fx.Array[fx.Int32, nq * 48, 16]
+        interq: fx.Array[fx.Int32, nq * k2b.ip_row(pad), 16]
         intsc: fx.Array[fx.Int32, nq * k2b.UG_GROUPS, 16]
         contrib: fx.Array[fx.Float32, s * k2b.TOPK * k2b.ROWS, 16]
 
@@ -529,6 +530,7 @@ def build(key: K2Build):
                 "tslot": rl.tslot.ptr,
             },
             "xbuf": scratch + fx.Int64(lay["xrow"][0]),
+            "pad": pad,
             "xflags": NA,
             "tl_on": key.timeline,
             "tls": lds.tls.ptr,
