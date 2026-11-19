@@ -54,6 +54,7 @@ gemm/mxfp8_common/test_compile.py	compile
 indexer/indexer_nvfp4_d128_p128_top16/test_compile.py	compile
 moe/mxfp4_h6144_i768_e128_top4/test_compile_entry.py	compile
 norm/gemma_add_rmsnorm_h6144/test_compile.py	compile
+sampling/markov_gumbel_fused_v163840_r512/test_compile.py	compile
 
 # precompiled targets: their cold time is mostly compile (cold -> warm: test_moe 528 -> 21 s, test_gemm 347 -> 15,
 # test_dispatch 194 -> 8 (AITER's hipcc build of its CK module), test_publish 178 -> 17)
