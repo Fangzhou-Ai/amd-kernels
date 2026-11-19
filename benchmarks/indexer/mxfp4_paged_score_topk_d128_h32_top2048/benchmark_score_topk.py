@@ -4,7 +4,7 @@
 scorer writing fp32 logits ``[rows, width]``, then AITER's per-row top-2048 with scores), per decode batch and width.
 
 Every shape runs ``NIN`` distinct inputs (query rows and a key cache whose pages the inputs pick at random from a pool
-larger than the last-level cache) in one graph; median of 5 rounds x 5 replays, us per call. The roofline columns
+larger than the last-level cache) in one graph; minimum of 15 rounds x 5 replays, us per call. The roofline columns
 count the index-cache bytes the call must read (68 B a key, once a sequence: its rows share the keys), the query,
 weight and output bytes at the measured 6.4 TB/s HBM rate, the fp4 MFMA work (rows x keys x 32 heads x 128 x 2 flop at
 the measured 8.24 PFLOP/s), and the launch floor of the design: one graph kernel (1.57 us), one cross-workgroup
@@ -13,7 +13,6 @@ Run: python3 benchmarks/indexer/mxfp4_paged_score_topk_d128_h32_top2048/benchmar
 """
 
 import argparse
-import statistics
 
 import torch
 from amd_kernels.indexer.mxfp4_paged_score_topk_d128_h32_top2048 import host
@@ -34,6 +33,9 @@ SHAPES = [  # (sequences, rows a sequence, mean key count a sequence per rank)
     (48, 4, 8192),
     (48, 4, 32768),
     (8, 4, 94208),
+    (13, 5, 65536),
+    (32, 4, 8192),
+    (48, 4, 16384),
     (2, 6, 15360),
     (2, 6, 20480),
     (2, 6, 94208),
@@ -61,7 +63,7 @@ def make_set(seqs, qlen, width, pool, gen):
 
 def timed(g, n):
     ts = []
-    for _ in range(5):
+    for _ in range(15):
         a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         a.record()
         for _ in range(5):
@@ -69,7 +71,7 @@ def timed(g, n):
         b.record()
         b.synchronize()
         ts.append(a.elapsed_time(b) * 1000 / (5 * n))
-    return statistics.median(ts)
+    return min(ts)
 
 
 def graph(fn):
@@ -124,7 +126,8 @@ def main():
     pool[:, 4096:] = torch.randint(118, 124, (pool_pages, 256), dtype=torch.uint8, device="cuda", generator=gen)
     pool = pool.unflatten(1, (64, 68))
     print("seqs x rows | width | stock us | fused us | speedup | key MB | TB/s | HBM us | fp4 us | ceiling us | % of ceiling")
-    for seqs, qlen, width in shapes:
+    for position, (seqs, qlen, width) in enumerate([shapes[0]] + list(shapes)):
+        warm = position == 0  # the first shape runs once more first: the GPU's clocks and caches settle
         sets, keys = zip(*(make_set(seqs, qlen, width, pool, gen) for _ in range(NIN)))
         rows = seqs * qlen
         out_idx = torch.empty(rows, TOPK, dtype=torch.int32, device="cuda")
@@ -133,6 +136,8 @@ def main():
         host_calls = [lambda s=s: host._score_topk(**s, out_indices=out_idx, out_scores=out_val, uniform=True) for s in sets]
         t_stock = timed(graph(lambda: [c() for c in stock]), NIN)
         t_fused = timed(graph(lambda: [c() for c in host_calls]), NIN)
+        if warm:
+            continue
         mean_keys = sum(keys) / NIN
         read = mean_keys * 68 + rows * (2048 + 256 + 128)
         written = rows * TOPK * 8

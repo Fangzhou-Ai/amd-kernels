@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Entry, launch configuration and scratch of the MXFP4 paged index scorer + top-2048 (two launches)."""
+"""Entry, launch configuration and scratch of the MXFP4 paged index scorer + top-2048 (one launch)."""
 
 import functools
 
@@ -172,10 +172,10 @@ def _score_topk(
 
 
 def prefer_fused(batch: int, width: int) -> bool:
-    """Where the fused call beats the unfused scorer + top-k pair in graph replay (measured, cold pages): at most 8
-    sequences (up to 6 rows each) of 16384+ keys a rank. Beyond that the chunk kernel's select work, not the bytes,
-    sets the time and the pair is as fast or faster."""
-    return batch <= 8 and width >= 16384
+    """Where the fused call beats the unfused scorer + top-k pair in cold-page graph replay: everywhere measured but
+    more than 32 sequences of a rank's 8192 keys or fewer (48 x 4 rows x 8K: 0.95x), where the unfused pair is
+    marginally faster."""
+    return not (batch > 32 and width <= 8192)
 
 
 def _mode(*args, **kwargs):
@@ -212,13 +212,16 @@ def _inputs(mode, n, q_payload, q_scales, weights, cache, block_table, query_sta
 mxfp4_paged_score_topk = entry("indexer/mxfp4_paged_score_topk_d128_h32_top2048", mode=_mode, sizes=_sizes, inputs=_inputs)(
     _score_topk
 )
-mxfp4_paged_score_topk.__doc__ = """The DSA decode indexer's scoring + per-row top-2048 in two launches. Replaces vLLM's
+mxfp4_paged_score_topk.__doc__ = """The DSA decode indexer's scoring + per-row top-2048 in ONE launch. Replaces vLLM's
 ``score_paged`` + ``_select(logits, row_ends, selected, score_rows)`` of a decode batch (the logits never reach memory).
 
-Args (positional; the operands of ``score_paged`` plus the outputs): ``q_payload`` uint8 [rows, 32, 64] and ``q_scales``
-uint8 [rows, 1, 4, 16, 4] (the quantized query rows), ``weights`` fp32 [rows, 32] (head weights times
-``weight_scale``), ``cache`` uint8 [pages, 64, 68] index pages (page stride >= 4352 B), ``block_table`` int32 [B,
-width / 64], ``query_start_loc`` int32 [B + 1], ``row_ends`` int32 [rows], ``max_query_len`` (1 - 6 rows a
-sequence), ``out_indices`` int32 [rows, 2048] and ``out_scores`` fp32 [rows, 2048] written in full for every row
-(``-1`` / ``-inf`` past a row's live keys). Rows past ``query_start_loc[-1]`` are padding rows. CUDA-graph safe; the
-scratch is one set a device, so two launches must not run concurrently."""
+Args (the operands of ``score_paged`` plus the outputs): ``q_payload`` uint8 [rows, 32, 64] and ``q_scales`` uint8
+[rows, 1, 4, 16, 4] (the quantized query rows), ``weights`` fp32 [rows, 32] (head weights times ``weight_scale``),
+``cache`` uint8 [pages, 64, 68] index pages (page stride >= 4352 B), ``block_table`` int32 [B, width / 64],
+``query_start_loc`` int32 [B + 1], ``row_ends`` int32 [rows] (the causal key bound of each row, local keys),
+``max_query_len`` (1 - 6 rows a sequence), ``out_indices`` int32 [rows, 2048] and ``out_scores`` fp32 [rows, 2048]
+written in full for every row (the 2048 best keys, unordered, ties at the 2048th score in any order; ``-1`` /
+``-inf`` past a row's live keys; rows past ``query_start_loc[-1]`` are padding rows). ``uniform=True`` asserts
+``query_start_loc == arange(B + 1) * max_query_len`` (every sequence has ``max_query_len`` rows) and saves a dependent
+table read. CUDA-graph safe; the scratch (~145 MB) is one set a device and stream. Compile every variant before
+serving: the entry warms itself up on its first call (``amd_kernels.warm_up``)."""

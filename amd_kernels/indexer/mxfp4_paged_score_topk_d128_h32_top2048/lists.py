@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Chunk kernel: FP4 paged MQA scores of one chunk of a sequence's keys for its query rows, and each row's top list.
+"""Chunk role: FP4 paged MQA scores of one chunk of a sequence's keys for its query rows, and each row's top list.
 
-One workgroup (8 waves) a (sequence, chunk): the waves score the chunk's 64-key steps for every row of the sequence
-into LDS (``scoring.py``), then wave ``r`` selects row ``r``'s list of the chunk (``geometry.py``: the ``tb`` largest
-keys, or every live key of the sequence's last chunk) with a three pass radix select over the keys in LDS (11, 11 and
-10 bits of the order-preserving key, left-aligned past the bits all keys share), compacts it lane-major into an LDS
-stage (the wave's histogram, dead by then) and stores keys, then positions, as coalesced rows. Entries past a row's
-live keys are ``INT_MIN``; ``meta`` records the list's smallest key (the chunk's ``tb``-th largest, or ``INT_MIN`` when
-it holds every live key) and the chunk's live key count, which the merge kernel needs to know whether the list may miss
-keys above its threshold. The scores are never stored.
+One workgroup (8 waves) a (sequence, chunk, row tile): the waves score the chunk's 64-key steps for every row of the
+tile into LDS (``scoring.py``), then a wave (two for rows of a long chunk: the chunk's two halves are lists of their own)
+selects a row's list of the chunk (``geometry.py``: the ``tb`` largest keys, or every live key of the sequence's last
+chunk, which is simply copied out of LDS) with a radix select over the keys in LDS (a few rounds of 10 or 11 bits of
+the order-preserving key, left-aligned past the bits all keys share; a round whose threshold bin brings the list to its
+slot size ends it), compacts it lane-major into an LDS stage (the wave's histogram, dead by then) and stores keys, then
+positions, as write-through rows. Entries past a row's live keys are ``INT_MIN``; ``meta`` records the list's lower
+bound (the key of its threshold bin, ``INT_MIN`` when it holds every live key), the live and listed key counts and the
+chunk's extreme keys, which the merge needs to know whether the list may miss keys above its threshold; a chunk with more
+live keys than its list also stores its scores whole (the merge reads them in the rare case a list falls short). The
+workgroup ends by counting itself into its (sequence, row tile)'s ready count.
 """
 
 import flydsl.compiler as flyc

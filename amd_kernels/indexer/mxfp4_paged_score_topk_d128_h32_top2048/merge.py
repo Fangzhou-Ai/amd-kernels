@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 # The radix passes of the exact fallback, block scans and tie handling follow AITER's FlyDSL DCP top-k merge
 # (aiter/ops/flydsl/kernels/dcp_topk_merge.py, MIT, Copyright (C) 2024-2026, Advanced Micro Devices, Inc.).
-"""Merge kernel: the top 2048 keys of a row from its chunk lists.
+"""Merge role: the top 2048 keys of a row from its chunk lists.
 
-One workgroup (512 threads) a row. The row's pool (the chunk kernel's lists, ``geometry.py``) is read into registers
+One workgroup (512 threads) a row, started with the chunk workgroups: it waits for its (sequence, row tile)'s ready count,
+then reads the row's pool (the chunk role's lists, ``geometry.py``, four blocks of 2048 entries at most) into registers
 as order-preserving int32 keys, thread ``t`` holding entries ``4 t .. 4 t + 3`` of each 2048-entry block. Each key is
 cut to a bin of 2046 equal slices of the pool's score range (the chunk kernel's per-chunk minimum and maximum): one
 histogram pass and a wave-0 scan find the bin that holds the 2048th key, the keys in higher bins go straight to the
