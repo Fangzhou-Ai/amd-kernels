@@ -13,6 +13,8 @@ One line per kernel package. Each package's README has what it does, its entry p
 - [`gemm/mxfp8_gateup_swiglu_n6144_k6144_i3072`](gemm/mxfp8_gateup_swiglu_n6144_k6144_i3072/README.md): dense MLP
   gate_up + SwiGLU at 1-8 rows.
 - [`gemm/bf16_n50016_k6144`](gemm/bf16_n50016_k6144/README.md): the lm_head vocabulary shard, with an optional row map.
+- [`gemm/bf16_n20480_k7168`](gemm/bf16_n20480_k7168/README.md): the Kimi-K3.1 lm_head vocabulary shard (TP8), with a row
+  map and a publish epilogue into the logits exchange.
 - [`gemm/bf16_n200064_k256`](gemm/bf16_n200064_k256/README.md): the draft's Markov projection over selected rows.
 - [`gemm/bf16_concat_linear_n1536_k30720`](gemm/bf16_concat_linear_n1536_k30720/README.md): the draft's input fc over
   five taps, and the four-rank gather.
@@ -72,6 +74,8 @@ One line per kernel package. Each package's README has what it does, its entry p
   without CUs.
 - [`collectives/all_to_all_bf16_n50016_ranks4`](collectives/all_to_all_bf16_n50016_ranks4/README.md): logits rows into
   the final vocabulary layout.
+- [`collectives/all_to_all_bf16_n20480_ranks8`](collectives/all_to_all_bf16_n20480_ranks8/README.md): logits rows into
+  the owner's `[rows, 163840]` layout (or an all-gather) over eight ranks.
 - [`collectives/all_gather_sampler_i64_c8_ranks4`](collectives/all_gather_sampler_i64_c8_ranks4/README.md): the
   sampler output gather.
 - [`collectives/all_gather_i64_c7_ranks4`](collectives/all_gather_i64_c7_ranks4/README.md): draft token ids into batch

@@ -32,6 +32,8 @@ norm/gemma_add_rmsnorm_h6144/test_staged_ar_add_rmsnorm.py	4
 norm/gemma_add_rmsnorm_h6144/test_oneshot_pull_ack.py	4
 collectives/pull_collectives_ranks4/test_all_gather.py	4
 collectives/all_to_all_bf16_n50016_ranks4/test_exchange.py	4
+collectives/all_to_all_bf16_n20480_ranks8/test_exchange.py	8
+gemm/bf16_n20480_k7168/test_push.py	8
 gemm/bf16_n50016_k6144/test_publish.py	4		python3 -c "import tests, torch; from amd_kernels.gemm.bf16_n50016_k6144 import warmup_bf16_gemm_n50016_k6144 as w; w(torch.device('cuda'), True)"
 norm/gemma_add_rmsnorm_h6144/test_decoder_ar_norm.py	4
 norm/gemma_add_rmsnorm_h6144/test_decoder_tail_ranks4.py	4
