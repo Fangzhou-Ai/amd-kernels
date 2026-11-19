@@ -68,3 +68,32 @@ def check_close(out, lse, ref_out, ref_lse):
         err = (o - ro).abs()
         assert (err <= bound).all(), f"max abs error {err.max().item()} vs {bound.min().item()}"
         assert (lse[live] - ref_lse[live]).abs().max().item() <= 1e-2, "lse"
+
+
+Q_RECORD_BYTES = 1168
+Q_HI, Q_LO, Q_ROPE, Q_SCALE = 0, 512, 1024, 1152
+
+
+def quantize_q(q: torch.Tensor) -> torch.Tensor:
+    """Pre-quantized q ``[rows, 96, 1168]`` uint8 from bf16 ``q [rows, 96, 576]``, the form the kernel quantizes in-kernel.
+
+    Per (row, head) and block b of 128 latent dims: ``s_b = max(exponent(amax_b) - 7, 1)`` (E8M0 byte, ``exponent`` the biased
+    f32 exponent), ``x = q * 2^(127 - s_b)``, hi = e4m3fn(x) (round to nearest even), lo = e4m3fn((x - hi) * 32); the lo
+    scale is ``max(s_b - 5, 0)``. Record bytes: hi [0, 512), lo [512, 1024), rope bf16 [1024, 1152), s_0..s_3 [1152, 1156),
+    zero padding to 1168.
+    """
+    rows, heads, d = q.shape
+    x = q[..., :L].float().view(rows, heads, 4, BLOCK)
+    amax = x.abs().amax(dim=-1)
+    e = (amax.view(torch.int32) >> 23) & 0xFF
+    s = (e - 7).clamp(min=1)
+    inv = ((254 - s) << 23).to(torch.int32).view(torch.float32)
+    xs = x * inv[..., None]
+    hi = xs.to(torch.float8_e4m3fn)
+    lo = ((xs - hi.float()) * 32.0).to(torch.float8_e4m3fn)
+    out = torch.zeros(rows, heads, Q_RECORD_BYTES, dtype=torch.uint8, device=q.device)
+    out[..., Q_HI:Q_LO] = hi.view(torch.uint8).view(rows, heads, L)
+    out[..., Q_LO:Q_ROPE] = lo.view(torch.uint8).view(rows, heads, L)
+    out[..., Q_ROPE:Q_SCALE] = q[..., L:].contiguous().view(torch.uint8).view(rows, heads, 2 * R)
+    out[..., Q_SCALE : Q_SCALE + 4] = s.to(torch.uint8)
+    return out
