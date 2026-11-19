@@ -53,6 +53,7 @@ from .oproj import (
 from .attn_res import (
     poll_rows_to_lds,
 )
+from amd_kernels.common.mono.debug import stamp
 from amd_kernels.common.mono.mx import (
     FP4,
     UNIT_SCALE,
@@ -473,10 +474,14 @@ def early_compute(c, kind, i, q, ops):
             gemv.rows_to_lds(
                 tid, src, klen, n, c["xl"], xrow, cm, ldk=HIDDEN, k0=q * klen, t0=t0
             )
+        if const_expr(kind == 0):
+            stamp(c["tl_on"], c["tls"], tid, 18)
         acc = gemv.mfmas(lane, wave, c["xl"], xrow, klen, n, ops)
         fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
         gpu.barrier()
         early_out(c, kind, i, q, red, t0, n)
+        if const_expr(kind == 0):
+            stamp(c["tl_on"], c["tls"], tid, 19)
 
 
 @traced
@@ -629,6 +634,7 @@ def stage_route(c, t):
             # (OPT_BATCH) One batch (POLL_MAX would split the 14)
             got = c["poll"](specs, batch=per) if batch_on(c) else c["poll"](specs)
             lgs = [f32_of(got[i][0]) for i in range(per)]
+        stamp(c["tl_on"], c["tls"], c["tid"], 20)
         keys, sigs = [], []
         for i in range_constexpr(per):
             lg = lgs[i]
@@ -760,6 +766,7 @@ def load_route_few(c):
     npk = s * TOPK
     assert npk <= THREADS and 2 * THREADS >= E
     poll_route(c)
+    stamp(c["tl_on"], c["tls"], tid, 22)
     for i in range_constexpr((E + THREADS - 1) // THREADS):
         e = tid + THREADS * i
         if e < E:
@@ -1485,6 +1492,7 @@ def stage_lnorm(c, t):
             ],
             batch=nch * TP,
         )
+    stamp(c["tl_on"], c["tls"], tid, 26)
     vals = []
     for i in range_constexpr(nch):
         acc0, acc1 = bf2_f32(got[i * TP][0])
@@ -1567,6 +1575,7 @@ def stage_up(c, j, tile=None):
         if tid == 0:
             c["poll"]([(c["shrdy"], j, 1)])
     gpu.barrier()
+    stamp(c["tl_on"], c["tls"], tid, 27)
     if const_expr(tile is None):
         for t0, n in gemv.token_tiles(s, gemv.tile_rows(LAT)):
             up_tile(c, j, ops, t0, n)
