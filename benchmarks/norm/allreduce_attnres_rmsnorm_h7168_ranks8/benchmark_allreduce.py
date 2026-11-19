@@ -24,15 +24,26 @@ ROW = H * 2
 
 
 def traffic(m, blocks, write):
-    """(HBM bytes of one rank, xGMI bytes it receives) of m rows: bank, prefix read and write, partial, output, the
-    mailbox writes and reads of both phases."""
-    hbm = m * (ROW * (blocks + 4 + (1 if write else 0)) + 4 * 7 * ROW // 8 * 2)
-    return hbm, m * 14 * ROW // 8
+    """(HBM bytes of one rank, xGMI bytes it sends, FLOPs of one rank) of m rows of the pre-MLP call (prefix, ``blocks``
+    bank rows, output norm). HBM: partial, prefix and the bank rows read; prefix out, output (and the bank row of a
+    write) written; the 2 x 7/8 row of mailbox data received is written once and read once. xGMI: 2 phases x 7/8 row
+    sent (and the same received). FLOPs: ss, dot per source (2 x 2 per element of blocks + 1 sources), the mix (2 per
+    element and source), the prefix add, the output norm (about 4), the eight-way reduction of a 1/8 slice."""
+    hbm = m * ROW * (2 + blocks + 2 + (1 if write else 0) + 2 * 7 / 8 * 2)
+    flops = m * H * (4 * (blocks + 1) + 2 * (blocks + 1) + 1 + 4 + 7 / 8)
+    return hbm, m * 2 * 7 * ROW // 8, flops
 
 
 def floor_us(m):
-    """AR floor of hw_ceilings.md (5 us + 2 * 7/8 * bytes / 400 GB/s) plus the one-launch tail after the exchange."""
+    """Model floor: the AR floor of hw_ceilings.md (5 us + 2 * 7/8 * bytes / 400 GB/s) plus the tail after the exchange."""
     return 5.0 + 1.75 * m * ROW / 400e3 + 1.2
+
+
+def chain_floor_us(m):
+    """Primitive-chain floor from measured pieces: the empty-kernel graph period 1.57 us (hw_ceilings.md section 3),
+    the partial load 0.5, a flight 0.77 + a mailbox read 0.23 twice, the reduction 0.1, the tail (prefix, norm, store)
+    0.6, plus the two phases' bytes at the measured all-to-all push ceiling (they cannot overlap the flights)."""
+    return 1.57 + 0.5 + 2 * (0.77 + 0.23) + 0.1 + 0.6 + m * 2 * 7 * ROW / 8 / (XGMI_GBPS * 1e3)
 
 
 def worker(rank, errors, m, blocks, write, rounds):
@@ -98,16 +109,18 @@ def worker(rank, errors, m, blocks, write, rounds):
     if rank == 0:
         vals = [[max(v[k][r] for v in every) for r in range(rounds)] for k in range(len(graphs))]
         med = [statistics.median(v) for v in vals]
-        hbm, link = traffic(m, blocks, write)
+        hbm, link, flops = traffic(m, blocks, write)
         best = min(vals[1])
-        floor = floor_us(m)
+        floor, chain = floor_us(m), chain_floor_us(m)
         print(json.dumps(dict(
             rows=m, blocks=blocks, write=write, sets=n, stock_us=round(med[0], 2), ar_us=round(med[2], 2),
             attn_res_us=round(med[3], 2), fused_us=round(best, 2), fused_median_us=round(med[1], 2),
             speedup=round(med[0] / best, 3), hbm_mb=round(hbm / 1e6, 2),
             hbm_pct_ceiling=round(100 * hbm / (HBM_TBPS * 1e6) / best, 1), xgmi_mb=round(link / 1e6, 2),
-            xgmi_pct_ceiling=round(100 * link / (XGMI_GBPS * 1e3) / best, 1), floor_us=round(floor, 2),
-            pct_of_floor=round(100 * floor / best, 1))), flush=True)
+            xgmi_pct_ceiling=round(100 * link / (XGMI_GBPS * 1e3) / best, 1), hbm_tbps=round(hbm / best / 1e6, 3),
+            xgmi_gbps=round(link / best / 1e3, 1), gflops=round(flops / 1e9, 3), tflops_per_s=round(flops / best / 1e6, 3),
+            floor_us=round(floor, 2), pct_of_floor=round(100 * floor / best, 1), chain_floor_us=round(chain, 2),
+            pct_of_chain_floor=round(100 * chain / best, 1))), flush=True)
     comm.close()
     ca.close()
 

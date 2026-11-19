@@ -29,7 +29,8 @@ import flydsl.expr as fx
 from amd_kernels.common import buffer_ops
 from amd_kernels.warm_up import launcher
 from flydsl.expr import const_expr, range_constexpr
-from flydsl.expr.typing import T
+from flydsl._mlir.dialects import arith as _arith
+from flydsl.expr.typing import T, as_ir_value
 from flydsl.expr.typing import Vector as Vec
 
 from .norm_math import (
@@ -84,8 +85,14 @@ def _empty(v):
         fx.Int32(v[3]) == EMPTY)
 
 
-def _empty_at(big, i):
-    return _empty([big[4 * i + k] for k in range(4)])
+def _any_empty(big, n):
+    """True if any dword of the first ``n`` packets of ``big`` is the empty marker: the unsigned maximum of the dwords is
+    0xFFFFFFFF exactly then (a sent dword never has that value; the loads of an excluded lane return zeros). One
+    ``v_max3_u32`` per two dwords instead of a compare chain per packet."""
+    m = as_ir_value(fx.Int32(big[0]))
+    for k in range(1, 4 * n):
+        m = _arith.maxui(m, as_ir_value(fx.Int32(big[k])))
+    return fx.Int32(m) == EMPTY
 
 
 def _sendable(v):
@@ -183,10 +190,7 @@ def compile_allreduce_attnres_rmsnorm(has_prefix: bool, out_norm: bool, has_bank
             big = Vec.from_elements([fx.Int32(f[k]) for f in firsts for k in range(4)], fx.Int32)
 
             def pending(b):
-                p = oks[0] & _empty_at(b, 0)
-                for i in range_constexpr(1, n):
-                    p = p | (oks[i] & _empty_at(b, i))
-                return p
+                return _any_empty(b, n)
 
             while pending(big):
                 compiler_barrier()
