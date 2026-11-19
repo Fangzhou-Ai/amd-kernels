@@ -42,6 +42,8 @@ SCRATCH_DW = REC_OFF + 48 * 256 * REC_DW
 NWG = 256
 NW = 4
 TILES = V // 16 // (NWG * NW)  # 16-column tiles of a wave
+RES_TILES = {1: (2, 2, 2, 1), 2: (2, 1, 1, 1), 3: (0, 0, 0, 0)}  # tiles per wave kept in LDS across the steps, by row tiles
+RES_LO = 1  # their first tile index
 TS = bool(int(__import__("os").environ.get("AMD_KERNELS_MARKOV_TS", "0")))  # per-workgroup timestamps into the scratch
 TS_OFF = SCRATCH_DW
 WG_COLS = V // NWG
@@ -173,6 +175,13 @@ def _dma(rsrc, lds_addr, voff, size):
     fx.rocdl.raw_ptr_buffer_load_lds(rsrc, lds.result, fx.Int32(size), fx.Int32(voff), fx.Int32(0), fx.Int32(0), aux=0)
 
 
+def _by_wave(vals, w):
+    out = I(vals[-1])
+    for i in range(len(vals) - 2, -1, -1):
+        out = (w == i).select(I(vals[i]), out)
+    return out
+
+
 def _wave_or(b, upper16, upper32):
     for mm in (1, 2, 4, 8):
         b = b | _xor_lane(b, mm, upper16)
@@ -193,6 +202,8 @@ def compile_markov_chain(mt: int, ksteps: int, sleep: int = 1):
     SLAB_IT = (ROWS * QMAX + 63) // 64  # DMA instructions of a wave's slab
     SLAB_CH = SLAB_IT * 64  # chunks of its LDS region (whole instructions)
     assert 1 <= MT <= 3 and 1 <= K <= 8 and TILES * NWG * NW * 16 == V
+    RW = RES_TILES[MT]
+    NSLOT = sum(RW)
     name = f"markov_gumbel_chain_v163840_r512_mt{MT}_k{K}"
 
     @fx.struct
@@ -204,6 +215,7 @@ def compile_markov_chain(mt: int, ksteps: int, sleep: int = 1):
         pi: fx.Array[fx.Int32, NW * ROWS]
         tk: fx.Array[fx.Int32, 64]
         rk: fx.Array[fx.Int32, 4]
+        rbuf: fx.Array[fx.Int32, max(NSLOT, 1) * 4096, 16]  # resident weight tiles: 16 KB each
 
     @flyc.kernel(name=name, known_block_size=[64 * NW, 1, 1])
     def kernel(
@@ -329,6 +341,8 @@ def compile_markov_chain(mt: int, ksteps: int, sleep: int = 1):
         fx.gpu.barrier()
         rkw = I(fx.rocdl.readfirstlane(T.i32, fx.as_ir_value(I(smem.rk.ptr[0]))))
         n0 = ((xcc * 32 + rkw) * NW + wave) * TILES * 16  # each XCC streams one contiguous eighth of the columns
+        rw = _by_wave(RW, wave)  # resident tiles of this wave, from slot ``rslot0``
+        rslot0 = _by_wave([sum(RW[:w]) for w in range(NW)], wave)
         fx.rocdl.sched_barrier(0)
         ws0 = gather_issue(tok_l)
         fx.rocdl.sched_barrier(0)
@@ -344,6 +358,15 @@ def compile_markov_chain(mt: int, ksteps: int, sleep: int = 1):
         for s in range_constexpr(K):
             st_write(s, l1[s], l2[s])
 
+        def fetch_next(from_lds, slot, nwi, gmask):
+            out = [Vec.filled(4, 0, I) for _ in range(KSTEPS)]
+            if from_lds:
+                out = res_read(slot)
+            else:
+                out = [Vec(buffer_ops.buffer_load(w2_r, nwi * (RANK // 2) + k * 16 + (lane // 16) * 4, vec_width=4,
+                                                  dtype=I, mask=gmask)) for k in range_constexpr(KSTEPS)]
+            return out
+
         def finish_step(smem, s, noisy, divide, afr, temps, h0s, cur):
             best_v = [F(NEG_INF) for _ in range(MT)]
             best_i = [I(0) for _ in range(MT)]
@@ -356,11 +379,14 @@ def compile_markov_chain(mt: int, ksteps: int, sleep: int = 1):
                     ti = I(t) + (T1 if h == 1 else 0)
                     nt = ti + 1
                     more = nt < TILES
+                    nres = more & (nt >= RES_LO) & (nt < RES_LO + rw)  # the next tile is resident
                     nt = more.select(nt, I(0))
                     nwi = n0 + nt * 16 + lane % 16
-                    nwv = [Vec(buffer_ops.buffer_load(w2_r, nwi * (RANK // 2) + k * 16 + (lane // 16) * 4,
-                                                      vec_width=4, dtype=I,
-                                                      mask=more | (s < K - 1))) for k in range_constexpr(KSTEPS)]
+                    first = s == 0
+                    gmask = more.select(nres.select(first, more), s < K - 1)
+                    nwv = fetch_next(nres & (s > 0), rslot0 + nt - RES_LO, nwi, gmask)
+                    if first & (ti >= RES_LO) & (ti < RES_LO + rw):
+                        res_write(smem, rslot0 + ti - RES_LO, wv)
                     acc = [Vec.filled(4, 0.0, F) for _ in range(MT)]
                     for k in range_constexpr(KSTEPS):
                         for m in range_constexpr(MT):
@@ -430,6 +456,22 @@ def compile_markov_chain(mt: int, ksteps: int, sleep: int = 1):
                                                fx.make_layout(ROWS * ER, 1)), fx.make_layout(4, 1))
         buf16 = fx.logical_divide(fx.make_view(fx.recast_iter(fx.Int32, smem.buf.ptr),
                                                fx.make_layout(NW * SLAB_CH * 4, 1)), fx.make_layout(4, 1))
+
+        rbuf16 = fx.logical_divide(fx.make_view(fx.recast_iter(fx.Int32, smem.rbuf.ptr),
+                                                fx.make_layout(max(NSLOT, 1) * 4096, 1)), fx.make_layout(4, 1))
+
+        def res_read(slot):
+            out = []
+            for kk in range_constexpr(KSTEPS):
+                rm = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+                fx.copy(atom, fx.slice(rbuf16, (None, slot * 1024 + kk * 64 + lane)), rm)
+                out.append(Vec(fx.memref_load_vec(rm)))
+            return out
+
+        def res_write(smem, slot, wv):
+            for kk in range_constexpr(KSTEPS):
+                for e in range_constexpr(4):
+                    smem.rbuf.ptr[slot * 4096 + (kk * 64 + lane) * 4 + e] = wv[kk][e]
 
         def a_frag(m, k):
             rm = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
