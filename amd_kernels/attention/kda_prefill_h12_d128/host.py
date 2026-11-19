@@ -67,7 +67,7 @@ def plan_groups(chunk_counts):
     return best
 
 
-def scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_state, out, chunk_counts=None, groups=None,
+def chunk_scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_state, out, chunk_counts=None, groups=None,
          checkpoint_state=None, checkpoint_offsets=None, checkpoint_rows=None):
     """Chunk scan over the workspace records ``ws`` [H, Nc, RECORD_BYTES]; updates ``state_cache`` rows in place and writes the
     bf16 outputs of the tokens into ``out`` [T, 12, 128] (row stride ``out.stride(0)``). ``chunk_counts``: the chunks of each
@@ -131,10 +131,10 @@ def _prefill(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_s
     """The KDA prefill of one layer: conv + prologue, chunk scan, gated RMSNorm. Writes ``out`` [T, 12, 128] bf16, rolls
     ``conv_state`` and updates ``state_cache`` rows in place. ``table``: ``prologue.chunk_table`` of the step (built once per step
     and shared by the layers; built here when ``None``); ``chunk_counts``: the chunks of each sequence as host ints (sizes the
-    groups of long chains); ``checkpoint_*``: see ``scan``."""
+    groups of long chains); ``checkpoint_*``: see ``chunk_scan``."""
     ws = _prologue.prologue(mixed, raw_g, beta_logit, A_log, dt_bias, lower_bound, scale, conv_weight, conv_state, state_indices,
                             has_initial_state, cu_seqlens, chunk_indices, table=table)
-    scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_state, out, chunk_counts,
+    chunk_scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_state, out, chunk_counts,
          checkpoint_state=checkpoint_state, checkpoint_offsets=checkpoint_offsets, checkpoint_rows=checkpoint_rows)
     return gated_norm(out, gate, norm_weight, norm_eps, out)
 

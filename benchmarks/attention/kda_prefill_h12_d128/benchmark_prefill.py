@@ -99,7 +99,7 @@ def stage_arms(c, cu, ci, co, counts):
 
     f_pro()
     fused = [("conv + prologue", f_pro),
-             ("scan", lambda: host.scan(ws["ws"], cu, co, state, c["state_indices"], c["has_initial_state"], out, counts)),
+             ("scan", lambda: host.chunk_scan(ws["ws"], cu, co, state, c["state_indices"], c["has_initial_state"], out, counts)),
              ("gated norm", lambda: host.gated_norm(out, c["gate"], c["norm_weight"], c["norm_eps"], out))]
     w2 = c["conv_weight"].permute(0, 2, 1).reshape(3 * R.LP, 4).contiguous()
     cs2, state2 = c["conv_state"].clone(), c["state_cache"].clone()

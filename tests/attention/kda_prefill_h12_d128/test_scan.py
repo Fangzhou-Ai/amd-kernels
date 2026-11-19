@@ -44,12 +44,12 @@ def test_scan(seq, init, groups, dt_shift):
     o_ref = R.chunk_reference(R.unpack_record(rec), cu, ref_state, c["state_indices"], c["has_initial_state"])
     state = c["state_cache"].clone()
     out = torch.zeros(sum(seq), R.NH, R.D, dtype=torch.bfloat16, device="cuda")
-    host.scan(rec, cu, offsets(cu), state, c["state_indices"], c["has_initial_state"], out, groups=groups)
+    host.chunk_scan(rec, cu, offsets(cu), state, c["state_indices"], c["has_initial_state"], out, groups=groups)
     assert rel(out, o_ref) < OUT_TOL
     assert rel(state, ref_state) < STATE_TOL
     again = c["state_cache"].clone()
     out2 = torch.zeros_like(out)
-    host.scan(rec, cu, offsets(cu), again, c["state_indices"], c["has_initial_state"], out2, groups=groups)
+    host.chunk_scan(rec, cu, offsets(cu), again, c["state_indices"], c["has_initial_state"], out2, groups=groups)
     assert torch.equal(out, out2) and torch.equal(state, again)
 
 
@@ -63,7 +63,7 @@ def test_state_continuation():
     cu = c["cu_seqlens"]
     whole_state = c["state_cache"].clone()
     out_whole = torch.zeros(first + second, R.NH, R.D, dtype=torch.bfloat16, device="cuda")
-    host.scan(rec, cu, offsets(cu), whole_state, c["state_indices"], c["has_initial_state"], out_whole)
+    host.chunk_scan(rec, cu, offsets(cu), whole_state, c["state_indices"], c["has_initial_state"], out_whole)
     ws = R.unpack_record(rec)
     nc1 = first // 64
     rec1, rec2 = rec[:, :nc1].contiguous(), rec[:, nc1:].contiguous()
@@ -72,8 +72,8 @@ def test_state_continuation():
     st = c["state_cache"].clone()
     o1 = torch.zeros(first, R.NH, R.D, dtype=torch.bfloat16, device="cuda")
     o2 = torch.zeros(second, R.NH, R.D, dtype=torch.bfloat16, device="cuda")
-    host.scan(rec1, cu1, offsets(cu1), st, c["state_indices"], c["has_initial_state"], o1)
-    host.scan(rec2, cu2, offsets(cu2), st, c["state_indices"], torch.ones_like(c["has_initial_state"]), o2)
+    host.chunk_scan(rec1, cu1, offsets(cu1), st, c["state_indices"], c["has_initial_state"], o1)
+    host.chunk_scan(rec2, cu2, offsets(cu2), st, c["state_indices"], torch.ones_like(c["has_initial_state"]), o2)
     assert torch.equal(torch.cat([o1, o2]), out_whole)
     assert torch.equal(st, whole_state)
 
@@ -95,7 +95,7 @@ def test_checkpoint(seq, offs, rows, groups, dt_shift):
     R.chunk_reference(R.unpack_record(rec), cu, ref_state, c["state_indices"], c["has_initial_state"], ref_ck, ck_off, ck_rows)
     state, ck = c["state_cache"].clone(), torch.zeros_like(ref_ck)
     out = torch.zeros(sum(seq), R.NH, R.D, dtype=torch.bfloat16, device="cuda")
-    host.scan(rec, cu, offsets(cu), state, c["state_indices"], c["has_initial_state"], out, groups=groups, checkpoint_state=ck,
+    host.chunk_scan(rec, cu, offsets(cu), state, c["state_indices"], c["has_initial_state"], out, groups=groups, checkpoint_state=ck,
               checkpoint_offsets=ck_off, checkpoint_rows=None if rows is None else ck_rows)
     assert rel(state, ref_state) < STATE_TOL
     assert rel(ck, ref_ck) < STATE_TOL

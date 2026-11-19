@@ -33,14 +33,15 @@ def run(c, check=None):
     conv_state, state = c["conv_state"].clone(), c["state_cache"].clone()
     host.prefill(c["mixed"], c["raw_g"], c["beta_logit"], c["gate"], c["A_log"], c["dt_bias"], c["conv_weight"], conv_state, state,
                  c["state_indices"], c["has_initial_state"], cu, chunk_indices(cu), offsets(cu), c["norm_weight"], c["norm_eps"], out,
-                 c["lower_bound"])
+                 c["lower_bound"], chunk_counts=[-(-(b - a) // 64) for a, b in zip(cu.tolist()[:-1], cu.tolist()[1:])])
     return out, conv_state, state
 
 
 @pytest.mark.parametrize("seq,init,dt_shift", [
     ([64], [True], 0.0), ([130], [False], 0.0), ([2048], [True], 0.0), ([300, 64, 77, 1], [True, False, True, True], 0.0),
     ([5, 3], [False, True], 0.0), ([1500, 700, 64, 3000], [True, False, True, True], -6.0),
-], ids=["64", "130_noinit", "2048", "ragged4", "tiny", "ragged_slow"])
+    ([200 + 17 * i for i in range(16)], [i % 3 != 0 for i in range(16)], 0.0), ([4096, 2500], [True, True], -3.0),
+], ids=["64", "130_noinit", "2048", "ragged4", "tiny", "ragged_slow", "sixteen", "two_long"])
 @torch.inference_mode()
 def test_prefill(seq, init, dt_shift):
     require_gfx950()
@@ -50,6 +51,7 @@ def test_prefill(seq, init, dt_shift):
                                   c["conv_weight"], conv_state, state, c["state_indices"], c["has_initial_state"], c["cu_seqlens"],
                                   c["norm_weight"], c["norm_eps"])
     out, got_conv, got_state = run(c)
+    assert not torch.isnan(out.float()).any()
     assert rel(out, ref) < OUT_TOL
     assert rel(got_state, state) < STATE_TOL
     assert torch.equal(got_conv, conv_state)

@@ -99,10 +99,11 @@ def _block_decode(bid, groups, ngrp):
 
 
 @launcher
-def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2, ckpt: bool = False):
+def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2, ckpt: bool = False, skeleton: bool = False):
     """``chain=False``: the walk kernel; ``chain=True``: the transfer kernel; ``stages``: depth of the LDS ring (the DMAs and the
     ``u`` loads of chunk c + stages - 1 are issued during chunk c); ``ckpt``: the walk also stores the state after
-    ``checkpoint_offsets[n]`` tokens of a sequence into ``checkpoint_state``."""
+    ``checkpoint_offsets[n]`` tokens of a sequence into ``checkpoint_state``; ``skeleton``: the same loads, DMAs and stores with
+    no math (the benchmark's empirical floor)."""
     nsl = waves * nvt
     nslices = 16 if chain else 8
     ngrp = nslices // nsl
@@ -112,7 +113,7 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2, ckpt: bool 
     stage = CHAIN_STAGE if chain else WALK_STAGE
     ndma = -(-pieces // waves)
     ct_pitch = 16 * nsl + 4  # elements of a staged C^T row
-    name = f"kda_prefill_{'chain' if chain else 'walk'}_h12_d128_w{waves}_v{nvt}_s{stages}" + ("_ck" if ckpt else "")
+    name = f"kda_prefill_{'chain' if chain else 'walk'}_h12_d128_w{waves}_v{nvt}_s{stages}" + ("_ck" if ckpt else "") + ("_skel" if skeleton else "")
 
     @fx.struct
     class Shared:
@@ -284,6 +285,8 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2, ckpt: bool 
                             for kt in range_constexpr(8):
                                 tasks.append(("K", kt, ksp, RECORD_KGT + (kt * 2 + ksp) * 1024))
                         dec_off = RECORD_DEC
+                    if const_expr(skeleton):
+                        tasks = []
                     reads = [i for i, t in enumerate(tasks) if t[0] != "V"]
                     frags = {}
 
@@ -294,7 +297,7 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2, ckpt: bool 
                     vn = [[U[vt][mt] for mt in range_constexpr(4)] for vt in range_constexpr(nvt)]
                     ob = [[Vec.filled(4, 0.0, fx.Float32) for _ in range_constexpr(4)] for _ in range_constexpr(nvt)]
                     sf = {}
-                    s_new = [[None] * 8 for _ in range_constexpr(nvt)]
+                    s_new = [[S[vt][kt] for kt in range_constexpr(8)] if skeleton else [None] * 8 for vt in range_constexpr(nvt)]
                     vnf = []
                     d4s = None
                     nread = len(reads)
@@ -340,7 +343,7 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2, ckpt: bool 
                         jb()
                     u_next = _u_f32(win[0] if stages > 2 else new_raw)
                     if const_expr(chain):
-                        ex_next = [EX[kt] * d4s[kt] for kt in range_constexpr(8)]
+                        ex_next = [EX[kt] if skeleton else EX[kt] * d4s[kt] for kt in range_constexpr(8)]
                     else:
                         ex_next = [Vec(ob[vt][nt_].to(fx.BFloat16).bitcast(fx.Int32)) for vt in range_constexpr(nvt) for nt_ in range_constexpr(4)]
                     if const_expr(ckpt):
@@ -438,7 +441,7 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2, ckpt: bool 
 
 
 @launcher
-def compile_fold(waves: int, nvt: int, stages: int):
+def compile_fold(waves: int, nvt: int, stages: int, skeleton: bool = False):
     nsl = waves * nvt
     assert 8 % nsl == 0
     ngrp = 8 // nsl
@@ -448,7 +451,7 @@ def compile_fold(waves: int, nvt: int, stages: int):
     stage_bytes = b_off + b_bytes
     pieces = 32 + 1 + b_bytes // 1024
     ndma = -(-pieces // waves)
-    name = f"kda_prefill_fold_h12_d128_w{waves}_v{nvt}_s{stages}"
+    name = f"kda_prefill_fold_h12_d128_w{waves}_v{nvt}_s{stages}" + ("_skel" if skeleton else "")
 
     @fx.struct
     class Shared:
@@ -536,7 +539,7 @@ def compile_fold(waves: int, nvt: int, stages: int):
                     acc = [[S[vt][kt] * a4[kt] + lds_load4(base + b_off + ((16 * (wave * nvt + vt) + l16) * D + 16 * kt + 4 * qg) * 4).bitcast(fx.Float32)
                             for kt in range_constexpr(8)] for vt in range_constexpr(nvt)]
                     sf = [[_pack(S[vt][2 * ks], S[vt][2 * ks + 1]) for ks in range_constexpr(4)] for vt in range_constexpr(nvt)]
-                    for ks in range_constexpr(4):
+                    for ks in range_constexpr(0 if skeleton else 4):
                         for kt in range_constexpr(8):
                             f = lds_load4(base + (kt * 4 + ks) * 1024 + lane16)
                             for vt in range_constexpr(nvt):
