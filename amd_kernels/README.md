@@ -59,6 +59,8 @@ One line per kernel package. Each package's README has what it does, its entry p
 - [`attention/fp8_sparse_mla_decode_dcp8_h96_kv512_top2048`](attention/fp8_sparse_mla_decode_dcp8_h96_kv512_top2048/README.md):
   the DSA layers' sparse MLA decode at DCP8: 96 latent heads over an fp8_ds_mla cache (bf16 or pre-quantized q), bf16
   output and LSE of the rank's key share.
+- [`attention/fp8_dense_mla_decode_h96_kv512`](attention/fp8_dense_mla_decode_h96_kv512/README.md): the DSpark draft's
+  dense MLA decode (96 latent heads, e4m3 q and latent KV, causal round-robin DCP shard).
 - [`attention/norm_rope_fp8_insert_d128_rot64`](attention/norm_rope_fp8_insert_d128_rot64/README.md): the draft's
   norm + RoPE + fp8 KV insert.
 - [`attention/dcp8_lse_combine_vup_mla_h12_kv512`](attention/dcp8_lse_combine_vup_mla_h12_kv512/README.md): the DCP8
