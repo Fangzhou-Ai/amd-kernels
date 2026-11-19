@@ -108,7 +108,6 @@ def _worker(rank, port, tokens, gate, out_q):
                 dist.all_reduce(t, op=dist.ReduceOp.MAX)
                 times[name].append(t.item())
         rows_out.append((m, {k: (statistics.median(v), min(v)) for k, v in times.items()}, cos))
-        del graphs, xs, lses, w_uv, wt, gates, outs, gouts
         torch.cuda.empty_cache()
     if rank == 0:
         out_q.put(rows_out)

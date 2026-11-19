@@ -13,7 +13,8 @@ partials of empty shards never propagate). ``out[t, j] = bf16(sum_s w_s * v_s)``
 rounded once. The optional output gate then multiplies by ``sigmoid(gate)`` in fp32 and rounds again.
 
 Tolerance: the kernel's ``v_r`` accumulates K in four fp32 partial sums (one per wave) added in fixed order, so it may
-differ from the reference's single accumulation by one bf16 ulp of ``v``; ``out`` agrees to cosine > 0.9999 and
+differ from the reference's single accumulation by one bf16 ulp of ``v``, and it multiplies by the hardware reciprocal
+of the sum instead of dividing; ``out`` agrees to cosine > 0.9999 and
 max-abs error <= 2^-7 of the row max, and two runs match bit for bit.
 """
 

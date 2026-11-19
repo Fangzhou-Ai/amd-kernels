@@ -99,11 +99,11 @@ def _combine(comm, attn_out, lse, w_uv_t, out, seq_lens=None, query_start_loc=No
 
 
 def _mode(comm, attn_out, lse, w_uv_t, out, seq_lens=None, query_start_loc=None, gate=None):
-    return (gate is not None,)
+    return (gate is not None, comm.max_tokens)
 
 
 def _sizes(mode):
-    return [16 * t for t in range(1, MAX_TOKENS // 16 + 1)]
+    return [min(16 * t, mode[1]) for t in range(1, -(-mode[1] // 16) + 1)]
 
 
 def _inputs(mode, n, comm, attn_out, lse, w_uv_t, out, seq_lens=None, query_start_loc=None, gate=None):
