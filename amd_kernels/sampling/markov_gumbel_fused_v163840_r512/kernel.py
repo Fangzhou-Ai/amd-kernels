@@ -428,10 +428,6 @@ def compile_markov_chain(mt: int, ksteps: int):
                             gt = gt | ((v == best_v[m]) & ((c0 + e) < best_i[m]))  # the sweep may run backwards: first column wins ties
                             best_v[m] = gt.select(v, best_v[m])
                             best_i[m] = gt.select(c0 + e, best_i[m])
-                    if TS:
-                        if (tx == 0) & (ti < 14):
-                            t64 = fx.Int64(_llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
-                            buffer_ops.buffer_store(t64.to(fx.Int32), sy_r, TS_OFF + (bid * K + s) * 24 + 8 + ti)
                     result = yield ([v.ir_value() for v in best_v] + [v.ir_value() for v in best_i] +
                                     [v.ir_value() for v in nwv])
                 best_v = [F(x) for x in result[:MT]]
