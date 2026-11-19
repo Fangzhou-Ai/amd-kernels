@@ -54,15 +54,16 @@ def plan(max_query_len: int, batch: int) -> tuple[int, int]:
     """``(rows, chunks)``: query rows of a sequence a chunk workgroup scores, and the chunks a sequence is cut into
     (the chunk size follows from the longest row bound at launch). A workgroup is resident one or two a CU, so the
     work is about ``batch * tiles * chunks`` workgroups: few sequences are cut finely into row pairs to fill the
-    machine, many take whole rows and as many chunks as fit one wave of workgroups (measured on cold pages)."""
+    machine, many take whole rows (at most four, or threes) and about one wave of workgroups (cold-page sweeps)."""
     if not 1 <= max_query_len <= QMAX:
         raise ValueError(f"1 - {QMAX} query rows a sequence, got {max_query_len}")
     if _FORCE is not None:  # experiments: (rows, chunks)
         return min(max_query_len, _FORCE[0]), _FORCE[1]
     if batch <= 4:
         return min(max_query_len, 2), CHUNKS_TARGET
-    wave = 300 if max_query_len <= 4 else 240  # workgroups of one wave: whole rows of 5 and 6 fill a CU alone
-    return max_query_len, max(8, min(40, round(wave / batch)))
+    if max_query_len >= 5:  # rows of 3 (two tiles): two workgroups a CU, a chunk selected on two waves
+        return 3, 12
+    return max_query_len, max(8, min(40, round(300 / batch)))  # whole rows, about one wave of workgroups
 
 
 @functools.cache
@@ -186,7 +187,7 @@ def _sizes(mode):
     """The kernel variants: the chunk kernel's rows a workgroup scores and the merge kernel's pool blocks. ``n`` is
     ``+-(rows + 100 * tier)``: rows of each of many sequences (whole rows a workgroup) or a few sequences (at most 2
     rows), at the width of the tier."""
-    wide = tuple(r + 100 * t for t in range(len(BLOCK_TIERS)) for r in range(1, QMAX + 1))
+    wide = tuple(r + 100 * t for t in range(len(BLOCK_TIERS)) for r in range(1, 5))
     narrow = tuple(-(r + 100 * t) for t in range(len(BLOCK_TIERS)) for r in (1, 2))
     return wide + narrow
 
