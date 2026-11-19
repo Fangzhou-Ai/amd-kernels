@@ -71,6 +71,9 @@ One line per kernel package. Each package's README has what it does, its entry p
   norm + RoPE + fp8 KV insert.
 - [`attention/dcp8_lse_combine_vup_mla_h12_kv512`](attention/dcp8_lse_combine_vup_mla_h12_kv512/README.md): the DCP8
   MLA decode combine: W_UV up-projection, owner-rank push and LSE-weighted combine in one launch.
+- [`attention/kda_mono_decode_k1_h12_d128_ranks8`](attention/kda_mono_decode_k1_h12_d128_ranks8/README.md): one
+  persistent launch of a KDA layer's decode (AttnRes, in_proj, conv, delta-rule recurrence, gated norm) for a
+  spec-verify step of up to 16 rows.
 
 ## Indexer
 

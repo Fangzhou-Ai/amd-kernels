@@ -433,3 +433,63 @@ def fp8_pack4(a, b, c, d):
     """Four f32 (already in range) -> one dword of four E4M3 bytes, RNE."""
     lo = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, a, b, fx.Int32(0), False))
     return fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, c, d, lo, True))
+
+
+def lds_dma(src, dst, cpol=""):
+    """A global_load_lds_dwordx4: lane i's 16 B at the 64-bit address ``src``
+    -> LDS byte ``dst`` (uniform) + 16 i. ``cpol``: cache policy bits ("sc1":
+    device scope). An ``s_nop`` between the M0 write and the load: right after
+    the write the load could read a stale M0. Completes at ``dma_wait``."""
+    llvm.inline_asm(
+        None,
+        [as_ir_value(fx.Int64(src)), as_ir_value(uniform(dst))],
+        f"s_mov_b32 m0, $1\n\ts_nop 0\n\tglobal_load_lds_dwordx4 $0, off {cpol}",
+        "v,s,~{m0},~{memory}",
+        has_side_effects=True,
+    )
+
+
+@traced
+def dma_wait():
+    """This wave's DMAs (and loads) landed, then the CTA's after the barrier."""
+    llvm.inline_asm(None, [], "s_waitcnt vmcnt(0)", "", has_side_effects=True)
+    gpu.barrier()
+
+
+def sld_i32(addr, i):
+    """Word ``i`` of an i32 buffer through scalar memory (wave-uniform ``i``):
+    no vector registers, no place in the wave's vector-memory order."""
+    i128 = ir.IntegerType.get_signless(128)
+    v4i32 = ir.VectorType.get([4], T.i32)
+    desc = llvm.bitcast(v4i32, llvm.ptrtoint(i128, rsrc(addr)))
+    return fx.Int32(
+        llvm.call_intrinsic(
+            T.i32,
+            "llvm.amdgcn.s.buffer.load.i32",
+            [desc, (fx.Int32(i) * 4).ir_value(), fx.Int32(0).ir_value()],
+            [],
+            [],
+        )
+    )
+
+
+def sum32_dpp(v):
+    """Sum of v over the 32 lanes of each half-wave, in every lane: one
+    permlane16_swap between the two 16-lane rows, then v_add_f32_dpp with
+    row_ror 8, 4, 2, 1 inside the row (a ring: every step adds the lane's
+    partner and the partner's sum). One instruction a step where ``xred`` takes
+    a move, a DPP move and an add."""
+    x = v.bitcast(fx.Int32)
+    a, b = permlane_swap(16, x, x)
+    s = a.bitcast(fx.Float32) + b.bitcast(fx.Float32)
+    for ror in (8, 4, 2, 1):
+        s = fx.Float32(
+            llvm.inline_asm(
+                T.f32,
+                [s.ir_value()],
+                f"s_nop 1\n\tv_add_f32_dpp $0, $1, $1 row_ror:{ror} row_mask:0xf bank_mask:0xf",
+                "=v,v",
+                has_side_effects=False,
+            )
+        )
+    return s
