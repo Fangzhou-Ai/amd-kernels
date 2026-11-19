@@ -70,8 +70,7 @@ def compile_kda_decode(max_tok, nw_f32=False, waves=8, lpr=8, store_cm=2, snap=F
 
     @fx.struct
     class Shared:
-        px: fx.Array[fx.Int32, tk * 5 * 64]  # [token][q, k, v, og, f_a][128] bf16
-        hx: fx.Array[fx.Int32, 9 * 64]  # [set][pos][128] bf16
+        px: fx.Array[fx.Int32, (tk + 3) * 5 * 64]  # [row][q, k, v, og, f_a][128] bf16: rows 0-2 conv history, row 3 + j token j
         cw: fx.Array[fx.Float32, 12 * D]  # [set][tap][128]
         sets: fx.Array[fx.Float32, tk * 5 * D]  # [token][q, k, v, a, scale][128]
         scal: fx.Array[fx.Float32, 2 * tk]
@@ -110,8 +109,6 @@ def compile_kda_decode(max_tok, nw_f32=False, waves=8, lpr=8, store_cm=2, snap=F
         scal = smem.scal.ptr
         part = smem.part.ptr
         obuf = smem.obuf.ptr
-        px16 = fx.recast_iter(fx.Int16, smem.px.ptr)
-        hx16 = fx.recast_iter(fx.Int16, smem.hx.ptr)
         atom_f = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
         atom_i = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
 
@@ -119,8 +116,7 @@ def compile_kda_decode(max_tok, nw_f32=False, waves=8, lpr=8, store_cm=2, snap=F
             return fx.logical_divide(fx.make_view(ptr, fx.make_layout(n, 1)), fx.make_layout(4, 1))
 
         sets_v = view(smem.sets.ptr, tk * 5 * D)
-        px_v = view(smem.px.ptr, tk * 5 * 64)
-        hx_v = view(smem.hx.ptr, 9 * 64)
+        px_v = view(smem.px.ptr, (tk + 3) * 5 * 64)
         cw_v = view(smem.cw.ptr, 12 * D)
 
         def ld4f(v, idx):
@@ -268,12 +264,12 @@ def compile_kda_decode(max_tok, nw_f32=False, waves=8, lpr=8, store_cm=2, snap=F
             # ---- to LDS
             for item, jj, seg, c16, vec in p_loads:
                 if item < n_p:
-                    st4(px_v, (jj * 5 + seg) * 16 + c16, vec, atom_i, fx.Int32)
+                    st4(px_v, ((jj + 3) * 5 + seg) * 16 + c16, vec, atom_i, fx.Int32)
             for item, vec in c_loads:
                 if item < n_c:
                     st4(cw_v, item, vec, atom_f, fx.Float32)
             if tx < n_h:
-                st4(hx_v, tx, h_load, atom_i, fx.Int32)
+                st4(px_v, (p_h * 5 + si_h) * 16 + c16_h, h_load, atom_i, fx.Int32)
             if tx < tk:
                 put(scal, 2 * tx + 1, sigmoid(bf16_i16(bl)))
             fx.gpu.barrier()
@@ -284,7 +280,7 @@ def compile_kda_decode(max_tok, nw_f32=False, waves=8, lpr=8, store_cm=2, snap=F
                     si_k = tx // 32
                     r_k = (tx % 32) // 16
                     c16_k = tx % 16
-                    v4 = ld4i(hx_v, (si_k * 3 + 1 + r_k) * 16 + c16_k)
+                    v4 = ld4i(px_v, ((1 + r_k) * 5 + si_k) * 16 + c16_k)
                     buffer_ops.buffer_store(v4, csr, (r_k * i32_cs_pos + si_k * LP + hv * D) // 2 + c16_k * 4)
                 for ri in range_constexpr(r_kx):
                     item = tx + ri * block
@@ -292,7 +288,7 @@ def compile_kda_decode(max_tok, nw_f32=False, waves=8, lpr=8, store_cm=2, snap=F
                     j_x = (item % (tk * 16)) // 16
                     c16_x = item % 16
                     if item < n_kx:
-                        v4 = ld4i(px_v, (j_x * 5 + si_x) * 16 + c16_x)
+                        v4 = ld4i(px_v, ((j_x + 3) * 5 + si_x) * 16 + c16_x)
                         if j_x < n_tok:
                             buffer_ops.buffer_store(
                                 v4, csr, (((2 + j_x) * i32_cs_pos + si_x * LP + hv * D) // 2) + c16_x * 4)
@@ -301,14 +297,16 @@ def compile_kda_decode(max_tok, nw_f32=False, waves=8, lpr=8, store_cm=2, snap=F
 
             # ---- stage 1: gate on the matrix cores (f_a from LDS), conv + SiLU from LDS
             zero4 = Vec.filled(4, 0.0, fx.Float32)
-            afr = [ld4i(px_v, ((l16 < tk).select(l16, fx.Int32(tk - 1)) * 5 + 4) * 16 + 4 * kb + qd)
+            arow = 2 * (l16 // 4) + l16 % 2
+            arow = ((l16 % 4 < 2) & (arow < tk)).select(arow, fx.Int32(0))
+            afr = [ld4i(px_v, ((arow + 3) * 5 + 4) * 16 + 4 * kb + qd)
                    for kb in range_constexpr(4)]
             for j in range_constexpr(nt_n):
                 acc4 = zero4
                 for kb in range_constexpr(4):
                     acc4 = mfma_bf16(afr[kb], bfr[j][kb], acc4)
-                for e in range_constexpr(4):
-                    tq = 4 * qd + e
+                for e in range_constexpr(2):
+                    tq = 2 * qd + e
                     gate = exp2(f32_lbc * sigmoid(a_exp * (round_bf16(acc4[e]) + dtbs[j])))
                     if tq < tk:
                         put(lds, (tq * 5 + 3) * D + 16 * nts[j] + l16, gate)
@@ -320,17 +318,15 @@ def compile_kda_decode(max_tok, nw_f32=False, waves=8, lpr=8, store_cm=2, snap=F
                 if tw < tk:
                     ys = []
                     for si in range_constexpr(3):
-                        for hh in range_constexpr(2):
-                            c_ = lane + 64 * hh
-                            wt = [smem.cw.ptr[(si * 4 + tp) * D + c_] for tp in range_constexpr(4)]
-                            acc = None
-                            for m in range_constexpr(4):
-                                sx = tw - 3 + m
-                                xv = bf16_i16(px16[((((sx >= 0).select(sx, fx.Int32(0))) * 5 + si) * D + c_)])
-                                hv_ = bf16_i16(hx16[(si * 3 + ((sx < 0).select(sx + 3, fx.Int32(0)))) * D + c_])
-                                tap = (sx >= 0).select(xv, hv_)
-                                acc = tap * wt[m] if acc is None else fma(tap, wt[m], acc)
-                            ys.append(acc * sigmoid(acc))
+                        wt = [[smem.cw.ptr[(si * 4 + tp) * D + 2 * lane + e] for e in range_constexpr(2)]
+                              for tp in range_constexpr(4)]
+                        acc = [None, None]
+                        for m in range_constexpr(4):
+                            wv = smem.px.ptr[((tw + m) * 5 + si) * 64 + lane]
+                            xs = [bf16x2_lo(wv), bf16x2_hi(wv)]
+                            for e in range_constexpr(2):
+                                acc[e] = xs[e] * wt[m][e] if m == 0 else fma(xs[e], wt[m][e], acc[e])
+                        ys += [acc[e] * sigmoid(acc[e]) for e in range_constexpr(2)]
                     yq, yk, yv = ys[0:2], ys[2:4], ys[4:6]
                     qq = readlane63(wave_sum_lane63(yq[0] * yq[0] + yq[1] * yq[1]))
                     kk = readlane63(wave_sum_lane63(yk[0] * yk[0] + yk[1] * yk[1]))
@@ -338,11 +334,11 @@ def compile_kda_decode(max_tok, nw_f32=False, waves=8, lpr=8, store_cm=2, snap=F
                     rq = rsqrt(qq + EPS_QK) * SCALE
                     rk = rsqrt(kk + EPS_QK)
                     base = tw * 5 * D
-                    for hh in range_constexpr(2):
-                        put(lds, base + lane + 64 * hh, yq[hh] * rq)
-                        put(lds, base + D + lane + 64 * hh, yk[hh] * rk)
-                        put(lds, base + 2 * D + lane + 64 * hh, yv[hh])
-                    ogp = smem.px.ptr[(tw * 5 + 3) * 64 + lane]
+                    for e in range_constexpr(2):
+                        put(lds, base + 2 * lane + e, yq[e] * rq)
+                        put(lds, base + D + 2 * lane + e, yk[e] * rk)
+                        put(lds, base + 2 * D + 2 * lane + e, yv[e])
+                    ogp = smem.px.ptr[((tw + 3) * 5 + 3) * 64 + lane]
                     put(lds, base + 4 * D + 2 * lane, nw2[0] * sigmoid(bf16x2_lo(ogp)))
                     put(lds, base + 4 * D + 2 * lane + 1, nw2[1] * sigmoid(bf16x2_hi(ogp)))
                     if lane == 0:

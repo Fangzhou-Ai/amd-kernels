@@ -3,7 +3,7 @@
 """Graph-replay timing of ``kda_decode_fb_gate_spec`` on gfx950 against the stock two-launch path and its traffic floor.
 
 One HIP graph holds ``--copies`` launches over distinct inputs (state slots, conv state, f_b weights, activations; the
-set is larger than the 256 MB MALL), median of 5 rounds in us per launch. Tiers (rows:tokens per sequence) are the served
+set is larger than the 256 MB MALL), median of 15 rounds in us per launch. Tiers (rows:tokens per sequence) are the served
 spec-decode batches: 12:6 (k = 5), 24 / 40 / 80 / 128 / 192 rows of 4 (k = 3), 65:5 (k = 4); conv state in the served
 (state_len, dim) layout. Arms: ``fused`` (this kernel, ``uniform`` lengths), ``floor`` (``skeleton.py``: the same grid,
 table lookups, state read and snapshot writes without math) and ``stock``: vLLM's ``kimi_k3_kda_fb_proj`` Triton GEMM (kernel copied from
@@ -91,7 +91,7 @@ def stock_calls(a):
     return fb, decode
 
 
-def timeit_graph(calls, replays=10, rounds=5, warmup=3):
+def timeit_graph(calls, replays=10, rounds=15, warmup=3):
     for c in calls:
         c()
     torch.cuda.synchronize()

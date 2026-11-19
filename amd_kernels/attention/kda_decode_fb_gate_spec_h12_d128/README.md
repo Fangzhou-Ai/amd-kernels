@@ -28,22 +28,22 @@ states within 2e-3 of the reference in the tests, identical conv state, two runs
 
 ## Performance
 
-Graph replay, 1 MI355X, inputs > 700 MB (cold), median us per layer call. `floor` = skeleton kernel (same grid, table
+Graph replay, 1 MI355X, inputs > 700 MB (cold), median of 15 rounds, us per layer call. `floor` = skeleton kernel (same grid, table
 lookups, state read, snapshot writes, no math). Ceiling = 6.2 TB/s (measured blend of 6.5 read / 6.0 write, hw_ceilings.md).
 
-| M (rows x tok) | MB | fused us | TB/s | % ceiling | floor us | fused/floor | stock f_b + AITER us | speedup |
+| M (rows x tok) | MB | fused us | TB/s | % ceiling | skeleton us | fused/skeleton | stock f_b + AITER us | speedup |
 |---|---|---|---|---|---|---|---|---|
-| 12 (2 x 6) | 11.8 | 10.0 | 1.18 | 19 | 5.5 | 1.82 | 16.2 | 1.63x |
-| 24 (6 x 4) | 24.9 | 8.7 | 2.87 | 46 | 5.8 | 1.49 | 14.7 | 1.69x |
-| 40 (10 x 4) | 41.2 | 9.9 | 4.16 | 67 | 7.1 | 1.40 | 17.5 | 1.77x |
-| 65 (13 x 5) | 63.9 | 13.7 | 4.66 | 75 | 10.4 | 1.32 | 21.5 | 1.57x |
-| 80 (20 x 4) | 81.9 | 15.6 | 5.25 | 85 | 14.6 | 1.07 | 22.1 | 1.41x |
-| 128 (32 x 4) | 130.9 | 25.5 | 5.14 | 83 | 19.5 | 1.31 | 32.3 | 1.27x |
-| 192 (48 x 4) | 196.1 | 34.4 | 5.69 | 92 | 30.6 | 1.13 | 45.1 | 1.31x |
+| 12 (2 x 6) | 11.8 | 9.8 | 1.21 | 20 | 5.6 | 1.73 | 16.2 | 1.66x |
+| 24 (6 x 4) | 24.9 | 8.5 | 2.92 | 47 | 6.1 | 1.41 | 15.0 | 1.75x |
+| 40 (10 x 4) | 41.2 | 9.6 | 4.29 | 69 | 7.0 | 1.36 | 17.5 | 1.82x |
+| 65 (13 x 5) | 63.9 | 13.2 | 4.86 | 78 | 10.5 | 1.25 | 21.9 | 1.66x |
+| 80 (20 x 4) | 81.9 | 15.2 | 5.38 | 87 | 12.7 | 1.20 | 22.1 | 1.45x |
+| 128 (32 x 4) | 130.9 | 25.2 | 5.20 | 84 | 23.3 | 1.08 | 34.0 | 1.35x |
+| 192 (48 x 4) | 196.1 | 34.7 | 5.66 | 91 | 31.0 | 1.12 | 48.2 | 1.39x |
 
-Small M is latency-bound (launch 1.6 us + prologue ~3.5 us + tail ~1 us); the large tiers are at 83-92% of the HBM
-ceiling. Not helpful (measured, <3%): conv write-back placement, state-load ordering, store interleaving, extra waves.
-Details and attempts log: analysis/kernels/kda_decode_fb_gate_spec_h12_d128.md.
+Small M is a latency chain, not bandwidth (no-store ablation: 9.2 us at M=12): launch 1.6 us + loads 2.2 + gate/conv 1.3 + VALU-bound
+token loop ~0.45 us/token + tail 1.3. M >= 65 is within 10-15% of launch + bytes / 6.2 TB/s. Row-splitting the head over
+workgroups bounds at -20% (M=12) before a ~1 us cross-workgroup norm exchange; not built. Details and attempts log: analysis/kernels/kda_decode_fb_gate_spec_h12_d128.md.
 
 ## Tests
 
