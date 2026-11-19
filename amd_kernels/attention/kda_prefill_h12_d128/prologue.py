@@ -430,6 +430,8 @@ def prologue_body(
             st4(pack8(vals_per_row[r]), base + res + (r0 + r) * PITCH_T + cg * 16, fx.Int32)
 
     # ---- k band
+    cbk = [exp2(fx.min(glast[c] - gn[c], fx.Float32(0.0))) for c in range_constexpr(8)]
+    egn = [exp2(gn[c]) for c in range_constexpr(8)]
     yp = band_conv(1, k_rows)
     rk = row_scale(yp)
     kg_pairs, kb_pairs = [], []
@@ -439,10 +441,12 @@ def prologue_body(
             r = 2 * rp + rr
             yv = unp(yp[r])
             kn = [yv[c] * rk[r] for c in range_constexpr(8)]
-            st4(pack8([kn[c] * exp2(g[r][c] - gn[c]) for c in range_constexpr(8)]), base + R_KD + (r0 + r) * PITCH_T + cg * 16, fx.Int32)
-            st4(pack8([kn[c] * exp2(gn[c] - g[r][c]) for c in range_constexpr(8)]), base + R_KI + (r0 + r) * PITCH_T + cg * 16, fx.Int32)
-            kgv.append([kn[c] * exp2(fx.min(glast[c] - g[r][c], fx.Float32(0.0))) for c in range_constexpr(8)])
-            kbv.append([kn[c] * betas[r] * exp2(g[r][c]) for c in range_constexpr(8)])
+            e1 = [exp2(g[r][c] - gn[c]) for c in range_constexpr(8)]
+            e2 = [exp2(gn[c] - g[r][c]) for c in range_constexpr(8)]
+            st4(pack8([kn[c] * e1[c] for c in range_constexpr(8)]), base + R_KD + (r0 + r) * PITCH_T + cg * 16, fx.Int32)
+            st4(pack8([kn[c] * e2[c] for c in range_constexpr(8)]), base + R_KI + (r0 + r) * PITCH_T + cg * 16, fx.Int32)
+            kgv.append([kn[c] * (e2[c] * cbk[c]) for c in range_constexpr(8)])
+            kbv.append([kn[c] * betas[r] * (e1[c] * egn[c]) for c in range_constexpr(8)])
         kg_pairs.append([pk_bf16(kgv[0][c], kgv[1][c]) for c in range_constexpr(8)])
         kb_pairs.append([pk_bf16(kbv[0][c], kbv[1][c]) for c in range_constexpr(8)])
     kb_pk = [[kb_pairs[0][c], kb_pairs[1][c]] for c in range_constexpr(8)]
@@ -520,13 +524,15 @@ def prologue_body(
     v_rows = band_rows(2)
     yp = band_conv(0, q_rows)
     rq = row_scale(yp)
+    egq = [exp2(gn[c]) for c in range_constexpr(8)]
     hc_ = (cg % 4) // 2
     h0 = hc_ == 0
     for r in range_constexpr(4):
         yv = unp(yp[r])
         qn = [yv[c] * rq[r] * f32_scale for c in range_constexpr(8)]
-        st4(pack8([qn[c] * exp2(g[r][c] - gn[c]) for c in range_constexpr(8)]), base + R_KD + (r0 + r) * PITCH_T + cg * 16, fx.Int32)
-        w4 = pack8([qn[c] * exp2(g[r][c]) for c in range_constexpr(8)])
+        e1 = [exp2(g[r][c] - gn[c]) for c in range_constexpr(8)]
+        st4(pack8([qn[c] * e1[c] for c in range_constexpr(8)]), base + R_KD + (r0 + r) * PITCH_T + cg * 16, fx.Int32)
+        w4 = pack8([qn[c] * (e1[c] * egq[c]) for c in range_constexpr(8)])
         send = [h0.select(w4[2], w4[0]), h0.select(w4[3], w4[1])]
         recv = [dpp_i(send[0], 0x4E), dpp_i(send[1], 0x4E)]
         mine = [h0.select(w4[0], w4[2]), h0.select(w4[1], w4[3])]

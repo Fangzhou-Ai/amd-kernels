@@ -129,27 +129,19 @@ def walk_body(
     arg_ckrow,
     arg_flags,
     arg_ts=None,
-    kn=None,
 ):
     """Walk workgroup ``wid``: (pair = (sequence, head), slice group) of the launch; waves 0 and 1 walk a slice each, waves 2 and 3
     issue the DMAs (and the flag traffic) of the next chunk."""
     ngrp = WALK_GROUPS
     nck = 8 if ckpt else 0
     fl = arg_flags is not None
-    kn = kn or {}
-    scm = kn.get('scm', SC1)
-    prio = kn.get('prio', 3)
     tx = fx.thread_idx.x
     lane = tx % 64
     wave = fx.Int32(fx.rocdl.readfirstlane(T.i32, tx // 64))
     l16 = lane % 16
     qg = lane // 16
-    if const_expr(kn.get('xcd', 1)):
-        pair = (wid // UNIT) * 8 + wid % 8
-        sg = (wid // 8) % ngrp
-    else:
-        pair = wid // ngrp
-        sg = wid % ngrp
+    pair = (wid // UNIT) * 8 + wid % 8
+    sg = (wid // 8) % ngrp
     if pair < i32_npairs:
         seq = pair // NH
         h = pair % NH
@@ -180,10 +172,7 @@ def walk_body(
             def so(c):
                 return fx.min(c, nch - 1) * RECORD_BYTES
 
-            if const_expr(prio > 0):
-                fx.rocdl.s_setprio(prio)
-            if const_expr(prio > 0):
-                fx.rocdl.s_setprio(prio)
+            fx.rocdl.s_setprio(3)
             if wave < NSLICE:
                 vs0 = sg * NSLICE + wave
                 ubase = lds_base + U_BASE + wave * 2048
@@ -204,11 +193,6 @@ def walk_body(
                         if (tx == 0) & (sg == 0):
                             buffer_ops.buffer_store(t_now, ts_r, (1 << 20) + ((h * i32_nc + c0 + ci) * WALK_GROUPS + sg))
                     par = ci % 2
-                    if const_expr(arg_ts is not None):
-                        def stamp(k):
-                            tn_ = fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], [])).to(fx.Int32)
-                            if (tx == 0) & (pair == 0) & (sg == 0):
-                                buffer_ops.buffer_store(tn_, ts_r, (1 << 21) + ci * 16 + k)
                     u_raw = [lds_load2(ubase + par * (NSLICE * 2048) + mt * 512 + lane * 8) for mt in range_constexpr(4)]
                     wbase = lds_base + par * 2 * SLOT + lane16
                     order = [(mt, ks) for ks in range_constexpr(4) for mt in range_constexpr(4)]
@@ -216,27 +200,19 @@ def walk_body(
                     sf = [_pack(S[2 * ks], S[2 * ks + 1]) for ks in range_constexpr(4)]
                     sbc = ci * SREC_BYTES
                     for ks in range_constexpr(4):
-                        buffer_ops.buffer_store(sf[ks], sb_r, lane * 4, cache_modifier=scm, soffset_bytes=sbc + (SREC_S + (vs0 * 4 + ks) * 1024))
+                        buffer_ops.buffer_store(sf[ks], sb_r, lane * 4, cache_modifier=SC1, soffset_bytes=sbc + (SREC_S + (vs0 * 4 + ks) * 1024))
                     sched_barrier()
-                    if const_expr(arg_ts is not None):
-                        stamp(0)
                     vn = _u_f32(u_raw)
                     for i in range_constexpr(16):
                         mt, ks = order[i]
                         vn[mt] = mfma(wfr[i], sf[ks], vn[mt])
                     sched_barrier()
-                    if const_expr(arg_ts is not None):
-                        stamp(1)
                     vnf = [_pack(vn[2 * ksp], vn[2 * ksp + 1]) for ksp in range_constexpr(2)]
                     for ksp in range_constexpr(2):
-                        buffer_ops.buffer_store(vnf[ksp], sb_r, lane * 4, cache_modifier=scm, soffset_bytes=sbc + (SREC_VN + (vs0 * 2 + ksp) * 1024))
+                        buffer_ops.buffer_store(vnf[ksp], sb_r, lane * 4, cache_modifier=SC1, soffset_bytes=sbc + (SREC_VN + (vs0 * 2 + ksp) * 1024))
                     fx.rocdl.s_waitcnt(lgkmcnt=0)
-                    if const_expr(arg_ts is not None):
-                        stamp(2)
                     barrier()
                     sched_barrier()
-                    if const_expr(arg_ts is not None):
-                        stamp(3)
                     korder = [(kt, ksp) for ksp in range_constexpr(2) for kt in range_constexpr(8)]
                     kbase = lds_base + (par * 2 + 1) * SLOT + lane16
                     kfr = [lds_load4(kbase + (kt * 2 + ksp) * 1024) for kt, ksp in korder]
@@ -244,14 +220,10 @@ def walk_body(
                     d4s = [lds_load4(dbase + kt * 64).bitcast(fx.Float32) for kt in range_constexpr(8)]
                     s_new = [S[kt] * d4s[kt] for kt in range_constexpr(8)]
                     sched_barrier()
-                    if const_expr(arg_ts is not None):
-                        stamp(4)
                     for i in range_constexpr(16):
                         kt, ksp = korder[i]
                         s_new[kt] = mfma(kfr[i], vnf[ksp], s_new[kt])
                     sched_barrier()
-                    if const_expr(arg_ts is not None):
-                        stamp(5)
                     if const_expr(ckpt):
                         hit = ((ci + 1) * BT == ck_off) & (ck_row >= 0) & (ck_off > 0)
                         ck_r = _fp(arg_ck + fx.Int64(fx.max(ck_row, fx.Int32(0))) * i64_ck_row_bytes + fx.Int64(h) * STATE_BYTES, STATE_BYTES)
@@ -336,10 +308,8 @@ def walk_body(
 
 
 @launcher
-def compile_walk(ckpt: bool = False, ts: bool = False, knobs: tuple = ()):
-    kn = dict(knobs)
-    ngrp = 8 // NSLICE
-    name = "kda_prefill_walk_h12_d128" + ("_ck" if ckpt else "") + ("_ts" if ts else "") + "".join(f"_{k}{v}" for k, v in knobs)
+def compile_walk(ckpt: bool = False, ts: bool = False):
+    name = "kda_prefill_walk_h12_d128" + ("_ck" if ckpt else "") + ("_ts" if ts else "")
 
     @fx.struct
     class Shared:
@@ -367,7 +337,7 @@ def compile_walk(ckpt: bool = False, ts: bool = False, knobs: tuple = ()):
                    i64_ck_row_bytes, arg_ckoff, arg_ckrow, arg_ts)
         smem = fx.SharedAllocator().allocate(Shared).peek()
         walk_body(fx.Int32(fx.ptrtoint(smem.buf.ptr)), fx.block_idx.x, ckpt, arg_ws, i32_nc, arg_state, i64_slot_bytes, arg_sidx, arg_has,
-                  arg_cu, arg_choff, arg_sb, i32_npairs, arg_ck, i64_ck_row_bytes, arg_ckoff, arg_ckrow, None, arg_ts if ts else None, kn)
+                  arg_cu, arg_choff, arg_sb, i32_npairs, arg_ck, i64_ck_row_bytes, arg_ckoff, arg_ckrow, None, arg_ts if ts else None)
 
     @flyc.jit
     def launch(
@@ -389,6 +359,6 @@ def compile_walk(ckpt: bool = False, ts: bool = False, knobs: tuple = ()):
         stream: fx.Stream,
     ):
         kernel(arg_ws, i32_nc, arg_state, i64_slot_bytes, arg_sidx, arg_has, arg_cu, arg_choff, arg_sb, i32_npairs, arg_ck,
-               i64_ck_row_bytes, arg_ckoff, arg_ckrow, arg_ts).launch(grid=(((i32_npairs + 7) // 8) * UNIT if kn.get('xcd', 1) else i32_npairs * WALK_GROUPS, 1, 1), block=(256, 1, 1), stream=stream)
+               i64_ck_row_bytes, arg_ckoff, arg_ckrow, arg_ts).launch(grid=(((i32_npairs + 7) // 8) * UNIT, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch

@@ -31,9 +31,8 @@ LDS = max(LDS_BYTES, WALK_LDS, OUT_LDS)
 
 
 @launcher
-def compile_mega(w_f32: bool, ckpt: bool, ts: bool = False, knobs: tuple = ()):
-    kn = dict(knobs)
-    name = "kda_prefill_mega_h12_d128" + ("_wf32" if w_f32 else "") + ("_ck" if ckpt else "") + ("_ts" if ts else "") + "".join(f"_{k}{v}" for k, v in knobs)
+def compile_mega(w_f32: bool, ckpt: bool, ts: bool = False):
+    name = "kda_prefill_mega_h12_d128" + ("_wf32" if w_f32 else "") + ("_ck" if ckpt else "") + ("_ts" if ts else "")
 
     @fx.struct
     class Shared:
@@ -80,11 +79,10 @@ def compile_mega(w_f32: bool, ckpt: bool, ts: bool = False, knobs: tuple = ()):
         f32_eps: fx.Float32,
         arg_flags: fx.Int64,
         i32_nwg: fx.Int32,
-        i32_lag: fx.Int32,
         arg_ts: fx.Int64,
     ):
         touch_args(arg_ws, i32_nc, arg_state, i64_slot_bytes, arg_sidx, arg_has, arg_cu, arg_choff, arg_sb, i32_npairs, arg_ck,
-                   i64_ck_row_bytes, arg_ckoff, arg_ckrow, arg_tab, arg_out, i32_ostride, arg_gate, i32_gstride, arg_nw, f32_eps, arg_flags, i32_nwg, i32_lag, arg_ts)
+                   i64_ck_row_bytes, arg_ckoff, arg_ckrow, arg_tab, arg_out, i32_ostride, arg_gate, i32_gstride, arg_nw, f32_eps, arg_flags, i32_nwg, arg_ts)
         smem = fx.SharedAllocator().allocate(Shared).peek()
         base = fx.Int32(fx.ptrtoint(smem.buf.ptr))
         bid = fx.Int32(fx.block_idx.x)
@@ -101,39 +99,25 @@ def compile_mega(w_f32: bool, ckpt: bool, ts: bool = False, knobs: tuple = ()):
         if bid < i32_nwg:
             for u in range(bid, ((i32_npairs + 7) // 8) * UNIT, i32_nwg):
                 walk_body(base, u, ckpt, arg_ws, i32_nc, arg_state, i64_slot_bytes, arg_sidx, arg_has, arg_cu, arg_choff, arg_sb,
-                          i32_npairs, arg_ck, i64_ck_row_bytes, arg_ckoff, arg_ckrow, arg_flags, arg_ts if ts else None, kn)
+                          i32_npairs, arg_ck, i64_ck_row_bytes, arg_ckoff, arg_ckrow, arg_flags, arg_ts if ts else None)
             if const_expr(ts):
                 stamp(0, bid)
         else:
             idp = bid - i32_nwg
-            lagc = fx.min(i32_lag, i32_nc)
-            lag12 = lagc * NH
-            j = idp - lag12
-            inter = (idp >= lag12) & (j < (i32_nc - lagc) * (2 * NH))
-            k = j // (2 * NH)
-            r = j % (2 * NH)
-            is_p = (idp < lag12) | (inter & (r < NH))
-            p_idx = (idp < lag12).select(idp, lag12 + k * NH + r)
-            o_idx = inter.select(k * NH + r - NH, (i32_nc - lagc) * NH + j - (i32_nc - lagc) * (2 * NH))
-            if is_p:
-                if const_expr(kn.get('pp', 0)):
-                    cp = p_idx // NH
-                    if cp < 6:
-                        fx.rocdl.s_setprio(3)
-                    elif cp < 16:
-                        fx.rocdl.s_setprio(2)
-                    elif cp < 40:
-                        fx.rocdl.s_setprio(1)
-                prologue_body(base, p_idx // NH, p_idx % NH, bid, arg_mixed, i32_ldx, i32_mixed_bytes, arg_rawg, i32_ldg, arg_beta, i32_ldb,
+            nrec = i32_nc * NH
+            if idp < nrec:
+                fx.rocdl.s_setprio(0)
+                prologue_body(base, idp // NH, idp % NH, bid, arg_mixed, i32_ldx, i32_mixed_bytes, arg_rawg, i32_ldg, arg_beta, i32_ldb,
                               arg_alog, arg_dtb, arg_cw, arg_cs, i32_cs_slot, i32_cs_dim, i32_cs_pos, arg_tab, arg_ws, i32_nc, f32_lb,
                               f32_scale, SC1, arg_flags)
                 if const_expr(ts):
-                    stamp(1, p_idx)
+                    stamp(1, idp)
             else:
-                out_body(base, o_idx // NH, o_idx % NH, w_f32, 0, arg_ws, i32_nc, arg_sb, arg_tab, arg_out, i32_ostride, arg_gate,
+                o = idp - nrec
+                out_body(base, o // NH, o % NH, w_f32, arg_ws, i32_nc, arg_sb, arg_tab, arg_out, i32_ostride, arg_gate,
                          i32_gstride, arg_nw, f32_eps, arg_flags)
                 if const_expr(ts):
-                    stamp(2, o_idx)
+                    stamp(2, o)
 
     @flyc.jit
     def launch(
@@ -176,14 +160,13 @@ def compile_mega(w_f32: bool, ckpt: bool, ts: bool = False, knobs: tuple = ()):
         f32_eps: fx.Float32,
         arg_flags: fx.Int64,
         i32_nwg: fx.Int32,
-        i32_lag: fx.Int32,
         arg_ts: fx.Int64,
         stream: fx.Stream,
     ):
         kernel(arg_mixed, i32_ldx, i32_mixed_bytes, arg_rawg, i32_ldg, arg_beta, i32_ldb, arg_alog, arg_dtb, arg_cw, arg_cs, i32_cs_slot,
                i32_cs_dim, i32_cs_pos, arg_tab, arg_ws, i32_nc, f32_lb, f32_scale, arg_state, i64_slot_bytes, arg_sidx, arg_has, arg_cu,
                arg_choff, arg_sb, i32_npairs, arg_ck, i64_ck_row_bytes, arg_ckoff, arg_ckrow, arg_out, i32_ostride, arg_gate, i32_gstride,
-               arg_nw, f32_eps, arg_flags, i32_nwg, i32_lag, arg_ts).launch(
+               arg_nw, f32_eps, arg_flags, i32_nwg, arg_ts).launch(
             grid=(i32_nwg + i32_nc * NH * 2, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch

@@ -42,11 +42,9 @@ def _rsqrt(x):
 
 
 @ASTRewriter.transform
-def out_body(lds_base, cid, h, w_f32, debug, arg_ws, i32_nc, arg_sb, arg_tab, arg_out, i32_ostride, arg_gate, i32_gstride, arg_w, f32_eps,
+def out_body(lds_base, cid, h, w_f32, arg_ws, i32_nc, arg_sb, arg_tab, arg_out, i32_ostride, arg_gate, i32_gstride, arg_w, f32_eps,
              arg_flags=None):
     """One workgroup's work: the output tile of chunk ``cid`` and head ``h``; with ``arg_flags`` it waits for the walk's state record."""
-    DEBUG = debug >= 1
-    DEBUG2 = debug >= 2
     tx = fx.thread_idx.x
     lane = tx % 64
     wave = fx.Int32(fx.rocdl.readfirstlane(T.i32, tx // 64))
@@ -103,7 +101,7 @@ def out_body(lds_base, cid, h, w_f32, debug, arg_ws, i32_nc, arg_sb, arg_tab, ar
         for nt in range_constexpr(4):
             for vt in range_constexpr(2):
                 ob[vt][nt] = mfma(sfv[vt][ks], qgf[(nt, ks)], ob[vt][nt])
-    for ksp in range_constexpr(0 if DEBUG2 else 2):
+    for ksp in range_constexpr(2):
         for nt in range_constexpr(2 * ksp, 4):
             for vt in range_constexpr(2):
                 ob[vt][nt] = mfma(vnv[vt][ksp], aqf[(nt, ksp)], ob[vt][nt])
@@ -142,13 +140,13 @@ def out_body(lds_base, cid, h, w_f32, debug, arg_ws, i32_nc, arg_sb, arg_tab, ar
             y = []
             for e in range_constexpr(4):
                 sig = _rcp(fx.Float32(1.0) + _exp2(g4[e] * (-LOG2E)))
-                y.append(ov[e] if DEBUG else ov[e] * rstd[nt] * wt[vt][e] * sig)
+                y.append(ov[e] * rstd[nt] * wt[vt][e] * sig)
             words = Vec.from_elements([pk_bf16(y[0], y[1]), pk_bf16(y[2], y[3])], fx.Int32)
             buffer_ops.buffer_store(words, out_r, ((16 * nt + l16) * i32_ostride + h * D + 16 * vs + 4 * qg) // 2)
 
 
 @launcher
-def compile_out(w_f32: bool, debug: int = 0):
+def compile_out(w_f32: bool):
     name = "kda_prefill_out_h12_d128" + ("_wf32" if w_f32 else "")
 
     @fx.struct
@@ -170,7 +168,7 @@ def compile_out(w_f32: bool, debug: int = 0):
     ):
         touch_args(arg_ws, i32_nc, arg_sb, arg_tab, arg_out, i32_ostride, arg_gate, i32_gstride, arg_w, f32_eps)
         smem = fx.SharedAllocator().allocate(Shared).peek()
-        out_body(fx.Int32(fx.ptrtoint(smem.buf.ptr)), fx.Int32(fx.block_idx.x), fx.Int32(fx.block_idx.y), w_f32, debug, arg_ws, i32_nc, arg_sb,
+        out_body(fx.Int32(fx.ptrtoint(smem.buf.ptr)), fx.Int32(fx.block_idx.x), fx.Int32(fx.block_idx.y), w_f32, arg_ws, i32_nc, arg_sb,
                  arg_tab, arg_out, i32_ostride, arg_gate, i32_gstride, arg_w, f32_eps)
 
     @flyc.jit

@@ -121,7 +121,6 @@ def gated_norm(o, gate, norm_weight, eps, out=None):
 
 
 MAX_WALK_WGS = 192  # a multiple of 32 and 64: a workgroup keeps its XCD and its slice group across the units it walks
-OUT_LAG = 32
 _flag_cache = {}
 
 
@@ -136,13 +135,13 @@ def _flags(device, chunks):
 
 
 @functools.cache
-def _mega_launcher(w_f32, ckpt, ts=False, knobs=()):
-    return _mega.compile_mega(w_f32, ckpt, ts, knobs)
+def _mega_launcher(w_f32, ckpt, ts=False):
+    return _mega.compile_mega(w_f32, ckpt, ts)
 
 
 def prefill_mega(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices, has_initial_state,
                  cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale=D ** -0.5, table=None,
-                 chunk_counts=None, checkpoint_state=None, checkpoint_offsets=None, checkpoint_rows=None, walk_wgs=None, lag=None, timestamps=None, knobs=()):
+                 chunk_counts=None, checkpoint_state=None, checkpoint_offsets=None, checkpoint_rows=None, walk_wgs=None, timestamps=None):
     """The KDA prefill of one layer in one launch (mega.py): same contract as ``prefill``."""
     n = cu_seqlens.numel() - 1
     nc = chunk_indices.shape[0]
@@ -172,20 +171,20 @@ def prefill_mega(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, co
     nwg = min(units, MAX_WALK_WGS if walk_wgs is None else walk_wgs)
     cs = conv_state
     _run_compiled(
-        _mega_launcher(wf32, ckpt, timestamps is not None, knobs),
+        _mega_launcher(wf32, ckpt, timestamps is not None),
         mixed.data_ptr(), mixed.stride(0), mixed.shape[0] * mixed.stride(0) * 2, raw_g.data_ptr(),
         raw_g.stride(-3) if raw_g.dim() > 2 else raw_g.stride(0), beta_logit.data_ptr(), beta_logit.stride(-2), A_log.data_ptr(),
         dt_bias.data_ptr(), conv_weight.data_ptr(), cs.data_ptr(), cs.stride(0), cs.stride(1), cs.stride(2), table.data_ptr(), ws.data_ptr(), nc,
         float(lower_bound), float(scale), state_cache.data_ptr(), state_cache.stride(0) * 4, state_indices.data_ptr(), has.data_ptr(),
         cu_seqlens.data_ptr(), chunk_offsets.data_ptr(), sb.data_ptr(), n * NH, *ck, out.data_ptr(), out.stride(0), gate.data_ptr(),
-        gate.stride(0), norm_weight.data_ptr(), float(norm_eps), flags.data_ptr(), nwg, OUT_LAG if lag is None else lag,
+        gate.stride(0), norm_weight.data_ptr(), float(norm_eps), flags.data_ptr(), nwg,
         timestamps.data_ptr() if timestamps is not None else ws.data_ptr(), torch.cuda.current_stream())
     return out
 
 
 @functools.cache
-def _walk_standalone(ckpt, ts=False, knobs=()):
-    return _walk.compile_walk(ckpt, ts, knobs)
+def _walk_standalone(ckpt, ts=False):
+    return _walk.compile_walk(ckpt, ts)
 
 
 @functools.cache
@@ -194,7 +193,7 @@ def _out_standalone(w_f32):
 
 
 def walk_states(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_state, checkpoint_state=None, checkpoint_offsets=None,
-                checkpoint_rows=None, timestamps=None, knobs=()):
+                checkpoint_rows=None, timestamps=None):
     """The state walk alone over the workspace records ``ws``: the state records [H, Nc, SREC_BYTES] the output pass reads; updates
     ``state_cache`` (and the checkpoint rows) in place."""
     n = cu_seqlens.numel() - 1
@@ -208,7 +207,7 @@ def walk_states(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_i
         ck = (checkpoint_state.data_ptr(), checkpoint_state.stride(0) * 4, checkpoint_offsets.data_ptr(), rows.data_ptr())
     else:
         ck = (ws.data_ptr(), 0, ws.data_ptr(), ws.data_ptr())
-    _run_compiled(_walk_standalone(ckpt, timestamps is not None, knobs), ws.data_ptr(), nc, state_cache.data_ptr(), state_cache.stride(0) * 4, state_indices.data_ptr(),
+    _run_compiled(_walk_standalone(ckpt, timestamps is not None), ws.data_ptr(), nc, state_cache.data_ptr(), state_cache.stride(0) * 4, state_indices.data_ptr(),
                   has.data_ptr(), cu_seqlens.data_ptr(), chunk_offsets.data_ptr(), sb.data_ptr(), n * NH, *ck, timestamps.data_ptr() if timestamps is not None else ws.data_ptr(), torch.cuda.current_stream())
     return sb
 
@@ -236,17 +235,45 @@ def prefill_v1(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv
     return gated_norm(out, gate, norm_weight, norm_eps, out)
 
 
+MEGA_MAX_CHAIN = 48  # chunks of the longest sequence the one-launch path serves (its walk is serial: about 0.9 us per chunk)
+MEGA_MAX_CHUNKS = 48  # chunks of a one- or two-sequence batch; larger batches start too many walk workgroups beside the prologue
+MEGA_TINY_CHUNKS = 16  # a batch this small takes the one-launch path whatever its sequence count (up to 8)
+
+
+def uses_mega(chunk_counts):
+    """Whether sequences of ``chunk_counts`` chunks (host ints) take the one-launch path (``prefill_mega``) rather than the staged
+    one (``prefill_v1``: prologue, grouped chains, gated norm); the staged path when the counts are not known."""
+    if chunk_counts is None:
+        return False
+    n, nc = len(chunk_counts), sum(chunk_counts)
+    return max(chunk_counts) <= MEGA_MAX_CHAIN and (nc <= MEGA_TINY_CHUNKS and n <= 8 or n <= 2 and nc <= MEGA_MAX_CHUNKS)
+
+
+def _prefill(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices, has_initial_state,
+             cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale=D ** -0.5, table=None,
+             chunk_counts=None, checkpoint_state=None, checkpoint_offsets=None, checkpoint_rows=None, impl=None):
+    """The KDA prefill of one layer (reference.py): writes ``out`` [T, 12, 128] bf16, rolls ``conv_state`` and updates
+    ``state_cache`` rows in place. ``impl``: ``"mega"`` / ``"v1"`` force a path, by default ``uses_mega(chunk_counts)`` chooses."""
+    if impl is None:
+        impl = "mega" if uses_mega(chunk_counts) else "v1"
+    run = prefill_mega if impl == "mega" else prefill_v1
+    return run(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices, has_initial_state,
+               cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale, table, chunk_counts,
+               checkpoint_state, checkpoint_offsets, checkpoint_rows)
+
+
 def _mode(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices, has_initial_state,
           cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale=D ** -0.5, table=None,
-          chunk_counts=None, checkpoint_state=None, checkpoint_offsets=None, checkpoint_rows=None):
+          chunk_counts=None, checkpoint_state=None, checkpoint_offsets=None, checkpoint_rows=None, impl=None):
     """What a call fixes about its kernels (``amd_kernels.warm_up``): the norm weight dtype and the checkpoint export."""
     return (norm_weight.dtype == torch.float32, checkpoint_state is not None)
 
 
 def _inputs(mode, n, mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices,
             has_initial_state, cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale=D ** -0.5,
-            table=None, chunk_counts=None, checkpoint_state=None, checkpoint_offsets=None, checkpoint_rows=None):
-    """One sequence of ``n`` tokens (zeros; the launches are compiled, not run)."""
+            table=None, chunk_counts=None, checkpoint_state=None, checkpoint_offsets=None, checkpoint_rows=None, impl=None):
+    """One sequence of ``n`` tokens (zeros; the launches are compiled, not run): the staged path with a short chain at 64 tokens
+    (whole chains), the one-launch path at 2048, the staged path with grouped chains at 8192."""
     dev = mixed.device
     chunks = -(-n // 64)
     cu = torch.tensor([0, n], dtype=torch.int32, device=dev)
@@ -260,10 +287,10 @@ def _inputs(mode, n, mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight
     args = (x, torch.zeros((n, NH, D), dtype=raw_g.dtype, device=dev), xg[:, 6272:6284], g, A_log, dt_bias, conv_weight, conv_state,
             state_cache, zero, torch.zeros(1, dtype=torch.bool, device=dev), cu, ci, co, norm_weight, norm_eps,
             torch.empty((n, NH, D), dtype=out.dtype, device=dev), lower_bound)
-    kwargs = {"chunk_counts": [chunks]}
+    kwargs = {"chunk_counts": [chunks], "impl": "v1" if n == 64 else None}
     if mode[1]:
         kwargs.update(checkpoint_state=checkpoint_state, checkpoint_offsets=zero, checkpoint_rows=None)
     return args, kwargs
 
 
-prefill = entry("attention/kda_prefill_h12_d128", mode=_mode, sizes=lambda mode: (64, 2048), inputs=_inputs)(prefill_mega)
+prefill = entry("attention/kda_prefill_h12_d128", mode=_mode, sizes=lambda mode: (64, 2048, 8192), inputs=_inputs)(_prefill)
