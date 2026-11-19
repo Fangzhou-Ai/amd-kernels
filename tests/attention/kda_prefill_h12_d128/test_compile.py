@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Nothing compiles after the first call (root README, rule 4): every kernel is compiled once per process (the grid, the group
-count and the sequence lengths are runtime arguments); the compile keys of a call are the norm weight dtype and the checkpoint
-export."""
+"""Nothing compiles after the first calls (root README, rule 4): the kernels are compiled once per process (the grid, the group
+count and the sequence lengths are runtime arguments); the compile keys of a call are the norm weight dtype, the checkpoint
+export and whether the sequences are grouped (the walk of grouped chains hosts the fold)."""
 
 import flydsl.compiler as flyc
 import pytest
@@ -38,7 +38,8 @@ def call(c, w_f32, ck):
 @pytest.mark.parametrize("w_f32,ck", [(True, False), (False, False), (True, True)])
 def test_no_compile_after_warmup(w_f32, ck, monkeypatch):
     require_gfx950()
-    call(make_case(SERVED[0][0]), w_f32, ck)
+    call(make_case(SERVED[0][0]), w_f32, ck)  # grouped chains
+    call(make_case(SERVED[1][0]), w_f32, ck)  # whole chains
     torch.cuda.synchronize()
     compiled = []
     real = flyc.compile
@@ -48,6 +49,6 @@ def test_no_compile_after_warmup(w_f32, ck, monkeypatch):
         return real(fn, *args, **kwargs)
 
     monkeypatch.setattr(flyc, "compile", counting)
-    for seq, _ in SERVED[1:]:
+    for seq, _ in SERVED[2:]:
         call(make_case(seq), w_f32, ck)
         assert not compiled, f"{seq} compiled {compiled}"

@@ -13,6 +13,7 @@ write and re-reads, and the MFMA time of the chunk matrices at the measured bf16
 """
 
 import argparse
+import functools
 import statistics
 import sys
 import types
@@ -131,6 +132,29 @@ def stage_arms(c, cu, ci, co, counts):
     return fused, stock
 
 
+def skeleton_scan_arms(cases, cu, co, counts):
+    """The chunk scan with the same DMAs, loads, stores and launches but no math (the scan's empirical floor)."""
+    fns = []
+    for c in cases:
+        ws = torch.zeros(R.NH, int(co[-1]), R.RECORD_BYTES, dtype=torch.uint8, device="cuda")
+        state = c["state_cache"].clone()
+        out = torch.empty(c["mixed"].shape[0], R.NH, R.D, dtype=torch.bfloat16, device="cuda")
+        fns.append(lambda ws=ws, state=state, out=out, c=c: host.chunk_scan(
+            ws, cu, co, state, c["state_indices"], c["has_initial_state"], out, counts))
+    return fns
+
+
+def skeleton_patch():
+    import importlib
+
+    scan_mod = importlib.import_module("amd_kernels.attention.kda_prefill_h12_d128.scan")
+    host._walk_launcher = functools.cache(
+        lambda ckpt=False, foldwalk=False: scan_mod.compile_scan(host.WALK_WAVES, host.WALK_NVT, False, host.WALK_STAGES, ckpt, True,
+                                                                  foldwalk))
+    host._chain_launcher = functools.cache(
+        lambda: scan_mod.compile_scan(host.CHAIN_WAVES, host.CHAIN_NVT, True, host.CHAIN_STAGES, False, True))
+
+
 def timeit_graph(calls, replays=10, rounds=15, warmup=3):
     for call in calls:
         call()
@@ -173,6 +197,7 @@ def main():
     ap.add_argument("--lens", default="", help="ragged batch, e.g. 3000,1500,700,60 (replaces --tokens)")
     ap.add_argument("--no-stock", action="store_true")
     ap.add_argument("--stages", action="store_true", help="also time each stage alone (fused and stock)")
+    ap.add_argument("--skeleton", action="store_true", help="also time the scan's no-math skeleton (run last: it patches the launchers)")
     args = ap.parse_args()
     print(f"{'T':>6} {'seqs':>4} {'fused us':>9} {'min':>8} {'stock us':>9} {'speedup':>8} {'floor(io) us':>13} {'%io':>5} {'floor(+ws)':>11} "
           f"{'mfma us':>8}")
@@ -196,6 +221,10 @@ def main():
         if not args.no_stock:
             smn, smd = timeit_graph([stock_arm(c, cu, ci, co) for c in cases])
         io, with_ws, mfma = floors(tokens, int(ci.shape[0]))
+        if args.skeleton:
+            skeleton_patch()
+            sk = timeit_graph(skeleton_scan_arms(cases, cu, co, counts))[0]
+            print(f"    scan skeleton us (min): {sk:.1f}")
         if args.stages:
             fs, ss = [], []
             sets = [stage_arms(c, cu, ci, co, counts) for c in cases]

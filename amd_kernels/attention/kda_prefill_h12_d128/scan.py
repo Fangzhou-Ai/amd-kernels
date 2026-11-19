@@ -18,11 +18,15 @@ issued. The ``u`` slices of a wave go straight to registers one chunk ahead; a c
 of the next one (rows past the sequence end fall out of the output buffer's range).
 
 Long sequences are cut into G groups of chunks walked in parallel (exact, ``S_out = S_in M_g + B_g`` with the group's transfer
-``M_g = prod_c (diag(decay_c) - w_c^T kg_c)``): the ``chain`` kernel walks a group from a zero state with ``u`` (the 8 value
+``M_g = prod_c (diag(decay_c) - w_c^T kg_c)``). The ``chain`` kernel walks a group from a zero state with ``u`` (the 8 value
 slices of ``B_g``) and from the identity with ``u = 0`` (8 more slices: the rows of ``M_g``, kept as ``diag(A_g)`` in fp32,
-``A_g`` the group's decay product, plus ``C_g = M_g - diag(A_g)`` in bf16 fragments); the ``fold`` kernel composes
-``S_in(g + 1) = S_in(g) A_g + S_in(g) C_g + B_g`` for every group; the ``walk`` kernel replays each group from its ``S_in(g)``
-with the outputs. A sequence of 4 chunks or fewer is one group: ``walk`` alone, from the state cache.
+``A_g`` the group's decay product, plus ``C_g = M_g - diag(A_g)`` in bf16 fragments); it also marks every row of the
+``S_in`` buffer unwritten. The ``walk`` kernel (``foldwalk``) starts with the fold workgroups, one per (pair, value slice): wave 0
+composes ``S_in(g + 1) = S_in(g) A_g + S_in(g) C_g + B_g`` over the groups with write-through stores, the other waves only issue
+its DMAs. The walk workgroups of group g poll the rows ``S_in(g)`` (agent-scope loads) until none holds the marker, so a group
+starts as soon as the fold reaches it and nothing depends on a flag or a fence; the workgroups are dispatched fold first, so
+every poll waits on workgroups that are already running. A sequence of 4 chunks or fewer is one group: the walk alone, from the
+state cache.
 """
 
 import flydsl.compiler as flyc
@@ -40,6 +44,9 @@ from .reference import (BT, D, NH, RECORD_AQK, RECORD_BYTES, RECORD_DEC, RECORD_
                         RECORD_W)
 
 STATE_BYTES = D * D * 4
+SENTINEL = 0x7FC0DEAD  # a NaN payload no state holds: marks a published row not yet written
+SC1 = 0x10  # agent-scope (cross-XCD) stores and loads
+POLL_LIMIT = 1 << 22  # polls of a published row before the walk gives up
 WALK_PIECES = RECORD_U // 1024  # 57 1 KB pieces of w | qg | kgt | aqk | decay
 WALK_STAGE = 60 * 1024
 CHAIN_PIECES = 33  # w | kgt | decay
@@ -99,11 +106,13 @@ def _block_decode(bid, groups, ngrp):
 
 
 @launcher
-def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2, ckpt: bool = False, skeleton: bool = False):
+def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2, ckpt: bool = False, skeleton: bool = False,
+                 foldwalk: bool = False):
     """``chain=False``: the walk kernel; ``chain=True``: the transfer kernel; ``stages``: depth of the LDS ring (the DMAs and the
     ``u`` loads of chunk c + stages - 1 are issued during chunk c); ``ckpt``: the walk also stores the state after
     ``checkpoint_offsets[n]`` tokens of a sequence into ``checkpoint_state``; ``skeleton``: the same loads, DMAs and stores with
-    no math (the benchmark's empirical floor)."""
+    no math (the benchmark's empirical floor); ``foldwalk``: the walk launch also hosts the fold (the first ``nbfold`` workgroups
+    are fold workgroups of one wave): a walk workgroup of group g reads the state S_in(g) the fold publishes, polling for it."""
     nsl = waves * nvt
     nslices = 16 if chain else 8
     ngrp = nslices // nsl
@@ -113,11 +122,15 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2, ckpt: bool 
     stage = CHAIN_STAGE if chain else WALK_STAGE
     ndma = -(-pieces // waves)
     ct_pitch = 16 * nsl + 4  # elements of a staged C^T row
-    name = f"kda_prefill_{'chain' if chain else 'walk'}_h12_d128_w{waves}_v{nvt}_s{stages}" + ("_ck" if ckpt else "") + ("_skel" if skeleton else "")
+    name = f"kda_prefill_{'chain' if chain else 'walk'}_h12_d128_w{waves}_v{nvt}_s{stages}" + ("_ck" if ckpt else "") + ("_skel" if skeleton else "") + ("_fw" if foldwalk else "")
+    fold_stages = 3
+    fold_stage = FRAGS_C + 1024 + 8192
+    pieces_f = 32 + 1 + 8
+    lds_bytes = max(stages * stage, fold_stages * fold_stage) if foldwalk else stages * stage
 
     @fx.struct
     class Shared:
-        buf: fx.Array[fx.Uint8, stages * stage, 16]
+        buf: fx.Array[fx.Uint8, lds_bytes, 16]
 
     @flyc.kernel(name=name, known_block_size=[nthreads, 1, 1])
     def kernel(
@@ -142,6 +155,7 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2, ckpt: bool 
         i64_ck_row_bytes: fx.Int64,
         arg_ckoff: fx.Int64,
         arg_ckrow: fx.Int64,
+        i32_nbfold: fx.Int32,
     ):
         tx = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -150,8 +164,97 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2, ckpt: bool 
         wave = fx.Int32(fx.rocdl.readfirstlane(T.i32, tx // 64))
         l16 = lane % 16
         qg = lane // 16
-        pair, g, sg = _block_decode(bid, i32_groups, ngrp)
-        if pair < i32_npairs:
+        if const_expr(foldwalk):
+            def fold_role(fb):
+                """One workgroup per (pair, V slice): wave 0 computes the rows of S_in(g + 1) = S_in(g) A_g + S_in(g) C_g + B_g for
+                every group and publishes them with write-through stores (the walk workgroups poll for them); the other waves only
+                issue the DMAs of the next stages."""
+                fpair, _fg, fsg = _block_decode(fb, 1, 8)
+                if fpair < i32_npairs:
+                    n = fpair // NH
+                    h = fpair % NH
+                    cu_r = buffer_ops.create_buffer_resource_from_addr(arg_cu)
+                    tok0 = fx.Int32(buffer_ops.buffer_load(cu_r, n, vec_width=1, is_scalar=True))
+                    tok1 = fx.Int32(buffer_ops.buffer_load(cu_r, n + 1, vec_width=1, is_scalar=True))
+                    slot = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_sidx), n, vec_width=1, is_scalar=True))
+                    has_w = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_has), n // 4, vec_width=1, is_scalar=True))
+                    nt = (tok1 - tok0 + (BT - 1)) // BT
+                    gn = _group(nt, i32_groups, i32_minc)
+                    if gn > 1:
+                        has_b = ((has_w >> ((n % 4) * 8)) & 0xFF) != 0
+                        lds_base = fx.Int32(fx.ptrtoint(smem.buf.ptr))
+                        lane16 = lane * 16
+                        nh = fpair * i32_groups
+                        steps = gn - 1
+                        nhelp = nthreads // 64 - 1
+                        per_help = -(-pieces_f // nhelp)
+
+                        def fdma(gp, st):
+                            gpc = fx.min(gp, steps - 1)
+                            rc = _fp(arg_gc + fx.Int64(nh + gpc) * FRAGS_C, FRAGS_C)
+                            ra = _fp(arg_ga + fx.Int64(nh + gpc) * (D * 4), 1024)
+                            rb = _fp(arg_gb + fx.Int64(nh + gpc) * STATE_BYTES + fx.Int64(fsg * 8192), 8192)
+                            for i in range_constexpr(per_help):
+                                j = fx.min(wave - 1 + i * nhelp, fx.Int32(pieces_f - 1))
+                                dst = lds_base + st * fold_stage + j * 1024
+                                if j < 32:
+                                    _dma_piece(rc, dst, j * 1024 + lane16)
+                                elif j < 33:
+                                    _dma_piece(ra, dst, lane16)
+                                else:
+                                    _dma_piece(rb, dst, (j - 33) * 1024 + lane16)
+
+                        if wave == 0:
+                            src_r = _fp(arg_state + fx.Int64(slot) * i64_slot_bytes + fx.Int64(h) * STATE_BYTES, STATE_BYTES)
+                            s0f = [buffer_ops.buffer_load(src_r, (16 * fsg + l16) * D + 16 * kt + 4 * qg, vec_width=4, dtype=fx.Float32, mask=has_b)
+                                   for kt in range_constexpr(8)]
+                            sin0 = _fp(arg_sin + fx.Int64(nh) * STATE_BYTES, STATE_BYTES)
+                            for kt in range_constexpr(8):
+                                buffer_ops.buffer_store(s0f[kt], sin0, (16 * fsg + l16) * D + 16 * kt + 4 * qg, cache_modifier=SC1)
+                            for gp, st in range(0, fx.Int64(steps), 1, init=[fx.as_ir_value(x) for x in s0f]):
+                                gi = fx.Int32(gp)
+                                S = [Vec(st[kt]) for kt in range_constexpr(8)]
+                                barrier()
+                                base = lds_base + (gi % fold_stages) * fold_stage
+                                a4 = [lds_load4(base + FRAGS_C + (16 * kt + 4 * qg) * 4).bitcast(fx.Float32) for kt in range_constexpr(8)]
+                                acc = [S[kt] * a4[kt] + lds_load4(base + FRAGS_C + 1024 + (l16 * D + 16 * kt + 4 * qg) * 4).bitcast(fx.Float32)
+                                       for kt in range_constexpr(8)]
+                                sf = [_pack(S[2 * ks], S[2 * ks + 1]) for ks in range_constexpr(4)]
+                                for ks in range_constexpr(0 if skeleton else 4):
+                                    for kt in range_constexpr(8):
+                                        acc[kt] = mfma(lds_load4(base + (kt * 4 + ks) * 1024 + lane16), sf[ks], acc[kt])
+                                dst = _fp(arg_sin + fx.Int64(nh + gi + 1) * STATE_BYTES, STATE_BYTES)
+                                for kt in range_constexpr(8):
+                                    buffer_ops.buffer_store(acc[kt], dst, (16 * fsg + l16) * D + 16 * kt + 4 * qg, cache_modifier=SC1)
+                                results = yield [fx.as_ir_value(x) for x in acc]
+                        else:
+                            for p_ in range_constexpr(fold_stages - 1):
+                                fdma(fx.Int32(p_), fx.Int32(p_))
+                            for gp in range(fx.Int32(0), steps, fx.Int32(1)):
+                                gi = fx.Int32(gp)
+                                fx.rocdl.s_waitcnt(vmcnt=(fold_stages - 2) * per_help)
+                                barrier()
+                                fdma(gi + fold_stages - 1, (gi + fold_stages - 1) % fold_stages)
+
+        if const_expr(chain):
+            # the fold's inputs are published by sentinel: every state row of the launch starts as an unwritten marker
+            sin_units = i32_npairs * i32_groups * (STATE_BYTES // 16)
+            sin_r = _fp(arg_sin, i32_npairs * i32_groups * STATE_BYTES)
+            sent = Vec.filled(4, SENTINEL, fx.Int32)
+            nthr_all = fx.grid_dim.x * nthreads
+            for u0_ in range(bid * nthreads + tx, sin_units, nthr_all):
+                buffer_ops.buffer_store(sent, sin_r, u0_ * 4)
+        if const_expr(foldwalk):
+            wbid = bid - i32_nbfold
+            fold_blk = bid < i32_nbfold
+        else:
+            wbid = bid
+        pair, g, sg = _block_decode(wbid, i32_groups, ngrp)
+        if const_expr(foldwalk):
+            if fold_blk:
+                fold_role(bid)
+        active = (pair < i32_npairs) & (bid >= i32_nbfold) if foldwalk else pair < i32_npairs
+        if active:
             n = pair // NH
             h = pair % NH
             cu_r = buffer_ops.create_buffer_resource_from_addr(arg_cu)
@@ -197,10 +300,18 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2, ckpt: bool 
                     src = grouped.select(fx.Int64(arg_sin) + fx.Int64(nhg) * STATE_BYTES, fx.Int64(arg_state) + fx.Int64(slot) * i64_slot_bytes + fx.Int64(h) * STATE_BYTES)
                     ok = grouped | has
                     src_r = _fp(src, STATE_BYTES)
-                    s0 = []
-                    for vt in range_constexpr(nvt):
-                        for kt in range_constexpr(8):
-                            s0.append(buffer_ops.buffer_load(src_r, (16 * (vs0 + vt) + l16) * D + 16 * kt + 4 * qg, vec_width=4, dtype=fx.Float32, mask=ok))
+
+                    def rd_s0():
+                        return [buffer_ops.buffer_load(src_r, (16 * (vs0 + vt) + l16) * D + 16 * kt + 4 * qg, vec_width=4, dtype=fx.Float32,
+                                                       mask=ok, cache_modifier=SC1 if foldwalk else 0)
+                                for vt in range_constexpr(nvt) for kt in range_constexpr(8)]
+
+                    def unwritten(vs):
+                        hit = vs[0][0].bitcast(fx.Int32) == SENTINEL
+                        for v_ in vs:
+                            for e_ in range_constexpr(4):
+                                hit = hit | (v_[e_].bitcast(fx.Int32) == SENTINEL)
+                        return fx.Int64(fx.rocdl.ballot(T.i64, hit)) != fx.Int64(0)
 
                 if const_expr(not chain):
                     out_r = buffer_ops.create_buffer_resource_from_addr(
@@ -238,6 +349,16 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2, ckpt: bool 
                     for jb in dma(fx.Int32(p), fx.Int32(p)):
                         jb()
                     win0.append(raw_p)
+                if const_expr(not chain):
+                    s0 = rd_s0()
+                    if const_expr(foldwalk):
+                        pending = unwritten(s0)
+                        spins = fx.Int32(0)
+                        while pending & (spins < POLL_LIMIT):
+                            fx.rocdl.s_sleep(2)
+                            s0 = rd_s0()
+                            pending = unwritten(s0)
+                            spins = spins + 1
                 u0 = _u_f32(win0[0])
                 extra0 = ([Vec.filled(4, 1.0, fx.Float32) for _ in range_constexpr(8)] if chain
                           else [Vec.filled(2, 0, fx.Int32) for _ in range_constexpr(nvt * 4)])
@@ -431,142 +552,11 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2, ckpt: bool 
         i64_ck_row_bytes: fx.Int64,
         arg_ckoff: fx.Int64,
         arg_ckrow: fx.Int64,
+        i32_nbfold: fx.Int32,
         stream: fx.Stream,
     ):
         kernel(arg_ws, i32_nc, arg_state, i64_slot_bytes, arg_sidx, arg_has, arg_cu, arg_choff, arg_out, i32_ostride, arg_gb, arg_gc,
-               arg_ga, arg_sin, i32_groups, i32_minc, i32_npairs, arg_ck, i64_ck_row_bytes, arg_ckoff, arg_ckrow).launch(
-            grid=(((i32_npairs * i32_groups + 7) // 8) * 8 * ngrp, 1, 1), block=(nthreads, 1, 1), stream=stream)
-
-    return launch
-
-
-@launcher
-def compile_fold(waves: int, nvt: int, stages: int, skeleton: bool = False):
-    nsl = waves * nvt
-    assert 8 % nsl == 0
-    ngrp = 8 // nsl
-    nthreads = 64 * waves
-    b_bytes = nsl * 8192
-    a_off, b_off = FRAGS_C, FRAGS_C + 1024
-    stage_bytes = b_off + b_bytes
-    pieces = 32 + 1 + b_bytes // 1024
-    ndma = -(-pieces // waves)
-    name = f"kda_prefill_fold_h12_d128_w{waves}_v{nvt}_s{stages}" + ("_skel" if skeleton else "")
-
-    @fx.struct
-    class Shared:
-        buf: fx.Array[fx.Uint8, stages * stage_bytes, 16]
-
-    @flyc.kernel(name=name, known_block_size=[nthreads, 1, 1])
-    def kernel(
-        arg_state: fx.Int64,
-        i64_slot_bytes: fx.Int64,
-        arg_sidx: fx.Int64,
-        arg_has: fx.Int64,
-        arg_cu: fx.Int64,
-        arg_gb: fx.Int64,
-        arg_gc: fx.Int64,
-        arg_ga: fx.Int64,
-        arg_sin: fx.Int64,
-        i32_groups: fx.Int32,
-        i32_minc: fx.Int32,
-        i32_npairs: fx.Int32,
-    ):
-        tx = fx.thread_idx.x
-        bid = fx.block_idx.x
-        smem = fx.SharedAllocator().allocate(Shared).peek()
-        lane = tx % 64
-        wave = fx.Int32(fx.rocdl.readfirstlane(T.i32, tx // 64))
-        l16 = lane % 16
-        qg = lane // 16
-        pair, _, sg = _block_decode(bid, 1, ngrp)
-        if pair < i32_npairs:
-            n = pair // NH
-            h = pair % NH
-            cu_r = buffer_ops.create_buffer_resource_from_addr(arg_cu)
-            tok0 = fx.Int32(buffer_ops.buffer_load(cu_r, n, vec_width=1, is_scalar=True))
-            tok1 = fx.Int32(buffer_ops.buffer_load(cu_r, n + 1, vec_width=1, is_scalar=True))
-            slot = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_sidx), n, vec_width=1, is_scalar=True))
-            has_w = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_has), n // 4, vec_width=1, is_scalar=True))
-            ntok = tok1 - tok0
-            nt = (ntok + (BT - 1)) // BT
-            gn = _group(nt, i32_groups, i32_minc)
-            if gn > 1:
-                has = ((has_w >> ((n % 4) * 8)) & 0xFF) != 0
-                lds_base = fx.Int32(fx.ptrtoint(smem.buf.ptr))
-                lane16 = lane * 16
-                vs0 = (sg * waves + wave) * nvt
-                nh = pair * i32_groups
-                steps = gn - 1
-
-                def dma(gp, st):
-                    gpc = fx.min(gp, steps - 1)
-                    rc = _fp(arg_gc + fx.Int64(nh + gpc) * FRAGS_C, FRAGS_C)
-                    ra = _fp(arg_ga + fx.Int64(nh + gpc) * (D * 4), 1024)
-                    rb = _fp(arg_gb + fx.Int64(nh + gpc) * STATE_BYTES + fx.Int64(sg * nsl * 8192), b_bytes)
-                    for i in range_constexpr(ndma):
-                        j = fx.min(wave + i * waves, fx.Int32(pieces - 1))
-                        dst = lds_base + st * stage_bytes + j * 1024
-                        if j < 32:
-                            _dma_piece(rc, dst, j * 1024 + lane16)
-                        else:
-                            if j < 33:
-                                _dma_piece(ra, dst, lane16)
-                            else:
-                                _dma_piece(rb, dst, (j - 33) * 1024 + lane16)
-
-                for p in range_constexpr(stages - 1):
-                    dma(fx.Int32(p), fx.Int32(p))
-                src_r = _fp(arg_state + fx.Int64(slot) * i64_slot_bytes + fx.Int64(h) * STATE_BYTES, STATE_BYTES)
-                s0 = []
-                for vt in range_constexpr(nvt):
-                    for kt in range_constexpr(8):
-                        s0.append(buffer_ops.buffer_load(src_r, (16 * (vs0 + vt) + l16) * D + 16 * kt + 4 * qg, vec_width=4, dtype=fx.Float32, mask=has))
-                sin0 = _fp(arg_sin + fx.Int64(nh) * STATE_BYTES, STATE_BYTES)
-                for vt in range_constexpr(nvt):
-                    for kt in range_constexpr(8):
-                        buffer_ops.buffer_store(s0[vt * 8 + kt], sin0, (16 * (vs0 + vt) + l16) * D + 16 * kt + 4 * qg)
-                init = [fx.as_ir_value(x) for x in s0]
-                for gp, st in range(0, fx.Int64(steps), 1, init=init):
-                    gi = fx.Int32(gp)
-                    S = [[Vec(st[vt * 8 + kt]) for kt in range_constexpr(8)] for vt in range_constexpr(nvt)]
-                    fx.rocdl.s_waitcnt(vmcnt=(stages - 1) * 8 * nvt + (stages - 2) * ndma, lgkmcnt=0)
-                    barrier()
-                    base = lds_base + (gi % stages) * stage_bytes
-                    dma(gi + stages - 1, (gi + stages - 1) % stages)
-                    sched_barrier()
-                    a4 = [lds_load4(base + a_off + (16 * kt + 4 * qg) * 4).bitcast(fx.Float32) for kt in range_constexpr(8)]
-                    acc = [[S[vt][kt] * a4[kt] + lds_load4(base + b_off + ((16 * (wave * nvt + vt) + l16) * D + 16 * kt + 4 * qg) * 4).bitcast(fx.Float32)
-                            for kt in range_constexpr(8)] for vt in range_constexpr(nvt)]
-                    sf = [[_pack(S[vt][2 * ks], S[vt][2 * ks + 1]) for ks in range_constexpr(4)] for vt in range_constexpr(nvt)]
-                    for ks in range_constexpr(0 if skeleton else 4):
-                        for kt in range_constexpr(8):
-                            f = lds_load4(base + (kt * 4 + ks) * 1024 + lane16)
-                            for vt in range_constexpr(nvt):
-                                acc[vt][kt] = mfma(f, sf[vt][ks], acc[vt][kt])
-                    dst = _fp(arg_sin + fx.Int64(nh + gi + 1) * STATE_BYTES, STATE_BYTES)
-                    for vt in range_constexpr(nvt):
-                        for kt in range_constexpr(8):
-                            buffer_ops.buffer_store(acc[vt][kt], dst, (16 * (vs0 + vt) + l16) * D + 16 * kt + 4 * qg)
-                    results = yield [fx.as_ir_value(acc[vt][kt]) for vt in range_constexpr(nvt) for kt in range_constexpr(8)]
-
-    @flyc.jit
-    def launch(
-        arg_state: fx.Int64,
-        i64_slot_bytes: fx.Int64,
-        arg_sidx: fx.Int64,
-        arg_has: fx.Int64,
-        arg_cu: fx.Int64,
-        arg_gb: fx.Int64,
-        arg_gc: fx.Int64,
-        arg_ga: fx.Int64,
-        arg_sin: fx.Int64,
-        i32_groups: fx.Int32,
-        i32_minc: fx.Int32,
-        i32_npairs: fx.Int32,
-        stream: fx.Stream,
-    ):
-        kernel(arg_state, i64_slot_bytes, arg_sidx, arg_has, arg_cu, arg_gb, arg_gc, arg_ga, arg_sin, i32_groups, i32_minc,
-               i32_npairs).launch(grid=(((i32_npairs + 7) // 8) * 8 * ngrp, 1, 1), block=(nthreads, 1, 1), stream=stream)
+               arg_ga, arg_sin, i32_groups, i32_minc, i32_npairs, arg_ck, i64_ck_row_bytes, arg_ckoff, arg_ckrow, i32_nbfold).launch(
+            grid=(i32_nbfold + ((i32_npairs * i32_groups + 7) // 8) * 8 * ngrp, 1, 1), block=(nthreads, 1, 1), stream=stream)
 
     return launch

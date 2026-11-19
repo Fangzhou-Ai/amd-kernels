@@ -18,11 +18,8 @@ WALK_WAVES = 4
 WALK_NVT = 1
 CHAIN_WAVES = 4
 CHAIN_NVT = 1
-CHAIN_STAGES = 3
+CHAIN_STAGES = 2
 WALK_STAGES = 2
-FOLD_WAVES = 1
-FOLD_NVT = 1
-FOLD_STAGES = 3
 MIN_CHUNKS = 4
 MIN_GROUP_CHUNKS = 5
 MAX_GROUPS = 32
@@ -30,18 +27,13 @@ NUM_CUS = 256
 
 
 @functools.cache
-def _walk_launcher(ckpt=False):
-    return _scan.compile_scan(WALK_WAVES, WALK_NVT, False, WALK_STAGES, ckpt)
+def _walk_launcher(ckpt=False, foldwalk=False):
+    return _scan.compile_scan(WALK_WAVES, WALK_NVT, False, WALK_STAGES, ckpt, False, foldwalk)
 
 
 @functools.cache
 def _chain_launcher():
     return _scan.compile_scan(CHAIN_WAVES, CHAIN_NVT, True, CHAIN_STAGES)
-
-
-@functools.cache
-def _fold_launcher():
-    return _scan.compile_fold(FOLD_WAVES, FOLD_NVT, FOLD_STAGES)
 
 
 @functools.cache
@@ -55,7 +47,7 @@ MAX_UNITS = 128  # (pair, group) units of one launch: 128 fill the 32 CUs of eac
 
 def plan_groups(chunk_counts):
     """Chunk groups per sequence for sequences of ``chunk_counts`` chunks (host ints): the most groups whose (pair, group) units
-    still fit one round of the CUs, none for short chains (the chain / fold launches cost more than they save)."""
+    still fit one round of the CUs, none for short chains (the chain launch and the fold cost more than they save)."""
     if max(chunk_counts) <= SHORT_CHAIN:
         return 1
     best = 1
@@ -102,13 +94,12 @@ def chunk_scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_in
         ck = (checkpoint_state.data_ptr(), checkpoint_state.stride(0) * 4, checkpoint_offsets.data_ptr(), rows.data_ptr())
     else:
         ck = (ws.data_ptr(), 0, ws.data_ptr(), ws.data_ptr())
+    nbfold = ((n * NH + 7) // 8) * 8 * 8 if g > 1 else 0
     tail = (g, MIN_CHUNKS, n * NH, *ck)
     full = (*common, gb.data_ptr(), gc.data_ptr(), ga.data_ptr(), sin.data_ptr(), *tail)
     if g > 1:
-        _run_compiled(_chain_launcher(), *full, stream)
-        _run_compiled(_fold_launcher(), state_cache.data_ptr(), state_cache.stride(0) * 4, state_indices.data_ptr(), has.data_ptr(),
-                      cu_seqlens.data_ptr(), gb.data_ptr(), gc.data_ptr(), ga.data_ptr(), sin.data_ptr(), g, MIN_CHUNKS, n * NH, stream)
-    _run_compiled(_walk_launcher(ckpt), *full, stream)
+        _run_compiled(_chain_launcher(), *full, 0, stream)
+    _run_compiled(_walk_launcher(ckpt, nbfold > 0), *full, nbfold, stream)
     return out
 
 
@@ -169,4 +160,4 @@ def _inputs(mode, n, mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight
     return args, kwargs
 
 
-prefill = entry("attention/kda_prefill_h12_d128", mode=_mode, sizes=lambda mode: (2048,), inputs=_inputs)(_prefill)
+prefill = entry("attention/kda_prefill_h12_d128", mode=_mode, sizes=lambda mode: (64, 2048), inputs=_inputs)(_prefill)
