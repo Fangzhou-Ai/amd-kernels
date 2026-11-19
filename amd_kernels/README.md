@@ -13,6 +13,9 @@ One line per kernel package. Each package's README has what it does, its entry p
 - [`gemm/mxfp8_gateup_swiglu_n6144_k6144_i3072`](gemm/mxfp8_gateup_swiglu_n6144_k6144_i3072/README.md): dense MLP
   gate_up + SwiGLU at 1-8 rows.
 - [`gemm/bf16_n50016_k6144`](gemm/bf16_n50016_k6144/README.md): the lm_head vocabulary shard, with an optional row map.
+- [`gemm/bf16_skinny_common`](gemm/bf16_skinny_common/README.md): the dense bf16 linears of a 1-192 row decode step
+  (attention in/out projections, shared experts, latent down, lm_head, drafter context projection) on a load-time
+  packed weight, one tuned tile table.
 - [`gemm/bf16_n200064_k256`](gemm/bf16_n200064_k256/README.md): the draft's Markov projection over selected rows.
 - [`gemm/bf16_concat_linear_n1536_k30720`](gemm/bf16_concat_linear_n1536_k30720/README.md): the draft's input fc over
   five taps, and the four-rank gather.
