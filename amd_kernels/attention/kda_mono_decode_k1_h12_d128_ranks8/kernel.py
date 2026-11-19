@@ -94,6 +94,7 @@ STAGER = WAVES - 1  # the wave that stages x
 import os
 WCM = int(os.environ.get('WCM', '0'))
 NSTAGER = int(os.environ.get('NSTAGER', '1'))
+EARLY = int(os.environ.get('EARLY', '7'))
 VCH = 16  # state rows a KDA task
 NVCH = HD // VCH  # 8
 CONV_W = 4
@@ -105,13 +106,13 @@ WGT0 = 256  # red: the source weights
 MSQ0 = 512  # red: the mix's per-wave sums of squares
 # timeline points: start, slice, gate, mix, load_x, gemv0, gemv1, k.stage,
 # k.conv, k.gates, k.recur, k.norm
-TL_POINTS = 24
+TL_POINTS = 32
 
 
 _STREAM = fx.Stream(None)
 REGIONS = ("xrdy", "proj", "onrm")
 # every mono source file: in every build's JIT cache key
-_SOURCES = source_digest("common/mono", "attention/kda_mono_decode_k1_h12_d128_ranks8") + f"wcm{WCM}ns{NSTAGER}"
+_SOURCES = source_digest("common/mono", "attention/kda_mono_decode_k1_h12_d128_ranks8") + f"wcm{WCM}ns{NSTAGER}e{EARLY}"
 
 
 @dataclass(frozen=True)
@@ -416,6 +417,7 @@ def stage_x(c):
     nb = c["XB"]
     if lane < c["S"]:
         c["poll"]([(c["xrdy"], lane, 1)])
+    stamp(c["on"], c["tls"], c["tid"] - 64 * STAGER, 24)
     l4 = lane // 4
     col0 = (l4 % 8) * KCH + (l4 // 8) * 32 + (lane % 4) * 8
     pieces = (nb + 15) // 16
@@ -451,12 +453,17 @@ def gemv_weights(c, lr_a, n_a, lr_b, n_b):
     which lands while the others' MFMAs wait for the barrier."""
     wave = uniform(c["wave"])
     me = wave >= WAVES - NSTAGER
-    ops_a = gemv_loads(c, lr_a, me.select(fx.Int32(0), n_a), range(PER_WAVE))
-    ops_b = gemv_loads(c, lr_b, me.select(fx.Int32(0), n_b), range(PER_WAVE))
+    zero = fx.Int32(0)
+    # the stager waves' first EARLY chunks are in flight with everyone's; their
+    # poll queues behind those only
+    early = range(EARLY)
+    rest = range(EARLY, PER_WAVE)
+    ops_a = gemv_loads(c, lr_a, n_a, early) + gemv_loads(c, lr_a, me.select(zero, n_a), rest)
+    ops_b = gemv_loads(c, lr_b, n_b, early) + gemv_loads(c, lr_b, me.select(zero, n_b), rest)
     if me:
         stage_x(c)
-        ops_a = gemv_loads(c, lr_a, n_a, range(PER_WAVE))
-        ops_b = gemv_loads(c, lr_b, n_b, range(PER_WAVE))
+        ops_a = ops_a[: 4 * EARLY] + gemv_loads(c, lr_a, n_a, rest)
+        ops_b = ops_b[: 4 * EARLY] + gemv_loads(c, lr_b, n_b, rest)
     gpu.barrier()
     return ops_a, ops_b
 
@@ -963,10 +970,10 @@ def build(key: KdaPreBuild):
         stamp(on, tls, tid, 5)
         accs = gemv_mfma(c, ops_a, ops_b, xd)
         stamp(on, tls, tid, 19)
-        k = kda_stage(c)
-        stamp(on, tls, tid, 20)
         gemv_put(c, accs, lr_a, n_a, lr_b, n_b)
         stamp(on, tls, tid, 21)
+        k = kda_stage(c)
+        stamp(on, tls, tid, 20)
         nrounds = -(-(s // L) * NH // ((BLOCKS - s) // NVCH))
         for r in range_constexpr(nrounds):
             if r > 0:
