@@ -54,7 +54,7 @@ def stock_op():
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--shapes", nargs="*", default=None)
-    p.add_argument("--rows", type=int, nargs="*", default=[12, 24, 40, 65, 80, 128, 192])
+    p.add_argument("--rows", type=int, nargs="*", default=[12, 24, 40, 64, 80, 96, 128, 160, 192])
     a = p.parse_args()
     shapes = [tuple(int(v) for v in s.split(",")) for s in a.shapes] if a.shapes else SHAPES
     stock, stock_name = stock_op()

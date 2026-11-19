@@ -4,8 +4,9 @@
 
 The product of the bf16 operands in fp64, rounded once to bf16. The kernel accumulates in fp32 (K ascending
 within a split, splits summed in split order), so it differs from the reference (and from hipBLASLt / wvSplitKrc)
-only in the sum order: per-row cosine >= 0.99999 and relative L2 <= 1e-3, deterministic bits. NaN / inf propagate
-as in an fp32 accumulation.
+only in the sum order, which flips the final bf16 rounding of rare elements: every element within one bf16 ulp
+(2^-7 relative) plus 1e-5 of the row's largest element (the fp32 noise of a cancelling sum) of the reference,
+per-row cosine >= 0.99999, median per-row relative L2 <= 1e-3; the bits repeat run to run. NaN / inf propagate as in an fp32 accumulation.
 """
 import torch
 
