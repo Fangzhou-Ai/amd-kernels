@@ -37,7 +37,7 @@ def run(m, runs=3):
         def call():
             run_compiled(kernel, m, (m + T.rb_of(m) - 1) // T.rb_of(m), 0, table.data_ptr(), counts.data_ptr(), 0, 0, nw.data_ptr(),
                          w.data_ptr(), view.data_ptr(), view.stride(0), view.data_ptr(), view.stride(0),
-                         f32_bits(1e-6), 0, 0, torch.cuda.current_stream())
+                         f32_bits(1e-6), 0, 0, 0, torch.cuda.current_stream())
             torch.cuda.synchronize()
 
         call()

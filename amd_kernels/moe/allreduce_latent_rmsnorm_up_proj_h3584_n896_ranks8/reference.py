@@ -40,3 +40,14 @@ def latent_tail_reference(parts, norm_weight, w, shared, eps=1e-6):
     latent = reduce_reference(parts)
     y, up = up_proj_reference(latent, norm_weight, w, shared, eps)
     return y, up, latent
+
+
+def slot_sum_reference(slots, reverse_sorted):
+    """The latent partial [rows, 3584] of one rank from the routed experts' slot buffer ([sorted rows, 3584] bf16, already
+    multiplied by the router weights): token t's slot k is row ``reverse_sorted[16 t + k]``; the 16 slots are added in
+    order k = 0..15 in fp32 and rounded once to bf16 (the same bits as the routed-experts kernel's own sum)."""
+    rows = reverse_sorted.view(-1, 16).long()
+    acc = slots[rows[:, 0]].float()
+    for k in range(1, 16):
+        acc = acc + slots[rows[:, k]].float()
+    return acc.bfloat16()

@@ -50,6 +50,8 @@ from .norm_math import (
     wave_sum_lane63,
 )
 
+SLOTS = 16  # expert slots of the routed experts' output
+MAX_SLOT_ROWS = 64  # rows the slot-summing variant takes
 RB_MIN = 2  # rows per all-reduce workgroup of the smallest calls (one wave per row)
 SL = K // WORLD  # 448 columns of a slice
 PK = SL // 8  # 56 packs of 8 bf16 per row slice
@@ -87,16 +89,21 @@ def rb_of(m: int) -> int:
     return 2 if m <= 64 else 4 if m <= 128 else 8
 
 
-def nsub_of(mt: int) -> int:
+def nsub_of(mt: int, slots: bool = False) -> int:
     """16-column n tiles per workgroup: one for small calls (less weight traffic per CU before the flags arrive), two
     when the activation rows read per CU dominate."""
-    return 1 if mt <= 4 else 2
+    return 1 if mt <= (2 if slots else 4) else 2
 
 
 def groups_of(mt: int) -> int:
     """m groups of a call of ``mt`` 16-token tiles: an even count (the XCD mapping splits 28 n tiles x groups evenly over 8
     XCDs), at most 8 (224 workgroups), so a workgroup reads few activation rows; the weights it needs are 2 x 114 KB."""
     return 4 if mt <= 4 else 6 if mt <= 6 else 8
+
+
+def rb_of_slots(m: int) -> int:
+    """Rows per all-reduce workgroup when the 16 slots are summed in the kernel: a wave reads 16 slice rows per row."""
+    return 1
 
 
 def mpg_of(mt: int, groups: int = GROUPS) -> int:
@@ -125,16 +132,17 @@ def mfma_wait(v):
 
 
 @launcher
-def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False, groups: int = GROUPS, nsub: int = NSUB):
+def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False, groups: int = GROUPS, nsub: int = NSUB,
+                 slots: bool = False):
     """``mpg``: 16-token tiles of an m group (rows <= 64 mpg); ``ts``: each workgroup stores ``s_memrealtime`` (10 ns) stamps
     of its phases into ``arg_ts`` ([workgroup][wave][8] words, a profiling build)."""
-    assert mode in ("fused", "ar", "up") and groups % 2 == 0 and groups * (NTILES // nsub) <= K2_WGS and 1 <= mpg <= (MAX_MT + groups - 1) // groups and rb in (2, 4, 8)
+    assert mode in ("fused", "ar", "up") and groups % 2 == 0 and groups * (NTILES // nsub) <= K2_WGS and 1 <= mpg <= (MAX_MT + groups - 1) // groups and rb in ((1, 2) if slots else (2, 4, 8))
     do_ar, do_up = mode != "up", mode != "ar"
     nt2 = NTILES // nsub  # workgroup n tiles of 16 * nsub columns
     RB = rb
     UP0 = MAX_RB if mode == "fused" else 0  # first up-projection workgroup
     LDS = NWAVES * 16 * XROW + NWAVES * mpg * nsub * 1024
-    name = f"latent_tail_h3584_n896_{mode}_mpg{mpg}_rb{rb}_g{groups}_n{nsub}" + ("_ts" if ts else "")
+    name = f"latent_tail_h3584_n896_{mode}_mpg{mpg}_rb{rb}_g{groups}_n{nsub}" + ("_slots" if slots else "") + ("_ts" if ts else "")
     grid = (MAX_RB if do_ar else 0) + (nt2 * (K2_WGS // nt2) if do_up else 0)  # the grid is the same for every call: all epoch words advance together
 
     @fx.struct
@@ -159,6 +167,7 @@ def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False, groups: int
         i32_eps: fx.Int32,
         i32_zero: fx.Int32,
         arg_ts: fx.Int64,
+        arg_rs: fx.Int64,
     ):
         tx, bid = fx.thread_idx.x, fx.block_idx.x
         lane = tx % 64
@@ -199,26 +208,62 @@ def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False, groups: int
             ok = (lane < PK) & wrow
             stamp(0)
             if rb < i32_nrb:
-                xr = at(arg_x, i32_m * i32_sx * 2)
-                mine_pk = [pack(xr, row * (i32_sx // 2) + d * (SL // 2) + p * 4, ok) for d in range_constexpr(WORLD)]
-                wpk = bf16x8(pack(at(arg_nw, K * 2), i32_me * (SL // 2) + p * 4, ok))
-                for d in range_constexpr(WORLD):
-                    dest = at(bs[d] + INBOX, INBOX_BYTES)
-                    buffer_ops.buffer_store(mine_pk[d], dest, (i32_me * MAX_ROWS + row) * (SL // 2) + p * 4,
-                                            mask=ok & (i32_me != d), cache_modifier=SYS)
-                stamp(1, True)
-                fx.rocdl.s_waitcnt(vmcnt=0)
-                stamp(2)
-                if (lane < WORLD) & (lane != i32_me) & wrow:
-                    flag_store(sel8(lane, bs) + F1 + (fx.Int64(row) * WORLD + fx.Int64(i32_me)) * 4, e)
-                    spin_load(mine + F1 + (fx.Int64(row) * WORLD + fx.Int64(lane)) * 4, e)
+                wpk = bf16x8(pack(at(arg_nw, K * 2), i32_me * (SL // 2) + p * 4, ((lane < PK) & wrow)))
+                if const_expr(slots):
+                    # wave d of the workgroup sums, for each of its RB rows, the 16 expert-slot rows of slice d (fp32, slot
+                    # order, one bf16 rounding) and pushes it to rank d; one flag per (row, source) follows its acks
+                    slr = at(arg_x, 0x7FFFFFF0)
+                    rsr = at(arg_rs, MAX_ROWS * SLOTS * 4)
+                    for j in range_constexpr(RB):
+                        rj = rb * RB + j
+                        okj = (lane < PK) & (rj < i32_m)
+                        ids = [fx.Int32(buffer_ops.buffer_load(rsr, rj * SLOTS + k, vec_width=1, dtype=fx.Int32,
+                                                               is_scalar=True)) for k in range_constexpr(SLOTS)]
+                        sp = [pack(slr, ids[k] * (K // 2) + wave * (SL // 2) + p * 4, okj) for k in range_constexpr(SLOTS)]
+                        q4 = []
+                        for i in range_constexpr(4):
+                            lo = (fx.Int32(sp[0][i]) << 16).bitcast(fx.Float32)
+                            hi = (fx.Int32(sp[0][i]) & -65536).bitcast(fx.Float32)
+                            for k in range_constexpr(1, SLOTS):
+                                lo = lo + (fx.Int32(sp[k][i]) << 16).bitcast(fx.Float32)
+                                hi = hi + (fx.Int32(sp[k][i]) & -65536).bitcast(fx.Float32)
+                            q4.append(pk_bf16(lo, hi))
+                        buffer_ops.buffer_store(Vec.from_elements(q4, fx.Int32), at(sel8(wave, bs) + INBOX, INBOX_BYTES),
+                                                (i32_me * MAX_ROWS + rj) * (SL // 2) + p * 4, mask=okj,
+                                                cache_modifier=SYS)
+                    stamp(1, True)
+                    fx.rocdl.s_waitcnt(vmcnt=0)
+                    stamp(2)
+                    for j in range_constexpr(RB):
+                        rj = rb * RB + j
+                        if (lane == j) & (rj < i32_m):
+                            flag_store(sel8(wave, bs) + F1 + (fx.Int64(rj) * WORLD + fx.Int64(i32_me)) * 4, e)
+                    if (lane < WORLD) & wrow:
+                        spin_load(mine + F1 + (fx.Int64(row) * WORLD + fx.Int64(lane)) * 4, e)
+                else:
+                    xr = at(arg_x, i32_m * i32_sx * 2)
+                    mine_pk = [pack(xr, row * (i32_sx // 2) + d * (SL // 2) + p * 4, ok) for d in range_constexpr(WORLD)]
+                    for d in range_constexpr(WORLD):
+                        dest = at(bs[d] + INBOX, INBOX_BYTES)
+                        buffer_ops.buffer_store(mine_pk[d], dest, (i32_me * MAX_ROWS + row) * (SL // 2) + p * 4,
+                                                mask=ok & (i32_me != d), cache_modifier=SYS)
+                    stamp(1, True)
+                    fx.rocdl.s_waitcnt(vmcnt=0)
+                    stamp(2)
+                    if (lane < WORLD) & (lane != i32_me) & wrow:
+                        flag_store(sel8(lane, bs) + F1 + (fx.Int64(row) * WORLD + fx.Int64(i32_me)) * 4, e)
+                        spin_load(mine + F1 + (fx.Int64(row) * WORLD + fx.Int64(lane)) * 4, e)
                 stamp(3)
                 inbox = at(mine + INBOX, INBOX_BYTES)
                 pk = []
                 for s in range_constexpr(WORLD):
-                    got = pack(inbox, (s * MAX_ROWS + row) * (SL // 2) + p * 4, ok & (i32_me != s), SYS)
-                    pk.append([(i32_me == s).select(fx.Int32(mine_pk[s][i]), fx.Int32(got[i]))
-                               for i in range_constexpr(4)])
+                    if const_expr(slots):
+                        got = pack(inbox, (s * MAX_ROWS + row) * (SL // 2) + p * 4, ok, SYS)
+                        pk.append([fx.Int32(got[i]) for i in range_constexpr(4)])
+                    else:
+                        got = pack(inbox, (s * MAX_ROWS + row) * (SL // 2) + p * 4, ok & (i32_me != s), SYS)
+                        pk.append([(i32_me == s).select(fx.Int32(mine_pk[s][i]), fx.Int32(got[i]))
+                                   for i in range_constexpr(4)])
                 xn_pk = []
                 ssq = fx.Float32(0.0)
                 for i in range_constexpr(4):
@@ -385,10 +430,10 @@ def compile_tail(mode: str, mpg: int, rb: int = 2, ts: bool = False, groups: int
         i32_m: fx.Int32, i32_nrb: fx.Int32, i32_me: fx.Int32, arg_bufs: fx.Int64, arg_cnt: fx.Int64,
         arg_x: fx.Int64, i32_sx: fx.Int32, arg_nw: fx.Int64, arg_w: fx.Int64, arg_shared: fx.Int64,
         i32_ssh: fx.Int32, arg_out: fx.Int64, i32_sout: fx.Int32, i32_eps: fx.Int32, i32_zero: fx.Int32, arg_ts: fx.Int64,
-        stream: fx.Stream,
+        arg_rs: fx.Int64, stream: fx.Stream,
     ):
         kernel(i32_me, arg_bufs, arg_cnt, arg_x, i32_sx, i32_m, i32_nrb, arg_nw, arg_w, arg_shared, i32_ssh,
-               arg_out, i32_sout, i32_eps, i32_zero, arg_ts).launch(grid=(grid, 1, 1), block=(512, 1, 1), stream=stream)
+               arg_out, i32_sout, i32_eps, i32_zero, arg_ts, arg_rs).launch(grid=(grid, 1, 1), block=(512, 1, 1), stream=stream)
 
     launch.kernel_name = name
     launch.compile_hints = {**PRELOAD_HINTS, **({"waves_per_eu": WPE} if WPE else {})}

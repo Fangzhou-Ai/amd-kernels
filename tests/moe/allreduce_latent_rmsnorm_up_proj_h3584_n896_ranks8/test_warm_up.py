@@ -9,6 +9,7 @@ from tests.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8.multi_gpu8 imp
 from tests.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8.workload import K, N, rand
 
 WALK_ROWS = (1, 7, 16, 17, 33, 48, 65, 100, 129, 191, 192, 193, 256)
+SLOT_WALK_ROWS = (1, 7, 16, 17, 33, 48, 64)
 
 
 def worker(rank, errors):
@@ -16,6 +17,7 @@ def worker(rank, errors):
     from amd_kernels.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8 import (
         LatentTailComm,
         allreduce_latent_rmsnorm_up_proj,
+        allreduce_slots_rmsnorm_up_proj,
     )
     from flydsl.compiler.jit_function import CompiledFunction, MlirCompiler
 
@@ -42,7 +44,16 @@ def worker(rank, errors):
             torch.cuda.synchronize()
             return view
 
+        def call_slots(m, seed):
+            shared = rand((m, 7168), seed + rank, dev)
+            view = shared[:, rank * N:(rank + 1) * N]
+            rs = torch.randperm(m * 16 + 5, generator=torch.Generator().manual_seed(seed))[: m * 16].to(dev, torch.int32)
+            allreduce_slots_rmsnorm_up_proj(comm, rand((m * 16 + 5, K), seed + 70 + rank, dev), rs, nw, w, view)
+            torch.cuda.synchronize()
+            return view
+
         call(12, 7)
+        call_slots(12, 8)
     finally:
         CompiledFunction.__call__ = launch
     if launches:
@@ -64,6 +75,13 @@ def worker(rank, errors):
                 compiles.clear()
             if not bool(torch.isfinite(out).all()):
                 errors.append(f"rank {rank}: non-finite output at {m} rows")
+        for m in SLOT_WALK_ROWS:
+            out = call_slots(m, 200 + m)
+            if compiles:
+                errors.append(f"rank {rank}: {len(compiles)} compiles at {m} slot rows after the warm-up")
+                compiles.clear()
+            if not bool(torch.isfinite(out).all()):
+                errors.append(f"rank {rank}: non-finite slot output at {m} rows")
     finally:
         MlirCompiler.compile = real
     if warm_up.late_compiles() != late0:

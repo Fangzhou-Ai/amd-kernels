@@ -11,11 +11,13 @@ evaluation, deterministic, no atomic adds into outputs. `out` may alias `shared`
 TP-sharded shared-expert partial, then the final all-reduce adds the other ranks' shares) and the replicated layout
 (`shared` = this rank's columns of the replicated shared output, `out` a zero-padded [M, 7168] partial buffer of
 which only this rank's columns are ever written, so the final all-reduce, or an all-gather, of the eight buffers
-is exact) use the same call.
+is exact; pad with -0.0, `replicated_partial_buffer`, so even a real -0.0 survives bit for bit) use the same call.
 
 ## Entry points
 - `LatentTailComm(rank, cpu_group, device)`: collective, one per stream; mailbox and `lat` buffers allocated once.
 - `allreduce_latent_rmsnorm_up_proj`: the call (an `amd_kernels.warm_up` entry); graph-safe, no host work.
+- `allreduce_slots_rmsnorm_up_proj`: the same with the routed experts' 16-slot sum folded in (1..64 rows; slot rows named by
+  `reverse_sorted`, fp32 slot order, one bf16 rounding): +1.4..2.6 us over the call on a summed partial, ~1 us under a separate sum.
 - `reference.latent_tail_reference`: the contract; `LatentTailComm.close()`: collective, after the work completes.
 The dispatch (row tier -> all-reduce workgroup rows, up-projection tiles) lives in `host.py`; the protocol in the
 module docstring of `tail_kernel.py`.
