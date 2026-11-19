@@ -9,10 +9,14 @@ import torch
 from amd_kernels.common.tensor_shim import _run_compiled
 from amd_kernels.warm_up import entry
 
+from . import mega as _mega
 from . import norm as _norm
+from . import outk as _outk
 from . import prologue as _prologue
 from . import scan as _scan
+from . import walk as _walk
 from .reference import D, NH, RECORD_BYTES
+from .walk import SREC_BYTES, flags_ints
 
 WALK_WAVES = 4
 WALK_NVT = 1
@@ -116,7 +120,109 @@ def gated_norm(o, gate, norm_weight, eps, out=None):
     return out
 
 
-def _prefill(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices, has_initial_state,
+MAX_WALK_WGS = 192  # a multiple of 32 and 64: a workgroup keeps its XCD and its slice group across the units it walks
+OUT_LAG = 32
+_flag_cache = {}
+
+
+def _flags(device, chunks):
+    """Zeroed hand-over flags of the mega launch (every flag is reset by its consumer, so the buffer is zero again after a call)."""
+    need = flags_ints(chunks)
+    buf = _flag_cache.get(device)
+    if buf is None or buf.numel() < need:
+        buf = torch.zeros(max(need, 1 << 21), dtype=torch.int32, device=device)
+        _flag_cache[device] = buf
+    return buf
+
+
+@functools.cache
+def _mega_launcher(w_f32, ckpt, ts=False, knobs=()):
+    return _mega.compile_mega(w_f32, ckpt, ts, knobs)
+
+
+def prefill_mega(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices, has_initial_state,
+                 cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale=D ** -0.5, table=None,
+                 chunk_counts=None, checkpoint_state=None, checkpoint_offsets=None, checkpoint_rows=None, walk_wgs=None, lag=None, timestamps=None, knobs=()):
+    """The KDA prefill of one layer in one launch (mega.py): same contract as ``prefill``."""
+    n = cu_seqlens.numel() - 1
+    nc = chunk_indices.shape[0]
+    dev = mixed.device
+    assert mixed.dtype == raw_g.dtype == beta_logit.dtype == torch.bfloat16 and mixed.stride(-1) == raw_g.stride(-1) == beta_logit.stride(-1) == 1
+    assert mixed.stride(0) % 8 == 0 and conv_state.stride(0) < 2**31 // 2
+    assert state_cache.dtype == torch.float32 and state_cache.shape[1:] == (NH, D, D) and state_cache.stride(1) == D * D
+    assert out.dtype == torch.bfloat16 and out.shape[1:] == (NH, D) and out.stride(1) == D and out.stride(2) == 1
+    assert gate.shape[1:] == (NH, D) and gate.stride(2) == 1 and gate.stride(1) == D
+    assert chunk_offsets.dtype == torch.int64 and cu_seqlens.dtype == torch.int32 and state_indices.dtype == torch.int32
+    wf32 = norm_weight.dtype == torch.float32
+    assert wf32 or norm_weight.dtype == torch.bfloat16
+    has = has_initial_state.to(torch.uint8) if has_initial_state.dtype != torch.uint8 else has_initial_state
+    if table is None:
+        table = _prologue.chunk_table(cu_seqlens, chunk_indices, state_indices, has_initial_state)
+    ws = torch.empty(NH, nc, RECORD_BYTES, dtype=torch.uint8, device=dev)
+    sb = torch.empty(NH, nc, SREC_BYTES, dtype=torch.uint8, device=dev)
+    flags = _flags(dev, nc)
+    ckpt = checkpoint_state is not None
+    if ckpt:
+        assert checkpoint_state.dtype == torch.float32 and checkpoint_state.shape[1:] == (NH, D, D) and checkpoint_offsets.dtype == torch.int32
+        rows = checkpoint_rows if checkpoint_rows is not None else torch.arange(n, dtype=torch.int32, device=dev)
+        ck = (checkpoint_state.data_ptr(), checkpoint_state.stride(0) * 4, checkpoint_offsets.data_ptr(), rows.data_ptr())
+    else:
+        ck = (ws.data_ptr(), 0, ws.data_ptr(), ws.data_ptr())
+    units = ((n * NH + 7) // 8) * _walk.UNIT
+    nwg = min(units, MAX_WALK_WGS if walk_wgs is None else walk_wgs)
+    cs = conv_state
+    _run_compiled(
+        _mega_launcher(wf32, ckpt, timestamps is not None, knobs),
+        mixed.data_ptr(), mixed.stride(0), mixed.shape[0] * mixed.stride(0) * 2, raw_g.data_ptr(),
+        raw_g.stride(-3) if raw_g.dim() > 2 else raw_g.stride(0), beta_logit.data_ptr(), beta_logit.stride(-2), A_log.data_ptr(),
+        dt_bias.data_ptr(), conv_weight.data_ptr(), cs.data_ptr(), cs.stride(0), cs.stride(1), cs.stride(2), table.data_ptr(), ws.data_ptr(), nc,
+        float(lower_bound), float(scale), state_cache.data_ptr(), state_cache.stride(0) * 4, state_indices.data_ptr(), has.data_ptr(),
+        cu_seqlens.data_ptr(), chunk_offsets.data_ptr(), sb.data_ptr(), n * NH, *ck, out.data_ptr(), out.stride(0), gate.data_ptr(),
+        gate.stride(0), norm_weight.data_ptr(), float(norm_eps), flags.data_ptr(), nwg, OUT_LAG if lag is None else lag,
+        timestamps.data_ptr() if timestamps is not None else ws.data_ptr(), torch.cuda.current_stream())
+    return out
+
+
+@functools.cache
+def _walk_standalone(ckpt, ts=False, knobs=()):
+    return _walk.compile_walk(ckpt, ts, knobs)
+
+
+@functools.cache
+def _out_standalone(w_f32):
+    return _outk.compile_out(w_f32)
+
+
+def walk_states(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_state, checkpoint_state=None, checkpoint_offsets=None,
+                checkpoint_rows=None, timestamps=None, knobs=()):
+    """The state walk alone over the workspace records ``ws``: the state records [H, Nc, SREC_BYTES] the output pass reads; updates
+    ``state_cache`` (and the checkpoint rows) in place."""
+    n = cu_seqlens.numel() - 1
+    nc = ws.shape[1]
+    dev = ws.device
+    has = has_initial_state.to(torch.uint8) if has_initial_state.dtype != torch.uint8 else has_initial_state
+    sb = torch.empty(NH, nc, SREC_BYTES, dtype=torch.uint8, device=dev)
+    ckpt = checkpoint_state is not None
+    if ckpt:
+        rows = checkpoint_rows if checkpoint_rows is not None else torch.arange(n, dtype=torch.int32, device=dev)
+        ck = (checkpoint_state.data_ptr(), checkpoint_state.stride(0) * 4, checkpoint_offsets.data_ptr(), rows.data_ptr())
+    else:
+        ck = (ws.data_ptr(), 0, ws.data_ptr(), ws.data_ptr())
+    _run_compiled(_walk_standalone(ckpt, timestamps is not None, knobs), ws.data_ptr(), nc, state_cache.data_ptr(), state_cache.stride(0) * 4, state_indices.data_ptr(),
+                  has.data_ptr(), cu_seqlens.data_ptr(), chunk_offsets.data_ptr(), sb.data_ptr(), n * NH, *ck, timestamps.data_ptr() if timestamps is not None else ws.data_ptr(), torch.cuda.current_stream())
+    return sb
+
+
+def chunk_outputs(ws, sb, table, gate, norm_weight, norm_eps, out):
+    """The output pass alone: gated-normed outputs of every chunk from the workspace and state records."""
+    nc = ws.shape[1]
+    wf32 = norm_weight.dtype == torch.float32
+    _run_compiled(_out_standalone(wf32), ws.data_ptr(), nc, sb.data_ptr(), table.data_ptr(), out.data_ptr(), out.stride(0), gate.data_ptr(),
+                  gate.stride(0), norm_weight.data_ptr(), float(norm_eps), torch.cuda.current_stream())
+    return out
+
+
+def prefill_v1(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices, has_initial_state,
              cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale=D ** -0.5, table=None,
              chunk_counts=None, checkpoint_state=None, checkpoint_offsets=None, checkpoint_rows=None):
     """The KDA prefill of one layer: conv + prologue, chunk scan, gated RMSNorm. Writes ``out`` [T, 12, 128] bf16, rolls
@@ -160,4 +266,4 @@ def _inputs(mode, n, mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight
     return args, kwargs
 
 
-prefill = entry("attention/kda_prefill_h12_d128", mode=_mode, sizes=lambda mode: (64, 2048), inputs=_inputs)(_prefill)
+prefill = entry("attention/kda_prefill_h12_d128", mode=_mode, sizes=lambda mode: (64, 2048), inputs=_inputs)(prefill_mega)

@@ -66,3 +66,7 @@ def touch_args(*args):
     """Read every kernel argument at the top: one batch of scalar loads instead of one dependent round per use."""
     vals = [raw(a) for a in args]
     llvm.inline_asm(None, vals, "", ",".join("s" for _ in vals), has_side_effects=True)
+
+
+FLAG_STRIDE = 4  # int32 per hand-over flag
+WALK_GROUPS = 4  # 4 or 8: walk workgroups (value slice groups) per (sequence, head)
