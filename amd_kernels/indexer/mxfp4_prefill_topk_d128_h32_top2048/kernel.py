@@ -21,7 +21,7 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm  # noqa: F401
 from flydsl.expr import rocdl
 from flydsl.expr.primitive import range_constexpr
-from flydsl.expr.typing import T, as_ir_value
+from flydsl.expr.typing import T
 
 from amd_kernels.common import buffer_ops
 from amd_kernels.warm_up import launcher
@@ -31,15 +31,15 @@ INT_MIN = -2147483648
 KMAXV = 0x7FFFFFFF
 NUM_REC = 0x7FFFF000
 K = 2048
-CAP = 6144
+CAP = 8192
 NBIN = 4096
 HSZA = 4608  # histogram words (4096 bins + 64 dummy, padded one word per 64, a multiple of 512)
 HEADB = 8
 TAILB = 64
-NBMID = 128
+NBMID = 152
 NBALL = NBMID + HEADB + TAILB
 SDIV = 80
-TMID, TA, TC = 3584, 11264, 2560
+TMID, TA, TC = 4608, 16128, 3456
 
 
 def _update_dpp(old, src, ctrl, row_mask, bank_mask):
@@ -225,7 +225,7 @@ def _thresholds(smem, tx, lane, wave, nt, keys, wts, t_mid, t_a, t_c, full=True)
 # K1: per-row thresholds
 # =====================================================================================================================
 @launcher
-def compile_threshold(NT=512, CAP=6144):
+def compile_threshold(NT=512, CAP=8192):
     NW = NT // 64
 
     @fx.struct
@@ -273,7 +273,7 @@ def compile_threshold(NT=512, CAP=6144):
 # K2: one stream pass at the threshold of K1
 # =====================================================================================================================
 @launcher
-def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
+def compile_stream(NT=512, V=4, CAP=8192, NC_ST=2):
     NW = NT // 64
     CH = NT * 4 * V
     SW = V * 256
@@ -316,14 +316,17 @@ def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
             run0 = _uniform(state[V])
             nxt = load_chunk(I(i) + 1, (I(i) + 1) < nit)
             base = ks_al + I(i) * CH + wave * SW
+            xs = [F(cur[v][k]) for v in range_constexpr(V) for k in range_constexpr(4)]
+            if (I(i) == 0) | (I(i) == nit - 1):
+                xs = [((base + (q // 4 * 64 + lane) * 4 + q % 4 - ks).bitcast(fx.Uint32) < wlen).select(xs[q], F(float("nan")))
+                      for q in range_constexpr(V * 4)]
             hv, incls, tots = [], [], []
             wtot = I(0)
             for v in range_constexpr(V):
                 hk = []
                 cl = I(0)
                 for k in range_constexpr(4):
-                    e = base + (v * 64 + lane) * 4 + k
-                    hh = (F(cur[v][k]) >= thr) & ((e - ks).bitcast(fx.Uint32) < wlen)
+                    hh = xs[v * 4 + k] >= thr
                     hk.append(hh)
                     cl = cl + hh.select(I(1), I(0))
                 incl = _wave_scan(cl, "add")
@@ -348,7 +351,7 @@ def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
                 for k in range_constexpr(4):
                     wp = (hv[v][k] & (pos < CAP)).select(pos, I(CAP) + lane)
                     _sts(smem.lidx, wp, base + (v * 64 + lane) * 4 + k)
-                    _sts(smem.lkey, wp, F(cur[v][k]).bitcast(I))
+                    _sts(smem.lkey, wp, xs[v * 4 + k].bitcast(I))
                     pos = pos + hv[v][k].select(I(1), I(0))
                 runv = runv + tots[v]
             res = yield [nxt[v] for v in range_constexpr(V)] + [run0 + itot]
@@ -377,7 +380,7 @@ def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
 # K2b: retry passes of the rows whose first pass count fell outside [2048, CAP]
 # =====================================================================================================================
 @launcher
-def compile_retry(NT=512, V=4, CAP=6144, NC_ST=2):
+def compile_retry(NT=512, V=4, CAP=8192, NC_ST=2):
     NW = NT // 64
     CH = NT * 4 * V
     SW = V * 256

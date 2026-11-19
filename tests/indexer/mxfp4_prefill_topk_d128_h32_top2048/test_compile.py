@@ -4,6 +4,7 @@
 
 import flydsl.compiler as flyc
 import torch
+
 from amd_kernels import warm_up
 from amd_kernels.indexer.mxfp4_prefill_topk_d128_h32_top2048 import host
 

@@ -5,6 +5,7 @@ stable top-k, and run to run."""
 
 import pytest
 import torch
+
 from amd_kernels.indexer.mxfp4_prefill_topk_d128_h32_top2048 import host, reference
 
 from .inputs import make_logits, make_windows, require_gfx950

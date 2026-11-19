@@ -5,8 +5,8 @@
 ``select``: one workgroup per row loads its list (ascending in position) into registers, finds the exact 2048th largest key (a
 12-bit radix round over the value range of the list, then a brute-force rank of the few entries sharing the final bin) and writes
 the selected positions in ascending order by one ordered compaction, ties going to the smaller position.
-``select_exact``: the rows whose passes all failed (all-equal keys, pathological structure) take three radix passes over the window
-itself and an ordered emit: slow, rare, never wrong.
+Rows whose passes all failed (all-equal keys, pathological structure) take three radix passes over the window itself and an ordered
+emit: slow, rare, never wrong.
 """
 
 import flydsl.compiler as flyc
@@ -17,8 +17,24 @@ from amd_kernels.common import buffer_ops
 from amd_kernels.warm_up import launcher
 
 from .kernel import (
-    HSZA, INT_MIN, K, KMAXV, NBIN, NUM_REC, F, I, I64,
-    _ballot, _blk_reduce, _float_to_key, _hist_add, _lsr, _readlane, _scan_hist, _sts, _uniform, _wave_scan, _zero_hist,
+    HSZA,
+    I64,
+    INT_MIN,
+    KMAXV,
+    NBIN,
+    NUM_REC,
+    F,
+    I,
+    K,
+    _blk_reduce,
+    _float_to_key,
+    _hist_add,
+    _lsr,
+    _scan_hist,
+    _sts,
+    _uniform,
+    _wave_scan,
+    _zero_hist,
 )  # fmt: skip
 
 
@@ -26,7 +42,7 @@ from .kernel import (
 # K3: exact select over the candidate list (registers), exact fallback for rows whose list is unusable
 # =====================================================================================================================
 @launcher
-def compile_select(NT=256, CAP=6144, POPMAX=64):
+def compile_select(NT=256, CAP=8192, POPMAX=64):
     NW = NT // 64
     PER = CAP // NT
     NCH = NT * 4
@@ -80,7 +96,6 @@ def compile_select(NT=256, CAP=6144, POPMAX=64):
 
             def load_idx(q):
                 return I(smem.lidx.ptr[tx * per + q])
-
             all_sel = N <= K
             kt = I(INT_MIN)
             need_eq = I(0)
@@ -194,58 +209,7 @@ def compile_select(NT=256, CAP=6144, POPMAX=64):
             for i7 in range_constexpr(K // NT + 1):
                 p7 = need0 + tx + NT * i7
                 buffer_ops.buffer_store(I(-1), out_r, row * i32_out_stride + p7, mask=p7 < K)
-
-    @flyc.jit
-    def launch(arg_lg: fx.Int64, arg_ks: fx.Int64, arg_ke: fx.Int64, arg_cnt: fx.Int64, arg_cand: fx.Int64, arg_out: fx.Int64,
-               i64_stride: fx.Int64, i32_cstride: fx.Int32, i32_out_stride: fx.Int32, rows: fx.Int32,
-               stream: fx.Stream):
-        k3(arg_lg, arg_ks, arg_ke, arg_cnt, arg_cand, arg_out, i64_stride, i32_cstride, i32_out_stride).launch(
-            grid=(I64(rows), 1, 1), block=(NT, 1, 1), stream=stream)
-
-    return launch
-
-
-@launcher
-def compile_select_exact(NT=256, CAP=6144, POPMAX=64):
-    NW = NT // 64
-    PER = CAP // NT
-    NCH = NT * 4
-
-    @fx.struct
-    class Shared:
-        hist: fx.Array[fx.Int32, HSZA]
-        lidx: fx.Array[fx.Int32, CAP + 64]
-        tmp: fx.Array[fx.Int32, POPMAX + 64]
-        wred: fx.Array[fx.Int32, 64]
-        wsum: fx.Array[fx.Int32, 16]
-        ctl: fx.Array[fx.Int32, 16]
-
-    @flyc.kernel(known_block_size=[NT, 1, 1])
-    def k4(arg_lg: fx.Int64, arg_ks: fx.Int64, arg_ke: fx.Int64, arg_cnt: fx.Int64, arg_cand: fx.Int64, arg_out: fx.Int64,
-           i64_stride: fx.Int64, i32_cstride: fx.Int32, i32_out_stride: fx.Int32):
-        tx = fx.thread_idx.x
-        lane = tx % 64
-        wave = _uniform(tx // 64)
-        row = I(fx.block_idx.x)
-        smem = fx.SharedAllocator().allocate(Shared).peek()
-        hist_add1 = lambda idx: _hist_add(smem, idx, I(1))
-        scan_hist_ = lambda need: _scan_hist(smem, lane, need)
-        blk_reduce_ = lambda vals, ops: _blk_reduce(smem, wave, NW, vals, ops)
-
-        ks_r = buffer_ops.create_buffer_resource_from_addr(arg_ks)
-        ke_r = buffer_ops.create_buffer_resource_from_addr(arg_ke)
-        cnt_r = buffer_ops.create_buffer_resource_from_addr(arg_cnt)
-        cand_r = buffer_ops.create_buffer_resource_from_addr(arg_cand, num_records_bytes=NUM_REC)
-        out_r = buffer_ops.create_buffer_resource_from_addr(arg_out, num_records_bytes=NUM_REC)
-        ks = _uniform(buffer_ops.buffer_load(ks_r, row, vec_width=1, dtype=I))
-        ke = _uniform(buffer_ops.buffer_load(ke_r, row, vec_width=1, dtype=I))
-        count = _uniform(buffer_ops.buffer_load(cnt_r, row, vec_width=1, dtype=I))
-        L = ke - ks
-        ks_al = ks & I(-64)
-        exact = L <= CAP
-        bad = (~exact) & ((count < K) | (count > CAP))
-
-        if bad:
+        else:
             rsrc = buffer_ops.create_buffer_resource_from_addr(arg_lg + I64(row) * i64_stride * 4, num_records_bytes=i64_stride * 4)
 
             VF = 4
@@ -307,7 +271,7 @@ def compile_select_exact(NT=256, CAP=6144, POPMAX=64):
                 ds.append(d)
                 if fx.const_expr(rnd == 1):
                     pref = (ds[0] << 12) | d
-            kt = (((ds[0] << 20) | (ds[1] << 8) | ds[2])) ^ I(INT_MIN)
+            kt = ((ds[0] << 20) | (ds[1] << 8) | ds[2]) ^ I(INT_MIN)
             need_eq = need
             for ci, state in range(0, nch, 1, init=[I(0), I(0)] + load_f(I(0), nch > 0)):
                 sr = state[0]
@@ -341,7 +305,7 @@ def compile_select_exact(NT=256, CAP=6144, POPMAX=64):
     def launch(arg_lg: fx.Int64, arg_ks: fx.Int64, arg_ke: fx.Int64, arg_cnt: fx.Int64, arg_cand: fx.Int64, arg_out: fx.Int64,
                i64_stride: fx.Int64, i32_cstride: fx.Int32, i32_out_stride: fx.Int32, rows: fx.Int32,
                stream: fx.Stream):
-        k4(arg_lg, arg_ks, arg_ke, arg_cnt, arg_cand, arg_out, i64_stride, i32_cstride, i32_out_stride).launch(
+        k3(arg_lg, arg_ks, arg_ke, arg_cnt, arg_cand, arg_out, i64_stride, i32_cstride, i32_out_stride).launch(
             grid=(I64(rows), 1, 1), block=(NT, 1, 1), stream=stream)
 
     return launch

@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-CAP = 6144
+CAP = 8192
 
 
 def require_gfx950():

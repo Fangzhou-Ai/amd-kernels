@@ -19,8 +19,7 @@ _workspaces: dict = {}
 
 @functools.cache
 def _launchers():
-    return (_kernel.compile_threshold(), _kernel.compile_stream(), _kernel.compile_retry(), _select.compile_select(),
-            _select.compile_select_exact())
+    return _kernel.compile_threshold(), _kernel.compile_stream(), _kernel.compile_retry(), _select.compile_select()
 
 
 def workspace_bytes(rows: int, width: int) -> int:
@@ -78,7 +77,7 @@ def topk_rows(logits: torch.Tensor, ks: torch.Tensor, ke: torch.Tensor, out: tor
     s = torch.cuda.current_stream()
     ws = _workspace(logits.device, s, rows, width)
     meta, cnt, cand = ws[: 4 * rows], ws[4 * rows : 5 * rows], ws[5 * rows :]
-    threshold, stream, retry, select, select_exact = _launchers()
+    threshold, stream, retry, select = _launchers()
     stride = logits.stride(0)
     ptrs = (logits.data_ptr(), ks.data_ptr(), ke.data_ptr())
     _run_compiled(threshold, *ptrs, meta.data_ptr(), stride, rows, s)
@@ -86,5 +85,4 @@ def topk_rows(logits: torch.Tensor, ks: torch.Tensor, ke: torch.Tensor, out: tor
     _run_compiled(retry, *ptrs, cnt.data_ptr(), cand.data_ptr(), stride, cstride, rows, s)
     args = (*ptrs, cnt.data_ptr(), cand.data_ptr(), out.data_ptr(), stride, cstride, out.stride(0), rows, s)
     _run_compiled(select, *args)
-    _run_compiled(select_exact, *args)
     return out

@@ -14,8 +14,12 @@ import statistics
 import sys
 
 import torch
+
 from amd_kernels.indexer.mxfp4_prefill_topk_d128_h32_top2048 import host
-from tests.indexer.mxfp4_prefill_topk_d128_h32_top2048.inputs import make_logits, make_windows
+from tests.indexer.mxfp4_prefill_topk_d128_h32_top2048.inputs import (
+    make_logits,
+    make_windows,
+)
 
 HBM_PLAIN_TBS = 6.5
 HBM_NT_TBS = 6.9
@@ -55,11 +59,12 @@ def read_floor_fn(logits, ks, ke):
     """One workgroup per row reading its window with 16-byte nontemporal loads, XOR-reducing so the loads are kept."""
     import flydsl.compiler as flyc
     import flydsl.expr as fx
-    from amd_kernels.common import buffer_ops
-    from amd_kernels.common.tensor_shim import _run_compiled
     from flydsl.expr import rocdl
     from flydsl.expr.primitive import range_constexpr
     from flydsl.expr.typing import T
+
+    from amd_kernels.common import buffer_ops
+    from amd_kernels.common.tensor_shim import _run_compiled
 
     I, I64 = fx.Int32, fx.Int64
     nt, u = 512, 8
