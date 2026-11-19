@@ -23,13 +23,7 @@ from flydsl.expr.typing import Float4E2M1FN, T
 from ._wave import F, I, I64, INT_MIN, global_i32, permlane_swap, relu2, score_key, store_lds, vop
 
 HEADS = 32
-import os as _os
-DEPTH = int(_os.environ.get('KK_DEPTH', '0'))  # 0: by the rows of the tile (1 from 4 rows: fewer registers)
 SPEC_SIZES = (512, 1024, 1536, 2048)
-import os
-SC = int(os.environ.get('KK_SC', '0'))
-SB = int(os.environ.get('KK_SB', '0'))  # sched barriers between key tiles
-TAG = f"s{SC}b{SB}d{DEPTH}k{_os.environ.get('KK_SKIP', '0')}"  # experiment switches: part of the kernel names
 
 
 @dataclass
@@ -107,9 +101,6 @@ def score_chunk(sc, rows, cmax, num_waves, cb, cc, field, base, hook=None):
         kvs = fx.Vector(global_i32(kvsb + I64(g * 64 + l * 4), 1))[0]
         if fx.const_expr(hook is not None and k == 0):
             hook(10)
-        if fx.const_expr(SC == 1):
-            kv = [fx.Vector.from_elements([phys, phys + nt, phys ^ nt, I(nt)], dtype=I) for nt in range(4)]
-            return kv, phys
         kv = [global_i32(kvb + I64(g * 1024 + l * 16 + nt * 256), 4, True) for nt in range(4)]
         return kv, kvs
 
@@ -117,11 +108,6 @@ def score_chunk(sc, rows, cmax, num_waves, cb, cc, field, base, hook=None):
         if fx.const_expr(hook is not None and k == 0):
             fx.rocdl.s_waitcnt(vmcnt=0)
             hook(11)
-        if fx.const_expr(SC == 2):
-            key = (wave + k * num_waves) * 64 + g * 16 + l
-            for r in range_constexpr(rows):
-                store_lds(field, base + r * cmax + key, I(kv[0][0]) ^ I(kv[1][1]) ^ I(kv[2][2]) ^ I(kv[3][3]) ^ I(kvs))
-            return
         per_tile = []
         for nt in range_constexpr(4):
             bfrag = fx.make_rmem_tensor(4, I)
@@ -141,8 +127,6 @@ def score_chunk(sc, rows, cmax, num_waves, cb, cc, field, base, hook=None):
                         total = vop("v_mul_f32 $0, $1, $2", t, wv) if total is None else vop("v_fma_f32 $0, $1, $2, $3", t, wv, total)
                 sums.append(total)
             per_tile.append(sums)
-            if fx.const_expr(SB):
-                fx.rocdl.sched_barrier(0)
         key = (wave + k * num_waves) * 64 + g * 16 + l
         for r in range_constexpr(rows):
             p = [per_tile[nt][r] for nt in range(4)]
@@ -162,7 +146,7 @@ def score_chunk(sc, rows, cmax, num_waves, cb, cc, field, base, hook=None):
         for r in range_constexpr(rows):
             store_lds(field, base + r * cmax + key, I(INT_MIN))
 
-    depth = DEPTH or (1 if rows >= 4 else 2)
+    depth = 1 if rows >= 4 else 2  # key tiles loaded ahead: a deeper pipeline costs registers, and with them workgroups a CU
     bufs = [load_keys(k) for k in range(min(depth, steps))]
     for k in range_constexpr(steps):
         kv, kvs = bufs[k % depth]

@@ -23,13 +23,10 @@ from flydsl.expr.typing import T
 from ._wave import SC1, AtomicBinOp, atomic_agent, carve, layout, I, I64, INT_MAX, INT_MIN, ballot, inclusive_scan, lane_prefix, now, popcount, readlane, store_lds, wave_reduce
 from ._wave import uniform as uniform_value
 from .geometry import CHUNK_MAX, COUNTER_BYTES, FULL_STRIDE, INFO_OFFSET, NCH_MAX, POOL, QMAX, chunk_size_rt, list_size_rt, slot_size
-from .scoring import SPEC_SIZES, TAG, Scorer, score_chunk
+from .scoring import SPEC_SIZES, Scorer, score_chunk
 
 NW = 8
 NUM_REC = 0x7FFFF000
-import os
-SKIP = int(os.environ.get('KK_SKIP', '0'))
-FENCE_SCOPE = os.environ.get('KK_FENCE', 'wavefront')  # the select's LDS exchanges stay inside one wave
 
 
 def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
@@ -47,7 +44,7 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
     HPAD = 64 * GW
     HIST = HPAD + 64  # + one dummy word a lane, for keys outside the round's prefix
     OFFS, WORDS = layout(keys=rows * CHUNK_MAX, hist=rows * split * HIST, st=128 if timing else 0)
-    CM = (SC1 if os.environ.get('KK_CM', '1') == '1' else 0) if sync else 0  # stores a merge workgroup of another XCD reads: write-through
+    CM = SC1 if sync else 0  # stores a merge workgroup of another XCD reads: write-through
 
     @flyc.jit
     def role(smem, arg_q: fx.Int64, arg_qs: fx.Int64, arg_kv: fx.Int64, arg_kvs: fx.Int64, arg_bt: fx.Int64,
@@ -127,7 +124,7 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
             fx.copy(lds_copy4, reg, fx.make_view(fx.add_offset(field.ptr, idx), fx.make_layout(4, 1)))
 
         def fence():
-            fx.memory_fence(ordering=fx.AtomicOrdering.AcqRel, syncscope=FENCE_SCOPE)
+            fx.memory_fence(ordering=fx.AtomicOrdering.AcqRel, syncscope="wavefront")  # the select's LDS exchanges stay inside one wave
 
         def hist_scan(wb, need):
             """The bin holding the ``need``-th largest key of the histogram at ``wb`` (a lane's group of bins: vector
@@ -349,18 +346,13 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
 
         if (tile * rows < count) & ((c * cb < max_end) | (c == 0)):
             stamp(0)
-            if fx.const_expr(SKIP != 2):
-                score_chunk(sc, rows, CHUNK_MAX, NW, cb, c, smem.keys, 0, stamp if timing else None)
+            score_chunk(sc, rows, CHUNK_MAX, NW, cb, c, smem.keys, 0, stamp if timing else None)
             fx.gpu.barrier()
             stamp(1)
-            if fx.const_expr(SKIP == 1):
-                if wave == 0:
-                    buffer_ops.buffer_store(I(smem.keys.ptr[lane]), meta, c)
-            if fx.const_expr(SKIP != 1):
-                sel_row = wave // hh  # waves of a row are consecutive
-                sel_h = wave - sel_row * hh
-                if (sel_row < rows) & (tile * rows + sel_row < count) & ((c * hh + sel_h) < nvch):
-                    select_row(wave, sel_row, sel_h, c)
+            sel_row = wave // hh  # waves of a row are consecutive
+            sel_h = wave - sel_row * hh
+            if (sel_row < rows) & (tile * rows + sel_row < count) & ((c * hh + sel_h) < nvch):
+                select_row(wave, sel_row, sel_h, c)
             stamp(2)
         if fx.const_expr(sync):
             fx.rocdl.s_waitcnt(vmcnt=0)
@@ -379,7 +371,7 @@ def compile_chunk_lists(rows: int, timing: bool = False):
     """``rows``: query rows a workgroup scores of a sequence (1 - 6; a sequence of more rows takes several workgroups
     a chunk)."""
     assert 1 <= rows <= QMAX
-    name = f"mxfp4_paged_chunk_lists_d128_h32_r{rows}_{TAG}" + ("_t" if timing else "")
+    name = f"mxfp4_paged_chunk_lists_d128_h32_r{rows}" + ("_t" if timing else "")
     role, OFFS, WORDS = chunk_parts(rows, timing)
 
     @fx.struct

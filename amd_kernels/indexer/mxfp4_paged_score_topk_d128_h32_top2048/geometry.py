@@ -28,9 +28,8 @@ LIST_FLOOR = 64  # keys a list keeps at least: at most ~33 chunks can hold selec
 COUNTER_BYTES = 256  # a (sequence, row tile)'s ready and consumer counts: a cache line pair of their own
 COUNTER_GROUPS = 1024  # (sequence, row tile) groups a call may hold
 FULL_STRIDE = NCH_MAX * CHUNK_MAX  # a row's plane of all scores of its truncated chunks
-import os
-TBDIV = int(os.environ.get('KK_TBDIV', '4'))
-SPREAD = int(os.environ.get('KK_SPREAD', '2688'))  # list keys a sequence's chunks share when its selected keys spread evenly (1.3 x TOPK)
+TBDIV = 4  # a list keeps a quarter of its chunk
+SPREAD = 2688  # list keys a sequence's chunks share when its selected keys spread evenly (1.3 x TOPK)
 POOL_TARGET = POOL  # entries a pool is cut to
 
 

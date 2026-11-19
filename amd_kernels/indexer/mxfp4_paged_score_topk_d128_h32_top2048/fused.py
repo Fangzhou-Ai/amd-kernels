@@ -15,7 +15,6 @@ from amd_kernels.warm_up import launcher
 from ._wave import I, I64, carve
 from .lists import NW, chunk_parts
 from .merge import NT, merge_parts
-from .scoring import TAG
 
 
 PRELOAD_HINTS = {"llvm_options": {"amdgpu-kernarg-preload": True, "amdgpu-kernarg-preload-count": 16}}
@@ -25,13 +24,13 @@ PRELOAD_HINTS = {"llvm_options": {"amdgpu-kernarg-preload": True, "amdgpu-kernar
 def compile_fused(rows: int, blocks: int, timing: bool = False):
     """``rows``: query rows a chunk workgroup scores of a sequence; ``blocks``: the merge kernel's pool blocks."""
     assert NW * 64 == NT
-    name = f"mxfp4_paged_score_topk_d128_h32_r{rows}_b{blocks}_{TAG}pad{__import__("os").environ.get("KK_PAD","0")}c{__import__("os").environ.get("KK_CM","1")}" + ("_t" if timing else "")
+    name = f"mxfp4_paged_score_topk_d128_h32_r{rows}_b{blocks}" + ("_t" if timing else "")
     chunk_role, CH_OFFS, CH_WORDS = chunk_parts(rows, timing, sync=True)
     merge_role, MG_OFFS, MG_WORDS = merge_parts(blocks, timing, sync=True)
 
     @fx.struct
     class Raw:
-        u: fx.Array[fx.Int32, max(CH_WORDS, MG_WORDS) + int(__import__('os').environ.get('KK_PAD', '0'))]
+        u: fx.Array[fx.Int32, max(CH_WORDS, MG_WORDS)]
 
     @flyc.kernel(name=name, known_block_size=[NT, 1, 1])
     def kernel(arg_qsl: fx.Int64, arg_bt: fx.Int64, arg_ends: fx.Int64, arg_q: fx.Int64, arg_w: fx.Int64,

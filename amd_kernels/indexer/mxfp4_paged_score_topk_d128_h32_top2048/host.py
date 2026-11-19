@@ -16,7 +16,6 @@ from .geometry import (CHUNK_MAX, CHUNKS_TARGET, MAX_ROWS, NCH_MAX, QMAX, TOPK, 
 
 HEADS = 32
 _FORCE = None
-_NOMERGE = False  # experiments: launch the chunk workgroups only
 _WIDE_BATCH = 4  # sequences above which a workgroup scores all rows of a sequence
 PAGE = 64
 
@@ -162,7 +161,7 @@ def _score_topk(
                       cnt.data_ptr(), out_indices.data_ptr(), out_scores.data_ptr(), block_table.stride(0),
                       cache.stride(0), cache.shape[0] - 1, max_query_len, int(uniform), target, out_indices.stride(0),
                       out_scores.stride(0), tiles, tile, batch * nch * tiles, dbg_ptr,
-                      batch * nch * tiles + (0 if _NOMERGE else rows), stream)
+                      batch * nch * tiles + rows, stream)
         return
     _run_compiled(_chunk_exe(tile, dbg is not None), *common, keys.data_ptr(), pos.data_ptr(), meta.data_ptr(),
                   full.data_ptr(), *geom, nch, max_query_len, target, int(uniform), dbg_ptr, batch * nch * tiles, stream)

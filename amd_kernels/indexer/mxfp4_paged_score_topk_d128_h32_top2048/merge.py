@@ -17,8 +17,6 @@ and the histogram pass runs again, so the result is exact. A bin with more keys 
 scores) is selected by three radix passes over the pool instead.
 """
 
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from amd_kernels.common import buffer_ops
@@ -71,7 +69,7 @@ def wait_group(tid, lane, row, arg_qsl, arg_cnt, i32_batch, i32_tiles, i32_tile_
 def merge_parts(blocks: int, timing: bool = False, sync: bool = False):
     """``blocks``: 2048-entry pool blocks a thread holds (the host picks the fewest that hold the widest pool)."""
     BLOCKS = blocks
-    CM = (SC1 if os.environ.get('KK_CM', '1') == '1' else 0) if sync else 0  # loads of what chunk workgroups of other XCDs stored: coherent
+    CM = SC1 if sync else 0  # loads of what chunk workgroups of other XCDs stored: coherent
     OFFS, WORDS = layout(bins=2 * BUF, scan=NWAVES + 1, acc=32, sidx=TOPK + NT + 4, sval=TOPK + NT + 4,
                          ckey=NCAND + NT, cidx=NCAND + NT, cof=64, st=128 if timing else 0)
 
