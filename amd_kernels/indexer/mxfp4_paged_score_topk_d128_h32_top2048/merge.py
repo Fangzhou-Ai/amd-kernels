@@ -17,6 +17,8 @@ and the histogram pass runs again, so the result is exact. A bin with more keys 
 scores) is selected by three radix passes over the pool instead.
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from amd_kernels.common import buffer_ops
@@ -69,7 +71,7 @@ def wait_group(tid, lane, row, arg_qsl, arg_cnt, i32_batch, i32_tiles, i32_tile_
 def merge_parts(blocks: int, uniform: bool = False, timing: bool = False, sync: bool = False):
     """``blocks``: 2048-entry pool blocks a thread holds (the host picks the fewest that hold the widest pool)."""
     BLOCKS = blocks
-    CM = SC1 if sync else 0  # loads of what chunk workgroups of other XCDs stored: coherent
+    CM = (SC1 if os.environ.get('KK_CM', '1') == '1' else 0) if sync else 0  # loads of what chunk workgroups of other XCDs stored: coherent
     OFFS, WORDS = layout(bins=2 * BUF, scan=NWAVES + 1, acc=32, sidx=TOPK + NT + 4, sval=TOPK + NT + 4,
                          ckey=NCAND + NT, cidx=NCAND + NT, cof=32)
 
@@ -328,9 +330,11 @@ def merge_parts(blocks: int, uniform: bool = False, timing: bool = False, sync: 
                     cg, cn = c2[0], c2[1]
                 pack = (cg << 16) + cn
                 inc = inclusive_scan(pack)
+                stamp(6)
                 if lane == 63:
                     store_lds(smem.scan, wave, inc)
                 fx.gpu.barrier()
+                stamp(7)
                 before = inc - pack
                 for w in range_constexpr(NWAVES - 1):
                     before = before + (I(w) < wave).select(I(smem.scan.ptr[w]), I(0))
@@ -363,6 +367,7 @@ def merge_parts(blocks: int, uniform: bool = False, timing: bool = False, sync: 
                             n_ = n_ + is_c.select(I(1), I(0))
                         c2 = yield [g_, n_]
                 fx.gpu.barrier()
+                stamp(8)
                 need2 = I(TOPK) - above_n
                 if wave == 0:
                     mine = (lane < nc).select(I(smem.ckey.ptr[lane]), I(INT_MIN))
@@ -374,6 +379,7 @@ def merge_parts(blocks: int, uniform: bool = False, timing: bool = False, sync: 
                         store_lds(smem.sidx, above_n + ranks, I(smem.cidx.ptr[lane]))
                         store_lds(smem.sval, above_n + ranks, mine)
                 fx.gpu.barrier()
+                stamp(9)
                 store_stage()
             else:
                 radix_init()
@@ -454,6 +460,7 @@ def merge_parts(blocks: int, uniform: bool = False, timing: bool = False, sync: 
         if fx.const_expr(sync):
             if row < qsl_end:
                 wait_group(tid, lane, row, arg_qsl, arg_cnt, i32_batch, i32_tiles, i32_tile_rows, i32_nch_grid)
+            stamp(4)
         info_r = buffer_ops.create_buffer_resource_from_addr(arg_meta + INFO_OFFSET, num_records_bytes=NUM_REC)
         if fx.const_expr(sync):
             inf = fx.Vector(buffer_ops.buffer_load(info_r, row * 4, vec_width=4, dtype=I, cache_modifier=CM))

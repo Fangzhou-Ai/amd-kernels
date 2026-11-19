@@ -23,7 +23,7 @@ from flydsl.expr.typing import T
 from ._wave import SC1, AtomicBinOp, atomic_agent, carve, layout, I, I64, INT_MAX, INT_MIN, ballot, inclusive_scan, lane_prefix, now, popcount, readlane, store_lds, wave_reduce
 from ._wave import uniform as uniform_value
 from .geometry import CHUNK_MAX, COUNTER_BYTES, FULL_STRIDE, INFO_OFFSET, NCH_MAX, POOL, QMAX, chunk_size_rt, list_size_rt, slot_size
-from .scoring import SPEC_SIZES, Scorer, score_chunk
+from .scoring import SPEC_SIZES, TAG, Scorer, score_chunk
 
 NW = 8
 HPAD = 2304  # the histogram a 32-bin group per 36 words: the scan reads a lane's group conflict-free
@@ -38,7 +38,7 @@ def chunk_parts(rows: int, uniform: bool = False, timing: bool = False, sync: bo
     a chunk)."""
     assert 1 <= rows <= QMAX
     OFFS, WORDS = layout(keys=rows * CHUNK_MAX, hist=rows * HIST)
-    CM = SC1 if sync else 0  # stores a merge workgroup of another XCD reads: write-through
+    CM = (SC1 if os.environ.get('KK_CM', '1') == '1' else 0) if sync else 0  # stores a merge workgroup of another XCD reads: write-through
 
     @flyc.jit
     def role(smem, arg_q: fx.Int64, arg_qs: fx.Int64, arg_kv: fx.Int64, arg_kvs: fx.Int64, arg_bt: fx.Int64,
@@ -218,43 +218,17 @@ def chunk_parts(rows: int, uniform: bool = False, timing: bool = False, sync: bo
                     stats = yield [kmax, kmin]
                 return wave_reduce(stats[0], fx.max), wave_reduce(stats[1], fx.min), stats[0], stats[1]
 
-            def sample_threshold():
-                """An approximate threshold from 128 keys spread over the live keys: a key bound ``kt`` (the list takes
-                the keys above it) that about 70% of the list's slots are expected to hold. -> kt, tk."""
-                stride = (nvalid // 128) | 1
-                p0 = fx.min(lane * stride, nvalid - 1)
-                p1 = fx.min((lane + 64) * stride, nvalid - 1)
-                s0, s1 = I(smem.keys.ptr[region + p0]), I(smem.keys.ptr[region + p1])
-                umax = wave_reduce(fx.max(s0, s1), fx.max) ^ I(INT_MIN)
-                umin = wave_reduce(fx.min(s0, s1), fx.min) ^ I(INT_MIN)
-                nb = I(32) - I(fx.math.ctlz(umax ^ umin).to(I))
-                sh = (nb == 0).select(I(0), I(32) - nb)
-                fullw = (nb == 0) | (nb == 32)
-                lowmask = fullw.select(I(-1), ~(I(-1) << nb))
-                hi = fullw.select(I(0), umin & (I(-1) << nb))
-                zero_hist(wb)
-                hist_add(wb, s0, 0, I(0), sh)
-                hist_add(wb, s1, 0, I(0), sh)
-                fence()
-                want = (slot * 11 // 16 * 128 + nvalid - 1) // nvalid
-                d, above = hist_scan(wb, fx.max(want, I(1)))
-                aligned = d << 21
-                low_key = (((aligned >> sh) & lowmask) | hi) ^ I(INT_MIN)
-                kt0 = (low_key == I(INT_MIN)).select(I(INT_MIN), low_key - 1)
-                return kt0, low_key
-
             def compact(kt, ties, keys_at, idx_at, dummy_at):
                 """The keys above ``kt`` (at most ``cap``), then the first ``ties`` equal to it, in block / key / lane
                 order, into the stage: keys at ``keys_at`` and positions at ``idx_at`` (None: not written). -> the keys
-                above ``kt`` and the largest key."""
-                for jj, st in range(0, nblk, 1, init=[I(0), I(INT_MIN)]):
+                above ``kt``."""
+                for jj, st in range(0, nblk, 1, init=[I(0)]):
                     j = I(jj)
-                    rg, kmx = st[0], st[1]
+                    rg = st[0]
                     v4 = lds_load4(smem.keys, region + j * 256 + lane * 4)
                     for k in range_constexpr(4):
                         key = I(v4[k])
                         gt = key > kt
-                        kmx = fx.max(kmx, key)
                         m = ballot(gt)
                         rank = rg + lane_prefix(m)
                         put = gt & (rank < cap)
@@ -263,8 +237,7 @@ def chunk_parts(rows: int, uniform: bool = False, timing: bool = False, sync: bo
                         if idx_at is not None:
                             store_lds(smem.hist, wb + put.select(idx_at + rank, dummy_at + lane), cc * cb + j * 256 + lane * 4 + k)
                         rg = rg + popcount(m)
-                    res = yield [rg, kmx]
-                above_total = res[0]
+                    above_total = yield [rg]
                 if ties > 0:
                     for jj, st in range(0, nblk, 1, init=[I(0)]):
                         j = I(jj)
@@ -282,7 +255,7 @@ def chunk_parts(rows: int, uniform: bool = False, timing: bool = False, sync: bo
                                 store_lds(smem.hist, wb + take.select(idx_at + above_total + p, dummy_at + lane), cc * cb + j * 256 + lane * 4 + k)
                             re = re + popcount(m)
                         tied = yield [re]
-                return res[0], wave_reduce(res[1], fx.max)
+                return above_total
 
             def pad_stage(at):
                 pad = fx.Vector.from_elements([I(INT_MIN)] * 4, dtype=I)
@@ -297,11 +270,11 @@ def chunk_parts(rows: int, uniform: bool = False, timing: bool = False, sync: bo
             def emit_list(kt, ties):
                 """Builds the list of the keys above ``kt`` (and ``ties`` equal to it) and stores it. -> the keys above
                 ``kt`` (more than ``cap``: the list is cut and the caller redoes it), the largest key."""
-                total, kmx = I(0), I(INT_MIN)
+                total = I(0)
                 if both:
                     pad_stage(0)
                     fence()
-                    total, kmx = compact(kt, ties, 0, cap, cap * 2)
+                    total = compact(kt, ties, 0, cap, cap * 2)
                     fence()
                     stamp(6)
                     store_plane(lkeys, 0)
@@ -309,35 +282,28 @@ def chunk_parts(rows: int, uniform: bool = False, timing: bool = False, sync: bo
                 else:
                     pad_stage(0)
                     fence()
-                    total, kmx = compact(kt, ties, 0, None, cap)
+                    total = compact(kt, ties, 0, None, cap)
                     fence()
                     store_plane(lkeys, 0)
                     fence()
                     compact(kt, ties, None, 0, cap)
                     fence()
                     store_plane(lidx, 0)
-                return total, kmx
+                return total
 
             tk, listed, chunk_max, chunk_min, total = I(INT_MIN), nvalid, I(INT_MIN), I(INT_MAX), I(0)
             if nvalid > cap:
                 for jj in range(0, nblk, 1):
                     buffer_ops.buffer_store(lds_load4(smem.keys, region + I(jj) * 256 + lane * 4), full,
                                             row * FULL_STRIDE + cc * cb + I(jj) * 256 + lane * 4, cache_modifier=CM)
-                kt, tk = sample_threshold()
+                chunk_max, chunk_min, smax_, smin_ = stats_pass()
+                kt, ties, tk, listed = threshold(wb, region, nblk, tb, cap, smax_, smin_)
                 stamp(4)
-                total, chunk_max = emit_list(kt, I(0))
-                listed = total
-                chunk_min = tk
-                if total > cap:
-                    cmax_, cmin_, smax_, smin_ = stats_pass()
-                    kt, ties, tk, listed = threshold(wb, region, nblk, tb, cap, smax_, smin_)
-                    stamp(4)
-                    total, chunk_max = emit_list(kt, ties)
-                    chunk_min = cmin_
+                total = emit_list(kt, ties)
             else:
                 chunk_max, chunk_min, smax_, smin_ = stats_pass()
                 stamp(4)
-                total, chunk_max2 = emit_list(I(INT_MIN), I(0))
+                total = emit_list(I(INT_MIN), I(0))
             stamp(7)
             if lane == 0:
                 buffer_ops.buffer_store(fx.Vector.from_elements([tk, (nvalid << 16) | listed, chunk_max, chunk_min], dtype=I), meta, (row * NCH_MAX + cc) * 4, cache_modifier=CM)
@@ -369,7 +335,7 @@ def compile_chunk_lists(rows: int, uniform: bool = False, timing: bool = False):
     """``rows``: query rows a workgroup scores of a sequence (1 - 6; a sequence of more rows takes several workgroups
     a chunk)."""
     assert 1 <= rows <= QMAX
-    name = f"mxfp4_paged_chunk_lists_d128_h32_r{rows}" + ("_u" if uniform else "") + ("_t" if timing else "")
+    name = f"mxfp4_paged_chunk_lists_d128_h32_r{rows}_{TAG}" + ("_u" if uniform else "") + ("_t" if timing else "")
     role, OFFS, WORDS = chunk_parts(rows, uniform, timing)
 
     @fx.struct

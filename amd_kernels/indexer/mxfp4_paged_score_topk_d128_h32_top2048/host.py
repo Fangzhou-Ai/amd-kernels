@@ -15,6 +15,7 @@ from .geometry import (CHUNK_MAX, CHUNKS_TARGET, MAX_ROWS, NCH_MAX, QMAX, TOPK, 
                        scratch_words, slot_size, COUNTER_GROUPS)
 
 HEADS = 32
+_FORCE = None
 _WIDE_BATCH = 16  # sequences above which a workgroup scores all rows of a sequence
 PAGE = 64
 
@@ -49,6 +50,8 @@ def plan(max_query_len: int, batch: int) -> tuple[int, int]:
     machine, so they take whole rows and big chunks."""
     if not 1 <= max_query_len <= QMAX:
         raise ValueError(f"1 - {QMAX} query rows a sequence, got {max_query_len}")
+    if _FORCE is not None:  # experiments: (rows, chunks)
+        return min(max_query_len, _FORCE[0]), _FORCE[1]
     if batch <= 4:
         return min(max_query_len, 2), CHUNKS_TARGET
     if batch <= _WIDE_BATCH:

@@ -24,10 +24,11 @@ from ._wave import F, I, I64, INT_MIN, global_i32, permlane_swap, relu2, score_k
 
 HEADS = 32
 import os as _os
-DEPTH = int(_os.environ.get('KK_DEPTH', '2'))
+DEPTH = int(_os.environ.get('KK_DEPTH', '0'))  # 0: by the rows of the tile (1 from 4 rows: fewer registers)
 SPEC_SIZES = (512, 1024, 1536, 2048)
 import os
 SC = int(os.environ.get('KK_SC', '0'))
+TAG = f"s{SC}d{DEPTH}"  # experiment switches: part of the kernel names
 
 
 @dataclass
@@ -158,12 +159,13 @@ def score_chunk(sc, rows, cmax, num_waves, cb, cc, field, base, hook=None):
         for r in range_constexpr(rows):
             store_lds(field, base + r * cmax + key, I(INT_MIN))
 
-    bufs = [load_keys(k) for k in range(min(DEPTH, steps))]
+    depth = DEPTH or (1 if rows >= 4 else 2)
+    bufs = [load_keys(k) for k in range(min(depth, steps))]
     for k in range_constexpr(steps):
-        kv, kvs = bufs[k % DEPTH]
+        kv, kvs = bufs[k % depth]
         if (wave + k * num_waves) < nst:
             compute(k, kv, kvs)
         elif (wave + k * num_waves) * 64 < cb:
             fill_invalid(k)
-        if k + DEPTH < steps:
-            bufs[k % DEPTH] = load_keys(k + DEPTH)
+        if k + depth < steps:
+            bufs[k % depth] = load_keys(k + depth)

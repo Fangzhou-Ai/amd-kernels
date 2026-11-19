@@ -15,13 +15,14 @@ from amd_kernels.warm_up import launcher
 from ._wave import I, I64, carve
 from .lists import NW, chunk_parts
 from .merge import NT, merge_parts
+from .scoring import TAG
 
 
 @launcher
 def compile_fused(rows: int, blocks: int, uniform: bool = False, timing: bool = False):
     """``rows``: query rows a chunk workgroup scores of a sequence; ``blocks``: the merge kernel's pool blocks."""
     assert NW * 64 == NT
-    name = f"mxfp4_paged_score_topk_d128_h32_r{rows}_b{blocks}" + ("_u" if uniform else "") + ("_t" if timing else "")
+    name = f"mxfp4_paged_score_topk_d128_h32_r{rows}_b{blocks}_{TAG}c{__import__("os").environ.get("KK_CM","1")}" + ("_u" if uniform else "") + ("_t" if timing else "")
     chunk_role, CH_OFFS, CH_WORDS = chunk_parts(rows, uniform, timing, sync=True)
     merge_role, MG_OFFS, MG_WORDS = merge_parts(blocks, uniform, timing, sync=True)
 
