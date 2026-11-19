@@ -90,3 +90,16 @@ def test_pad_rows_and_empty_experts(weights):
     assert torch.isfinite(out.float()).all()
     out2 = mxfp4_moe(x, weights, ids, tw)
     assert torch.equal(out, out2)
+
+
+def test_hot_experts_many_blocks(ckpt, weights):
+    """192 tokens on the same 16 experts: 12 m-blocks per expert, 880 idle experts; vs the reference."""
+    m = 192
+    x = make_activation(m, seed=6)
+    ids = torch.arange(16, dtype=torch.int32, device="cuda").repeat(m, 1)
+    ids = ids.gather(1, torch.stack([torch.randperm(16, device="cuda") for _ in range(m)]))
+    tw = torch.softmax(torch.randn(m, 16, device="cuda"), 1)
+    out = mxfp4_moe(x, weights, ids, tw)
+    ref, _ = R.moe_ref(x, ids, tw, *ckpt)
+    assert rel(out, ref) < 2e-2
+    assert torch.equal(out, mxfp4_moe(x, weights, ids, tw, fused=False))
