@@ -10,6 +10,7 @@ from amd_kernels.common.tensor_shim import _run_compiled
 from amd_kernels.warm_up import entry
 
 from . import kernel as _kernel
+from . import select as _select
 
 TOPK = 2048
 CAP = _kernel.CAP
@@ -18,7 +19,8 @@ _workspaces: dict = {}
 
 @functools.cache
 def _launchers():
-    return _kernel.compile_threshold(), _kernel.compile_stream(), _kernel.compile_select()
+    return (_kernel.compile_threshold(), _kernel.compile_stream(), _kernel.compile_retry(), _select.compile_select(),
+            _select.compile_select_exact())
 
 
 def workspace_bytes(rows: int, width: int) -> int:
@@ -26,12 +28,13 @@ def workspace_bytes(rows: int, width: int) -> int:
     return 4 * (5 * rows + 2 * rows * min(CAP, width))
 
 
-def _workspace(device: torch.device, rows: int, width: int) -> torch.Tensor:
+def _workspace(device: torch.device, stream, rows: int, width: int) -> torch.Tensor:
     need = workspace_bytes(rows, width) // 4
-    buf = _workspaces.get(device)
+    key = (device, stream.cuda_stream)
+    buf = _workspaces.get(key)
     if buf is None or buf.numel() < need:
         buf = torch.empty(need, dtype=torch.int32, device=device)
-        _workspaces[device] = buf
+        _workspaces[key] = buf
     return buf
 
 
@@ -72,12 +75,16 @@ def topk_rows(logits: torch.Tensor, ks: torch.Tensor, ke: torch.Tensor, out: tor
     if rows == 0:
         return out
     cstride = min(CAP, width)
-    ws = _workspace(logits.device, rows, width)
-    meta, cnt, cand = ws[: 4 * rows], ws[4 * rows : 5 * rows], ws[5 * rows :]
-    threshold, stream, select = _launchers()
     s = torch.cuda.current_stream()
+    ws = _workspace(logits.device, s, rows, width)
+    meta, cnt, cand = ws[: 4 * rows], ws[4 * rows : 5 * rows], ws[5 * rows :]
+    threshold, stream, retry, select, select_exact = _launchers()
     stride = logits.stride(0)
-    _run_compiled(threshold, logits.data_ptr(), ks.data_ptr(), ke.data_ptr(), meta.data_ptr(), stride, rows, s)
-    _run_compiled(stream, logits.data_ptr(), ks.data_ptr(), ke.data_ptr(), meta.data_ptr(), cnt.data_ptr(), cand.data_ptr(), stride, cstride, 0 if order is None else order.data_ptr(), rows, s)
-    _run_compiled(select, logits.data_ptr(), ks.data_ptr(), ke.data_ptr(), cnt.data_ptr(), cand.data_ptr(), out.data_ptr(), stride, cstride, out.stride(0), rows, s)
+    ptrs = (logits.data_ptr(), ks.data_ptr(), ke.data_ptr())
+    _run_compiled(threshold, *ptrs, meta.data_ptr(), stride, rows, s)
+    _run_compiled(stream, *ptrs, meta.data_ptr(), cnt.data_ptr(), cand.data_ptr(), stride, cstride, 0 if order is None else order.data_ptr(), rows, s)
+    _run_compiled(retry, *ptrs, cnt.data_ptr(), cand.data_ptr(), stride, cstride, rows, s)
+    args = (*ptrs, cnt.data_ptr(), cand.data_ptr(), out.data_ptr(), stride, cstride, out.stride(0), rows, s)
+    _run_compiled(select, *args)
+    _run_compiled(select_exact, *args)
     return out
