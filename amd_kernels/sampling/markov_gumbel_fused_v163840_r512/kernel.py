@@ -41,6 +41,8 @@ REC_OFF = 2048
 SCRATCH_DW = REC_OFF + 48 * 256 * REC_DW
 NWG = 256
 NW = 4
+SPIN_LIMIT = 1 << 22  # polls (about 3 s) before a wait gives up: wrong draft tokens (verified downstream) rather than a hung GPU
+ERR_OFF = 8  # dword of the scratch that a timed-out wait sets
 TILES = V // 16 // (NWG * NW)  # 16-column tiles of a wave
 RES_TILES = {1: (2, 2, 2, 1), 2: (2, 1, 1, 1), 3: (0, 0, 0, 0)}  # tiles per wave kept in LDS across the steps, by row tiles
 RES_LO = 1  # their first tile index
@@ -542,11 +544,15 @@ def compile_markov_chain(mt: int, ksteps: int, sleep: int = 1):
                         return b
                     rs = rd()
                     bad = _wave_or(bad_of(rs), upper16, upper32)
-                    while bad != 0:
+                    spins = I(0)
+                    while (bad != 0) & (spins < SPIN_LIMIT):
                         if sleep:
                             fx.rocdl.s_sleep(sleep)
                         rs = rd()
                         bad = _wave_or(bad_of(rs), upper16, upper32)
+                        spins = spins + 1
+                    if (bad != 0) & (lane == 0):
+                        buffer_ops.buffer_store(I(1), sy_r, ERR_OFF, cache_modifier=SC1)
                     bv, bi = F(NEG_INF), I(0)
                     for r_ in rs:
                         bv, bi = _comb(bv, bi, I(r_[0]).bitcast(F), I(r_[1]))
@@ -567,15 +573,20 @@ def compile_markov_chain(mt: int, ksteps: int, sleep: int = 1):
                         return (okl & (I(rv[2]) != tag)).select(I(1), I(0))
                     rv = rdres()
                     bad2 = _wave_or(bad_res(rv), upper16, upper32)
-                    while bad2 != 0:
+                    spins2 = I(0)
+                    while (bad2 != 0) & (spins2 < SPIN_LIMIT):
                         if sleep:
                             fx.rocdl.s_sleep(sleep)
                         rv = rdres()
                         bad2 = _wave_or(bad_res(rv), upper16, upper32)
-                    smem.tk.ptr[lane] = I(rv[1])
+                        spins2 = spins2 + 1
+                    if (bad2 != 0) & (lane == 0):
+                        buffer_ops.buffer_store(I(1), sy_r, ERR_OFF, cache_modifier=SC1)
+                    tok_v = ((I(rv[1]) >= 0) & (I(rv[1]) < V)).select(I(rv[1]), I(0))
+                    smem.tk.ptr[lane] = tok_v
                     if bid == 0:
                         if okl:
-                            buffer_ops.buffer_store(Vec.from_elements([I(rv[1]), I(0)], I), tok_r,
+                            buffer_ops.buffer_store(Vec.from_elements([tok_v, I(0)], I), tok_r,
                                                     (lane * i32_tok_stride + s) * 2)
                     fx.rocdl.s_waitcnt(lgkmcnt=0)
                 stamp(s, 5)
