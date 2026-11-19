@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+
 from amd_kernels.attention.kda_prefill_h12_d128 import host
 from amd_kernels.attention.kda_prefill_h12_d128 import prologue as P
 from amd_kernels.attention.kda_prefill_h12_d128 import reference as R
@@ -75,7 +76,6 @@ def test_state_continuation():
     first, second = 640, 384
     c = make_case([first + second], init=[False])
     rec = workspace(c)
-    cu = c["cu_seqlens"]
     out_whole, state_whole = run(c, rec)
     nc1 = first // 64
     rec1, rec2 = rec[:, :nc1].contiguous(), rec[:, nc1:].contiguous()

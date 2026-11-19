@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+
 from amd_kernels.attention.kda_prefill_h12_d128 import host
 from amd_kernels.attention.kda_prefill_h12_d128 import reference as R
 

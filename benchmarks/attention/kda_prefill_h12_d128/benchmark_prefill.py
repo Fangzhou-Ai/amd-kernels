@@ -2,8 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """Graph-replay timing of the KDA prefill of one layer (conv + prologue, chunk scan, gated RMSNorm) against the stock sequence.
 
-One HIP graph holds ``--copies`` launches over distinct inputs (the set is larger than the 256 MB MALL), min and median of 15
-rounds in us per launch. ``stock`` is what vLLM runs with kda_prefill_backend=fused: AITER ``causal_conv1d_split_qkv_triton_tile_fn``,
+One HIP graph holds one launch per input set (the sets together are larger than the 256 MB MALL), min of 15 rounds in us per layer call. ``stock`` is what vLLM runs with kda_prefill_backend=fused: AITER ``causal_conv1d_split_qkv_triton_tile_fn``,
 ``torch.ops._C.fused_kda_prologue`` / ``fused_kda_chunk`` and the Triton ``FusedRMSNormGated``. Roofline columns: the layer's
 unavoidable HBM traffic (reads of the projection bands, gate and beta, the gate for the norm, the output write, state and
 conv state) at the measured ceilings (read 6.5 TB/s, write 6.0 TB/s), the same plus this implementation's workspace
@@ -25,7 +24,7 @@ from amd_kernels.attention.kda_prefill_h12_d128 import host
 from amd_kernels.attention.kda_prefill_h12_d128 import reference as R
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-from tests.attention.kda_prefill_h12_d128.inputs import make_case  # noqa: E402
+from tests.attention.kda_prefill_h12_d128.inputs import make_case
 
 HBM_READ = 6.5e12
 HBM_WRITE = 6.0e12
@@ -41,8 +40,13 @@ def chunk_indices(cu):
 
 def stock_arm(c, cu, ci, co):
     import vllm.platforms.rocm  # noqa: F401  (registers torch.ops._C.fused_kda_prologue / fused_kda_chunk)
-    from aiter.ops.triton.gated_delta_net import causal_conv1d_split_qkv_triton_tile_fn as conv_fn
-    from vllm.models.kimi_k3.amd.ops.kda_chunk import fused_kda_chunk, fused_kda_prologue
+    from aiter.ops.triton.gated_delta_net import (
+        causal_conv1d_split_qkv_triton_tile_fn as conv_fn,
+    )
+    from vllm.models.kimi_k3.amd.ops.kda_chunk import (
+        fused_kda_chunk,
+        fused_kda_prologue,
+    )
     from vllm.third_party.flash_linear_attention.ops.kda import rms_norm_gated
 
     t = c["mixed"].shape[0]
@@ -68,7 +72,7 @@ def stock_arm(c, cu, ci, co):
     return run
 
 
-def fused_arm(c, cu, ci, co, counts):
+def fused_arm(c, cu, ci, co, counts, impl=None):
     table = host._prologue.chunk_table(cu, ci, c["state_indices"], c["has_initial_state"])
     cs = c["conv_state"].clone()
     state = c["state_cache"].clone()
@@ -76,7 +80,8 @@ def fused_arm(c, cu, ci, co, counts):
 
     def run():
         host.prefill(c["mixed"], c["raw_g"], c["beta_logit"], c["gate"], c["A_log"], c["dt_bias"], c["conv_weight"], cs, state,
-                     c["state_indices"], c["has_initial_state"], cu, ci, co, c["norm_weight"], c["norm_eps"], out, c["lower_bound"], table=table, chunk_counts=counts)
+                     c["state_indices"], c["has_initial_state"], cu, ci, co, c["norm_weight"], c["norm_eps"], out, c["lower_bound"],
+                     table=table, chunk_counts=counts, impl=impl)
 
     return run
 
@@ -84,8 +89,13 @@ def fused_arm(c, cu, ci, co, counts):
 def stage_arms(c, cu, ci, co, counts):
     """(fused stages, stock stages): [(name, closure)] sharing one workspace / output so each stage runs on its real input."""
     import vllm.platforms.rocm  # noqa: F401
-    from aiter.ops.triton.gated_delta_net import causal_conv1d_split_qkv_triton_tile_fn as conv_fn
-    from vllm.models.kimi_k3.amd.ops.kda_chunk import fused_kda_chunk, fused_kda_prologue
+    from aiter.ops.triton.gated_delta_net import (
+        causal_conv1d_split_qkv_triton_tile_fn as conv_fn,
+    )
+    from vllm.models.kimi_k3.amd.ops.kda_chunk import (
+        fused_kda_chunk,
+        fused_kda_prologue,
+    )
     from vllm.third_party.flash_linear_attention.ops.kda import rms_norm_gated
 
     t = c["mixed"].shape[0]
@@ -199,8 +209,8 @@ def main():
     ap.add_argument("--stages", action="store_true", help="also time each stage alone (fused and stock)")
     ap.add_argument("--skeleton", action="store_true", help="also time the scan's no-math skeleton (run last: it patches the launchers)")
     args = ap.parse_args()
-    print(f"{'T':>6} {'seqs':>4} {'fused us':>9} {'min':>8} {'stock us':>9} {'speedup':>8} {'floor(io) us':>13} {'%io':>5} {'floor(+ws)':>11} "
-          f"{'mfma us':>8}")
+    print(f"{'T':>6} {'seqs':>4} {'path':>6} {'v2 us':>8} {'staged':>8} {'stock':>8} {'v2/stock':>9} {'v2/staged':>10} {'io floor':>9} {'%io':>5} "
+          f"{'+ws floor':>10} {'%+ws':>5} {'mfma us':>8}")
     batches = [[int(x) for x in args.lens.split(",")]] if args.lens else None
     for k, tokens in enumerate(sum(b) for b in batches) if batches else enumerate(int(x) for x in args.tokens.split(",")):
         if batches:
@@ -215,11 +225,12 @@ def main():
         set_bytes = tokens * (R.LP * 2 * 5 + 6288 * 2)
         copies = max(2, min(12, -(-MIN_SET_BYTES // set_bytes)))
         cases = [c0] + [make_case(lens, seed=i + 1) for i in range(copies - 1)]
-        fused = [fused_arm(c, cu, ci, co, counts) for c in cases]
-        mn, md = timeit_graph(fused)
-        smn = smd = float("nan")
+        path = "mega" if host.uses_mega(counts) else "staged"
+        v2 = timeit_graph([fused_arm(c, cu, ci, co, counts) for c in cases])[0]
+        staged = timeit_graph([fused_arm(c, cu, ci, co, counts, "v1") for c in cases])[0] if path == "mega" else v2
+        stock = float("nan")
         if not args.no_stock:
-            smn, smd = timeit_graph([stock_arm(c, cu, ci, co) for c in cases])
+            stock = timeit_graph([stock_arm(c, cu, ci, co) for c in cases])[0]
         io, with_ws, mfma = floors(tokens, int(ci.shape[0]))
         if args.skeleton:
             skeleton_patch()
@@ -232,10 +243,10 @@ def main():
                 fs.append((name, timeit_graph([a[0][k][1] for a in sets])[0]))
             for k, (name, _) in enumerate(sets[0][1]):
                 ss.append((name, timeit_graph([a[1][k][1] for a in sets])[0]))
-            print("    fused stages us (min): " + ", ".join(f"{n} {v:.1f}" for n, v in fs))
+            print("    staged stages us (min): " + ", ".join(f"{n} {v:.1f}" for n, v in fs))
             print("    stock stages us (min): " + ", ".join(f"{n} {v:.1f}" for n, v in ss))
-        print(f"{tokens:>6} {len(lens):>4} {md:>9.1f} {mn:>8.1f} {smd:>9.1f} {smd / md:>7.2f}x {io:>13.1f} {100 * io / mn:>4.0f}% "
-              f"{with_ws:>11.1f} {mfma:>8.1f}", flush=True)
+        print(f"{tokens:>6} {len(lens):>4} {path:>6} {v2:>8.1f} {staged:>8.1f} {stock:>8.1f} {stock / v2:>8.2f}x {staged / v2:>9.2f}x {io:>9.1f} "
+              f"{100 * io / v2:>4.0f}% {with_ws:>10.1f} {100 * with_ws / v2:>4.0f}% {mfma:>8.1f}", flush=True)
 
 
 if __name__ == "__main__":

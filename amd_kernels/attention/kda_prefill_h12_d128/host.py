@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Entry points of the KDA prefill kernels: stage launches (kernels in scan.py / norm.py, contract in reference.py)."""
+"""Entry points of the KDA prefill kernels: ``prefill`` (the one-launch path of mega.py for short batches, the staged launches of
+prologue.py / scan.py / norm.py otherwise; contract in reference.py) and the stage launches the tests drive."""
 
 import functools
 
@@ -15,7 +16,7 @@ from . import outk as _outk
 from . import prologue as _prologue
 from . import scan as _scan
 from . import walk as _walk
-from .reference import D, NH, RECORD_BYTES
+from .reference import NH, RECORD_BYTES, D
 from .walk import SREC_BYTES, flags_ints
 
 WALK_WAVES = 4

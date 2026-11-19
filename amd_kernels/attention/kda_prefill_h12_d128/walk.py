@@ -1,41 +1,62 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""KDA state walk (gfx950, FlyDSL): the chunks of one (sequence, head) in order, the [K, V] state in MFMA accumulators, one wave
-per 16 value columns, publishing the state each chunk starts from.
+"""KDA state walk (gfx950, FlyDSL): the chunks of one (sequence, head) in order, the [K, V] state in MFMA accumulators, publishing
+the state each chunk starts from.
 
 Per chunk, with S^T [K, V16] in registers: ``Vn = u - w S^T`` and ``S^T = diag(decay) S^T + kg^T Vn`` (``qg`` and ``Aqk`` are not
-read: the output pass computes ``O = qg S^T + Aqk Vn`` from what this kernel publishes). Before the chunk's MFMAs a wave writes
-the bf16 state fragments the MFMAs consume (``sf``) and, after the first product, ``Vn`` as the bf16 fragments of the state
-update (``vnf``), as one linear 1 KB piece per (slice, fragment) of the chunk's 48 KB state record ``[S | Vn]``.
+read: the output pass computes ``O = qg S^T + Aqk Vn`` from what this kernel publishes). Before the chunk's MFMAs a compute wave writes
+the bf16 state fragments the MFMAs consume (``sf``) and, after the first product, ``Vn`` as the bf16 fragments of the state update
+(``vnf``): one linear 1 KB piece per (slice, fragment) of the chunk's 48 KB state record ``[S | Vn]`` (write-through stores).
 
-Data path: a chunk's ``w`` (16 pieces) and ``kgt | decay`` (17 pieces) move HBM / L2 -> LDS with ``buffer_load ... lds`` into a ring
-of four 17 KB slots (W_c, K_c, W_{c+1}, K_{c+1}, ...). Slot W_c is refilled with W_{c+2} once every wave has finished its first
-product, slot K_c with K_{c+1} when the walk enters chunk c + 1; three of the four slots are in flight at any time. The ``u``
-slices of a wave go straight to registers two chunks ahead. The ``vmcnt`` waits count the DMA / store / ``u`` order (``sched_barrier``
-pins it).
+A workgroup has two compute waves (one 16-column value slice each; 4 workgroups per (sequence, head), all on one XCD so the 41 KB
+of a chunk's record are fetched from HBM once) and two helper waves. The helpers issue every ``buffer_load ... lds`` and the flag
+traffic, so the compute waves issue LDS reads, MFMAs and stores only. A chunk's ``w`` (16 pieces) and ``kgt | decay`` (17 pieces)
+move into a ring of four 17 KB slots (W_c, K_c, W_{c+1}, K_{c+1}, ...), its ``u`` slices into a double buffer: slot W_c is refilled
+with W_{c+2} once every wave has finished its first product, slot K_c with K_{c+1} when the walk enters chunk c + 1, so three of
+the four slots are in flight at any time. Two barriers per chunk (before the first product, before the second) order the DMAs; the
+helpers' ``vmcnt`` waits count their own issue order (``sched_barrier`` pins it).
 
-With ``flags`` the walk runs beside the prologue that produces its records: chunk ``c`` is read once the prologue has published the
-flag ``F1[h, c, sg]`` (polled with agent-scope loads three chunks ahead, a flag is reset by its single consumer), and the state record of
-chunk ``c`` is published by ``F2[h, c, sg]`` after its write-through stores completed (two chunks later in the loop, at the end for the
-last two).
+Hand-over with the prologue and the output pass (``flags``): chunk ``c`` is read once the prologue has published ``F1[h, c, sg]``
+(DMA'd into LDS three chunks ahead with agent-scope loads and polled there; the single consumer resets it), and the state record
+of chunk ``c`` is published by ``F2[h, c, sg]`` once its write-through stores completed (two chunks later in the loop, at the end
+for the last two). Without flags the walk runs after the prologue launch (the standalone kernel the tests use).
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from amd_kernels.common import buffer_ops
-from amd_kernels.warm_up import launcher
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import rocdl as _rocdl_ods
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from .common import FLAG_STRIDE, WALK_GROUPS, barrier, lds_load2, lds_load4, mfma, sched_barrier, touch_args
-from .reference import BT, D, NH, RECORD_BYTES, RECORD_DEC, RECORD_KGT, RECORD_U, RECORD_W
-from .scan import SC1, STATE_BYTES, _dma_piece, _fp, _pack, _u_f32
-from .common import lds_ptr
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import rocdl as _rocdl_ods
+from amd_kernels.common import buffer_ops
+from amd_kernels.warm_up import launcher
+
+from .common import (
+    FLAG_STRIDE,
+    WALK_GROUPS,
+    barrier,
+    lds_load2,
+    lds_load4,
+    lds_ptr,
+    mfma,
+    sched_barrier,
+    touch_args,
+)
+from .reference import (
+    BT,
+    NH,
+    RECORD_BYTES,
+    RECORD_DEC,
+    RECORD_KGT,
+    RECORD_U,
+    RECORD_W,
+    D,
+)
+from .scan import SC1, STATE_BYTES, _fp, _pack, _u_f32
 
 NSLICE = 8 // WALK_GROUPS  # value slices (16 columns) of a walk workgroup: one per compute wave; the other waves move data
 NHELP = 4 - NSLICE
@@ -72,12 +93,13 @@ def flag_ready(fr, idx, need):
 
 
 @ASTRewriter.transform
-def spin_until(fr, idx, need, v0):
-    """Wait until the flag at ``idx`` is non-zero (``v0``: a load already issued); a flag that is not ``need``ed is ready."""
+def spin_until(fr, idx, need, v0, nap=1):
+    """Wait until the flag at ``idx`` is non-zero (``v0``: a load already issued), sleeping ``nap`` x 64 cycles between polls; a flag
+    that is not ``need``ed is ready."""
     pending = (fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.Int32(v0))) == 0) & need
     spins = fx.Int32(0)
     while pending & (spins < POLL_LIMIT):
-        fx.rocdl.s_sleep(1)
+        fx.rocdl.s_sleep(nap)
         v = flag_ready(fr, idx, need)
         pending = (fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.Int32(v))) == 0) & need
         spins = spins + 1

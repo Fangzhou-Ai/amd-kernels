@@ -1,23 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """KDA prefill in one launch (gfx950, FlyDSL): the prologue workgroups (conv, gate, intra-chunk matrices -> workspace records), the
-walk workgroups (one per (sequence, head, slice group): the serial state recurrence) and the output workgroups (``O`` and the gated
-RMSNorm) run side by side; records and state records are handed over through flags (walk.py).
+walk workgroups (the serial state recurrence of a (sequence, head), walk.py) and the output workgroups (``O`` and the gated
+RMSNorm, outk.py) run side by side; records and state records are handed over through flags in memory (walk.py).
 
-Workgroups are dispatched in block order: the walk workgroups first (so they are resident before anything waits for them), then
-the prologue workgroups in chunk order (head fastest), then the output workgroups in the same order. A prologue workgroup never
-waits, a walk workgroup waits for records of chunks whose prologue workgroups precede it, an output workgroup for the state
-record of its chunk: no wait depends on a workgroup that is dispatched later.
+Workgroups are dispatched in block order: the walk workgroups first (resident before anything waits for them), then the prologue
+workgroups in chunk order (head fastest), then the output workgroups in the same order. A prologue workgroup never waits, a walk
+workgroup waits for records whose prologue workgroups precede it, an output workgroup for the state record of its chunk: no wait
+depends on a workgroup dispatched later. The prologue's record stores are write-through (agent scope) because the walk and output
+workgroups run on other XCDs.
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from amd_kernels.common import buffer_ops
-from amd_kernels.warm_up import launcher
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+
+from amd_kernels.common import buffer_ops
+from amd_kernels.warm_up import launcher
 
 from .common import WALK_GROUPS, touch_args
 from .outk import OUT_LDS, out_body

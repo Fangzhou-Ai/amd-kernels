@@ -35,7 +35,8 @@ One line per kernel package. Each package's README has what it does, its entry p
 - [`attention/nvfp4_sparse_layer_gqa16_d128_p128_top16`](attention/nvfp4_sparse_layer_gqa16_d128_p128_top16/README.md):
   one NVFP4 sparse attention layer at its served dtypes: the indexer, the warm-up, the decode / prefill calls.
 - [`attention/kda_prefill_h12_d128`](attention/kda_prefill_h12_d128/README.md): the linear-attention (KDA) chunked prefill: conv +
-  SiLU, gate and q / k norms, the chunk-group delta-rule scan with fp32 recurrent states, the gated RMSNorm.
+  SiLU, gate and q / k norms, the chunk-group delta-rule scan with fp32 recurrent states, the gated RMSNorm (one launch for short
+  batches, staged launches for long ones).
 - [`attention/swa_decode_fp8kv_gqa16_d128`](attention/swa_decode_fp8kv_gqa16_d128/README.md): the draft's
   sliding-window decode attention over an fp8 KV cache.
 - [`attention/norm_rope_fp8_insert_d128_rot64`](attention/norm_rope_fp8_insert_d128_rot64/README.md): the draft's

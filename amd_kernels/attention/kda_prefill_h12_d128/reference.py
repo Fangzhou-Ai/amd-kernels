@@ -43,6 +43,11 @@ record per chunk and head: w | qg | kgt | aqk | decay | u at the RECORD_* byte o
 [R / 16][C / 32][64 lanes][8], lane ``l`` (row ``l % 16``, group ``q = l // 16``) holding columns
 ``32 ks + 16 (s // 4) + 4 q + s % 4`` of its row at slot ``s``, so one 1 KB fragment is one linear read and the MFMA's
 reduction is permuted identically on both operands.
+
+The one-launch path adds a state record per chunk and head (walk.py, 48 KB): the bf16 fragments of the state the chunk starts from
+(``S^T`` of each 16-column value slice as the B operand of the first product) and of ``Vn = u - w S^T`` (the operand of the state
+update and of the ``Aqk`` product); the output pass computes ``O = qg S^T + Aqk Vn`` from them and the record's ``qg`` / ``aqk``,
+which is the reference's ``chunk_reference`` with the same bf16 operands.
 """
 
 import math

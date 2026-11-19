@@ -23,16 +23,17 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from amd_kernels.common import buffer_ops
-from amd_kernels.common.tensor_shim import _run_compiled
-from amd_kernels.warm_up import launcher
 from flydsl._mlir import ir
-from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl._mlir.dialects import llvm
+from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.rocdl import _split_mfma_operands
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+
+from amd_kernels.common import buffer_ops
+from amd_kernels.common.tensor_shim import _run_compiled
+from amd_kernels.warm_up import launcher
 
 from .common import FLAG_STRIDE, WALK_GROUPS
 

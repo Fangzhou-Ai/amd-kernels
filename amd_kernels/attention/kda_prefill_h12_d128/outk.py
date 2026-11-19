@@ -11,18 +11,29 @@ is stored 8 bytes per lane; rows past the sequence end fall outside the output b
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from amd_kernels.common import buffer_ops
-from amd_kernels.warm_up import launcher
 from flydsl._mlir.dialects import llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from .common import barrier, bf16x2_hi, bf16x2_lo, lds_ptr, mfma, pk_bf16, raw, touch_args
-from .reference import BT, D, NH, RECORD_AQK, RECORD_BYTES, RECORD_QG
+from amd_kernels.common import buffer_ops
+from amd_kernels.warm_up import launcher
+
+from .common import (
+    FLAG_STRIDE,
+    WALK_GROUPS,
+    barrier,
+    bf16x2_hi,
+    bf16x2_lo,
+    lds_ptr,
+    mfma,
+    pk_bf16,
+    raw,
+    touch_args,
+)
+from .reference import NH, RECORD_AQK, RECORD_BYTES, RECORD_QG, D
 from .scan import SC1, _fp
-from .common import FLAG_STRIDE, WALK_GROUPS
 from .walk import SREC_BYTES, SREC_S, SREC_VN, flag_ready, spin_until
 
 LOG2E = 1.4426950408889634
@@ -53,8 +64,9 @@ def out_body(lds_base, cid, h, w_f32, arg_ws, i32_nc, arg_sb, arg_tab, arg_out, 
     if const_expr(arg_flags is not None):
         f_r = buffer_ops.create_buffer_resource_from_addr(arg_flags, num_records_bytes=fx.Int32(0x7FFFFFF0))
         f2 = NH * i32_nc * WALK_GROUPS * FLAG_STRIDE + ((h * i32_nc + cid) * WALK_GROUPS) * FLAG_STRIDE
-        for g_ in range_constexpr(WALK_GROUPS):
-            spin_until(f_r, f2 + g_ * FLAG_STRIDE, tx >= 0, flag_ready(f_r, f2 + g_ * FLAG_STRIDE, tx >= 0))
+        if wave == 0:
+            for g_ in range_constexpr(WALK_GROUPS):
+                spin_until(f_r, f2 + g_ * FLAG_STRIDE, tx >= 0, flag_ready(f_r, f2 + g_ * FLAG_STRIDE, tx >= 0), 8)
         fx.rocdl.s_waitcnt(lgkmcnt=0)
         barrier()
         if tx < WALK_GROUPS:
