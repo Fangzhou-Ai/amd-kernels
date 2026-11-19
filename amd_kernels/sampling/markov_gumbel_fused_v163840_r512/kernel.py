@@ -47,6 +47,7 @@ NW = 4
 SPIN_LIMIT = 1 << 22  # polls (about 3 s) before a wait gives up: wrong draft tokens (verified downstream) rather than a hung GPU
 ERR_OFF = 8  # dword of the scratch that a timed-out wait sets
 TILES = V // 16 // (NWG * NW)  # 16-column tiles of a wave
+NT = 2  # non-temporal: the base-logit read and the cache write must not push ``w2`` lines out of L2 / the infinity cache
 RES_TILES = {1: (2, 2, 2, 1), 2: (2, 1, 1, 1), 3: (0, 0, 0, 0)}  # tiles per wave kept in LDS across the steps, by row tiles
 RES_LO = 1  # their first tile index
 TS = bool(int(__import__("os").environ.get("AMD_KERNELS_MARKOV_TS", "0")))  # per-workgroup timestamps into the scratch
@@ -177,7 +178,7 @@ def _bf16_hi(w):
 def _dma(rsrc, lds_addr, voff, size):
     """``buffer_load ... lds``: ``size`` bytes per lane into LDS at ``lds_addr`` + lane * size."""
     lds = _llvm.IntToPtrOp(_ir.Type.parse("!llvm.ptr<3>"), fx.as_ir_value(I(lds_addr)))
-    fx.rocdl.raw_ptr_buffer_load_lds(rsrc, lds.result, fx.Int32(size), fx.Int32(voff), fx.Int32(0), fx.Int32(0), aux=0)
+    fx.rocdl.raw_ptr_buffer_load_lds(rsrc, lds.result, fx.Int32(size), fx.Int32(voff), fx.Int32(0), fx.Int32(0), aux=NT)
 
 
 def _by_wave(vals, w):
@@ -206,7 +207,7 @@ def compile_markov_chain(mt: int, ksteps: int):
     ROWS = MT * 16
     SLAB_IT = (ROWS * QMAX + 63) // 64  # DMA instructions of a wave's slab
     SLAB_CH = SLAB_IT * 64  # chunks of its LDS region (whole instructions)
-    assert 1 <= MT <= 3 and 1 <= K <= 8 and TILES * NWG * NW * 16 == V
+    assert 1 <= MT <= 3 and 1 <= K <= 8 and TILES * NWG * NW * 16 == V and TILES % 2 == 0
     RW = RES_TILES[MT]
     NSLOT = sum(RW)
     name = f"markov_gumbel_chain_v163840_r512_mt{MT}_k{K}"
@@ -374,17 +375,19 @@ def compile_markov_chain(mt: int, ksteps: int):
         def finish_step(smem, s, noisy, divide, afr, temps, h0s, cur):
             best_v = [F(NEG_INF) for _ in range(MT)]
             best_i = [I(0) for _ in range(MT)]
+            rev = s & 1  # odd steps sweep the tiles backwards: the last tiles read (still in L2) are the first needed
             for h in range_constexpr(2):
                 init = [v.ir_value() for v in best_v] + [v.ir_value() for v in best_i] + [v.ir_value() for v in cur]
                 for t, old in range(fx.Index(0), fx.Index(T1 if h == 0 else T2), fx.Index(1), init=init):
                     best_v = [F(x) for x in old[:MT]]
                     best_i = [I(x) for x in old[MT:2 * MT]]
                     wv = [Vec(x) for x in old[2 * MT:]]
-                    ti = I(t) + (T1 if h == 1 else 0)
-                    nt = ti + 1
-                    more = nt < TILES
+                    it = I(t) + (T1 if h == 1 else 0)  # iteration of the step; ``ti``: the tile of the wave's columns
+                    ti = (rev == 1).select(TILES - 1 - it, it)
+                    nit = it + 1
+                    more = nit < TILES
+                    nt = more.select((rev == 1).select(TILES - 1 - nit, nit), (rev == 1).select(I(0), I(TILES - 1)))
                     nres = more & (nt >= RES_LO) & (nt < RES_LO + rw)  # the next tile is resident
-                    nt = more.select(nt, I(0))
                     nwi = n0 + nt * 16 + lane % 16
                     first = s == 0
                     gmask = more.select(nres.select(first, more), s < K - 1)
@@ -422,6 +425,7 @@ def compile_markov_chain(mt: int, ksteps: int):
                                 v = v + noisy_row.select(_noise(h0s[m], kc + _i32((e * 0xCC9E2D51) & 0xFFFFFFFF)),
                                                          F(0.0))
                             gt = v > best_v[m]
+                            gt = gt | ((v == best_v[m]) & ((c0 + e) < best_i[m]))  # the sweep may run backwards: first column wins ties
                             best_v[m] = gt.select(v, best_v[m])
                             best_i[m] = gt.select(c0 + e, best_i[m])
                     if TS:
@@ -440,10 +444,12 @@ def compile_markov_chain(mt: int, ksteps: int):
                     r, q = j // HMAXC, j % HMAXC
                     co = I(smem.st.ptr[(s * 3 + 2) * 64 + r % ROWS])
                     rm = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
-                    fx.copy(atom, fx.slice(buf16, (None, (wave * SLAB_CH * 4 + r * PBD + ((T1 * 8 if h == 1 else 0) + q * 4)) // 4)), rm)
+                    hp = rev if h == 0 else 1 - rev  # the physical half this iteration half covers
+                    fx.copy(atom, fx.slice(buf16, (None, (wave * SLAB_CH * 4 + r * PBD + hp * T1 * 8 + q * 4) // 4)), rm)
                     buffer_ops.buffer_store(Vec(fx.memref_load_vec(rm)), cache_r,
-                                            (co + n0 + (T1 * 16 if h == 1 else 0) + q * 8) // 2,
-                                            mask=(j < ROWS * HMAXC) & (q < 2 * (T1 if h == 0 else T2)) & (co >= 0))
+                                            (co + n0 + hp * T1 * 16 + q * 8) // 2,
+                                            mask=(j < ROWS * HMAXC) & (q < 2 * (T1 if h == 0 else T2)) & (co >= 0),
+                                            cache_modifier=NT)
             for m in range_constexpr(MT):
                 av, ai = best_v[m], best_i[m]
                 for mm, up in ((16, upper16), (32, upper32)):
