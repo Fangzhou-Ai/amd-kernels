@@ -79,11 +79,8 @@ def _dma_piece_so(rs, lds_addr, voff, soff):
         aux=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), 0))
 
 
-def flag_index(h, nc, c, sg):
-    return ((h * nc + c) * WALK_GROUPS + sg) * FLAG_STRIDE
-
-
 def flags_ints(nc):
+    """Int32 flags of ``nc`` chunks: F1 (record ready) then F2 (state record ready) per (head, chunk, slice group)."""
     return 2 * NH * nc * WALK_GROUPS * FLAG_STRIDE
 
 
