@@ -13,9 +13,9 @@ sums in another order).
 
 One persistent launch, 256 CTAs x 512 threads, all resident, handing off through tagged mailboxes in scratch
 (`Workspace`: step epoch and layer slot make every tag unique, nothing is zeroed). Token CTAs (one a row) run AttnRes
-whole; every other CTA streams 26 rows of in_proj (16 + 10, 373 KB) into registers at kernel start, while one of its waves
-polls for x and DMAs it into LDS; the MFMAs run as the weights land; the KDA tasks (request x head x 16 state rows)
-follow on the same CTAs. A request whose first slot is the null slot (graph padding) reads zeros and writes nothing.
+whole; every other CTA streams 26 rows of in_proj (16 + 10, 373 KB) into registers at kernel start, while four of its waves
+(each holding back its last two K chunks) poll for x and DMA it into LDS; the MFMAs run as the weights land; the KDA
+tasks (request x head x 16 state rows) follow on the same CTAs. Past 12 rows x goes through LDS in two passes. A request whose first slot is the null slot (graph padding) reads zeros and writes nothing.
 
 ## Entry points
 
