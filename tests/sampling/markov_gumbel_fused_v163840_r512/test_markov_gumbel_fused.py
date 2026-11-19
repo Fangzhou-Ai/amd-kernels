@@ -4,7 +4,7 @@
 cache element within two bf16 ulps of the bias and base magnitude of the reference, 99.9% equal: the GEMV's sum order), the draw (the sampled token's
 noised value within 2e-4 of the row maximum, and the argmax wherever the top two differ by more than 1e-3), invalid
 rows (no cache write, plain argmax), the cache row mapping, uniform and mixed temperatures (every loop body),
-1-48 rows, 3-5 steps, bitwise repeats, a graph replay on new inputs, a ticket left at zero."""
+1-48 rows, 1-8 steps, one scratch across row and step counts, bitwise repeats, a graph replay on new inputs."""
 
 import pytest
 import torch
@@ -118,6 +118,8 @@ def check(d, n, k):
         (33, 5, [0.7, 1.0, 0.0, 1e-3], (0, 5), True),
         (48, 3, [1.0], (), False),
         (48, 3, [0.0, 1.0, 0.8, 1.2, 1.0, 0.6], (1, 47), True),
+        (20, 1, [0.7], (), False),
+        (20, 8, [1.0, 0.7], (3,), True),
     ],
 )
 def test_chain(n, k, temps, invalid, mapped):
@@ -125,6 +127,17 @@ def test_chain(n, k, temps, invalid, mapped):
     d = make(n, k, 100 + n, temps, invalid, mapped)
     run(d)
     assert check(d, n, k)
+
+
+def test_scratch_reused_across_variants():
+    """One scratch and call after call of different row counts and step counts (generation tags, rank counters)."""
+    require_gfx950()
+    scratch = torch.zeros(mk.scratch_dwords(48), dtype=torch.int32, device="cuda")
+    for i, (n, k) in enumerate([(8, 3), (48, 4), (20, 2), (8, 5), (48, 1), (33, 3)]):
+        d = make(n, k, 40 + i, [0.7, 1.0, 0.0])
+        d["scratch"] = scratch
+        run(d)
+        assert check(d, n, k)
 
 
 def test_repeats_bitwise_and_graph_replay():

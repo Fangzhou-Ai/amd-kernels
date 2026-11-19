@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""One Markov draft step of a Kimi-K3.1 DSpark draft in one launch, FlyDSL (gfx950).
+"""The k Markov draft steps of a Kimi-K3.1 DSpark draft in one persistent launch, FlyDSL (gfx950).
 
-256 workgroups of four waves; a workgroup owns 640 vocabulary columns (a wave ten 16-column tiles) for all rows
-(<= 48, ``MT`` row tiles of 16). The step's embeddings ``w1[prev]`` sit in LDS (row pitch 1040 B) and, from there,
-in registers as the MFMA's second operand; each wave streams its ``w2[v, :]`` rows once, one tile ahead, with the
-weights as the first operand (16x16x32 bf16, so a lane owns four consecutive columns of one row). The wave's base
-logits slab arrives in LDS by coalesced loads; per tile the fp32 sum is rounded to bf16 (the GEMV output), added to
-the base logits with one bf16 rounding, written back to that slab, noised with vLLM's murmur3 Gumbel draw and folded
-into the lane's maximum (first column on ties). After each half of its tiles the wave stores the slab into the draft
-logits cache with 16-byte coalesced stores. The workgroup reduces its columns per row and publishes one
-(value, column) pair per row with agent-scope stores; the last workgroup to take a ticket reduces the 256 pairs of
-each row into ``draft_tokens`` and resets the ticket. The temperature picks the loop body of the whole wave
-(uniform branch): no row noised, no division (every row T in {0, 1}), or the general one.
+256 workgroups of four waves, one per CU, all resident; the steps run inside the kernel. Per step, ``MT`` row tiles of 16
+(<= 48 rows): the previous tokens (in LDS) select the ``w1`` rows, which sit in LDS (row pitch 1040 B) and in registers as the
+MFMA's second operand; each wave streams ten 16-column tiles of ``w2`` (the first operand, 16x16x32 bf16: a lane owns four
+consecutive columns of one row), one tile ahead, and per tile rounds the fp32 sum to bf16 (the GEMV output), adds the base
+logits with one bf16 rounding, writes the logits back into the wave's LDS slab, adds vLLM's murmur3 Gumbel noise and folds
+the value into the lane's maximum (first column on ties). The slab (base logits of the wave's 160 columns, all rows) is the
+next step's and arrives by LDS DMA while the step's reduction runs; it goes to the draft logits cache in two 16-byte
+coalesced stores a half. A XCC owns a contiguous eighth of the columns (its workgroups take a rank from a per-XCC counter);
+each wave keeps its tiles 1 and 2 (7 / 5 tiles of a workgroup at 16 / 32 rows) in LDS from step 0 on, so steps 1.. read them
+from LDS. A workgroup reduces its columns per row and publishes one (value, column, tag) record per row with agent-scope
+stores; workgroup r < n waits for the 256 records of row r (a tag is generation + step + 1) and publishes the row's result;
+every workgroup polls the n results into LDS as the next step's tokens (workgroup 0 also writes ``draft_tokens``). The
+temperature picks the loop body of the whole wave (uniform branch): no row noised, no division (every row T in {0, 1}), or
+the general one. The 256 workgroups must be co-resident; a wait that never ends is abandoned after ``SPIN_LIMIT`` polls.
 """
 
 import struct
@@ -192,7 +195,7 @@ def _wave_or(b, upper16, upper32):
     return I(fx.rocdl.readfirstlane(T.i32, fx.as_ir_value(b)))
 
 
-def compile_markov_chain(mt: int, ksteps: int, sleep: int = 1):
+def compile_markov_chain(mt: int, ksteps: int):
     MT = mt
     K = ksteps
     T1 = TILES // 2  # tiles of the first half
@@ -356,7 +359,6 @@ def compile_markov_chain(mt: int, ksteps: int, sleep: int = 1):
         fx.rocdl.sched_barrier(0)
         dma_slab(I(0), n0)
         fx.rocdl.sched_barrier(0)
-        stamp(0, 20)
         for s in range_constexpr(K):
             st_write(s, l1[s], l2[s])
 
@@ -480,7 +482,6 @@ def compile_markov_chain(mt: int, ksteps: int, sleep: int = 1):
             fx.copy(atom, fx.slice(lds16, (None, ((lane % 16 + 16 * m) * ER + k * 16 + (lane // 16) * 4) // 4)), rm)
             return Vec(fx.memref_load_vec(rm))
 
-        stamp(0, 21)
         for s, state in range(fx.Index(0), fx.Index(K), fx.Index(1), init=[v.ir_value() for v in nxt] + [tok_l.ir_value()]):
             s = I(s)
             nxt = [Vec(x) for x in state[:KSTEPS]]
@@ -546,8 +547,7 @@ def compile_markov_chain(mt: int, ksteps: int, sleep: int = 1):
                     bad = _wave_or(bad_of(rs), upper16, upper32)
                     spins = I(0)
                     while (bad != 0) & (spins < SPIN_LIMIT):
-                        if sleep:
-                            fx.rocdl.s_sleep(sleep)
+                        fx.rocdl.s_sleep(1)
                         rs = rd()
                         bad = _wave_or(bad_of(rs), upper16, upper32)
                         spins = spins + 1
@@ -575,8 +575,7 @@ def compile_markov_chain(mt: int, ksteps: int, sleep: int = 1):
                     bad2 = _wave_or(bad_res(rv), upper16, upper32)
                     spins2 = I(0)
                     while (bad2 != 0) & (spins2 < SPIN_LIMIT):
-                        if sleep:
-                            fx.rocdl.s_sleep(sleep)
+                        fx.rocdl.s_sleep(1)
                         rv = rdres()
                         bad2 = _wave_or(bad_res(rv), upper16, upper32)
                         spins2 = spins2 + 1

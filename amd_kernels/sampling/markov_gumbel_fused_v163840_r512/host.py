@@ -10,10 +10,9 @@ from amd_kernels import warm_up
 
 from .reference import RANK, V
 
-NWG = 256
-REC_DW = 4
 SCRATCH_DW = 2048 + 48 * 256 * 4
 MAX_ROWS = 48
+MAX_STEPS = 8
 NAME = "sampling/markov_gumbel_fused_v163840_r512"
 
 
@@ -22,7 +21,8 @@ def row_tiles(n: int) -> int:
 
 
 def scratch_dwords(n: int) -> int:
-    """Size of the int32 scratch for ``n`` rows: generation, per-row results, per-workgroup (value, column, tag) records."""
+    """Size of the int32 scratch (any row count): generation, per-row results, per-XCC rank counters, per-workgroup
+    (value, column, tag) records."""
     return SCRATCH_DW
 
 
@@ -63,19 +63,21 @@ def _inputs(mode, n, base, w1, w2, input_ids, anchor_idx, draft_tokens, idx_mapp
 @warm_up.entry(NAME, mode=_mode, sizes=_sizes, inputs=_inputs)
 def markov_gumbel_fused(base, w1, w2, input_ids, anchor_idx, draft_tokens, idx_mapping, sample_pos, temperature,
                         seeds, cache, scratch, row_mapping=None):
-    """The Markov loop of ``DSparkSpeculator._sample_sequential`` after the base logits (``reference.py``), k steps
-    of one launch each.
+    """The Markov loop of ``DSparkSpeculator._sample_sequential`` after the base logits (``reference.py``): all k steps
+    in one persistent launch of 256 workgroups, which must be co-resident (one per CU: nothing else may hold CUs of the
+    device while it runs).
 
     ``base`` bf16 [n, k, V] (the base logits of every draft position); ``w1`` / ``w2`` bf16 [V, 512] contiguous;
     ``input_ids`` int32 and ``anchor_idx`` int64 [n] (step 0's previous token is ``input_ids[anchor_idx[r]]``);
     ``draft_tokens`` int64 [>= n, k] (output; step s reads column s - 1); ``idx_mapping`` and ``sample_pos`` int64
     [n, k] (request state index, < 0: invalid row, and the position of the predicted token: the draw is at
     ``sample_pos - 1``); ``temperature`` fp32 and ``seeds`` int64 [slots]; ``cache`` bf16 [rows, >= k, V] draft
-    logits cache (column = step); ``scratch`` int32 [``scratch_dwords(n)``], zeroed once (the kernel leaves it
-    zeroed); ``row_mapping`` int32 [slots] (``DraftLogitsCache.row_mapping``) or None. 1 <= n <= 48. Graph safe.
+    logits cache (column = step); ``scratch`` int32 [``scratch_dwords(n)``], zeroed once, then owned by the kernel (it
+    never needs a reset); ``row_mapping`` int32 [slots] (``DraftLogitsCache.row_mapping``) or None. 1 <= n <= 48,
+    1 <= k <= 8. Graph safe.
     """
     n, k, v = base.shape
-    assert v == V and 1 <= n <= MAX_ROWS and base.dtype == torch.bfloat16 and base.stride(2) == 1
+    assert v == V and 1 <= n <= MAX_ROWS and 1 <= k <= MAX_STEPS and base.dtype == torch.bfloat16 and base.stride(2) == 1
     assert base.stride(1) == V
     assert w1.shape == w2.shape == (V, RANK) and w1.dtype == w2.dtype == torch.bfloat16
     assert w1.is_contiguous() and w2.is_contiguous()
