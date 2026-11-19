@@ -47,7 +47,7 @@ def compile_chunk_lists(rows: int, uniform: bool = False, timing: bool = False):
     def kernel(arg_q: fx.Int64, arg_qs: fx.Int64, arg_kv: fx.Int64, arg_kvs: fx.Int64, arg_bt: fx.Int64,
                arg_w: fx.Int64, arg_ends: fx.Int64, arg_qsl: fx.Int64, arg_keys: fx.Int64, arg_idx: fx.Int64,
                arg_meta: fx.Int64, arg_full: fx.Int64, i32_bt_stride: fx.Int32, i32_page_stride: fx.Int32,
-               i32_last_page: fx.Int32, i32_batch: fx.Int32, i32_nch_grid: fx.Int32, i32_qlen: fx.Int32, arg_dbg: fx.Int64):
+               i32_last_page: fx.Int32, i32_batch: fx.Int32, i32_nch_grid: fx.Int32, i32_qlen: fx.Int32, i32_target: fx.Int32, arg_dbg: fx.Int64):
         tx = fx.thread_idx.x
         lane = tx % 64
         wave = I(rocdl.readfirstlane(T.i32, tx // 64))
@@ -86,7 +86,7 @@ def compile_chunk_lists(rows: int, uniform: bool = False, timing: bool = False):
             max_end = fx.max(max_end, row_bound(j))
         row0 = first + tile * rows
         ends = [row_bound(tile * rows + r) for r in range_constexpr(rows)]
-        cb = chunk_size_rt(max_end)
+        cb = chunk_size_rt(max_end, i32_target)
         nch = fx.max((max_end + cb - 1) // cb, I(1))
         tb = list_size_rt(nch, cb)
         slot = slot_size(tb)
@@ -313,9 +313,9 @@ def compile_chunk_lists(rows: int, uniform: bool = False, timing: bool = False):
                            arg_w: fx.Int64, arg_ends: fx.Int64, arg_qsl: fx.Int64, arg_keys: fx.Int64,
                            arg_idx: fx.Int64, arg_meta: fx.Int64, arg_full: fx.Int64, i32_bt_stride: fx.Int32,
                            i32_page_stride: fx.Int32, i32_last_page: fx.Int32, i32_batch: fx.Int32, i32_nch_grid: fx.Int32, i32_qlen: fx.Int32,
-                           arg_dbg: fx.Int64, grid_x: fx.Int32, stream: fx.Stream):
+                           i32_target: fx.Int32, arg_dbg: fx.Int64, grid_x: fx.Int32, stream: fx.Stream):
         kernel(arg_q, arg_qs, arg_kv, arg_kvs, arg_bt, arg_w, arg_ends, arg_qsl, arg_keys, arg_idx, arg_meta, arg_full,
-               i32_bt_stride, i32_page_stride, i32_last_page, i32_batch, i32_nch_grid, i32_qlen, arg_dbg).launch(
+               i32_bt_stride, i32_page_stride, i32_last_page, i32_batch, i32_nch_grid, i32_qlen, i32_target, arg_dbg).launch(
             grid=(I64(grid_x), 1, 1), block=(NW * 64, 1, 1), stream=stream)
 
     launch_chunk_lists.kernel_name = name

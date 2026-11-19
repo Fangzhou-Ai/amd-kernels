@@ -6,8 +6,9 @@ scorer writing fp32 logits ``[rows, width]``, then AITER's per-row top-2048 with
 Every shape runs ``NIN`` distinct inputs (query rows and a key cache whose pages the inputs pick at random from a pool
 larger than the last-level cache) in one graph; median of 5 rounds x 5 replays, us per call. The roofline columns
 count the index-cache bytes the call must read (68 B a key, once a sequence: its rows share the keys), the query,
-weight and output bytes, and the fp4 MFMA work (rows x keys x 32 heads x 128 x 2 flop at 5 PFLOP/s dense); the
-achievable HBM rate is 80% of 8 TB/s.
+weight and output bytes at the measured 6.4 TB/s HBM rate, the fp4 MFMA work (rows x keys x 32 heads x 128 x 2 flop at
+the measured 8.24 PFLOP/s), and the launch floor of the design: two graph kernels at 1.57 us each plus two cold
+dependent loads (245 ns). "ceiling" = max(bytes, flops) time + that floor; the last column is ceiling / measured.
 Run: python3 benchmarks/indexer/mxfp4_paged_score_topk_d128_h32_top2048/benchmark_score_topk.py [--quick]
 """
 
@@ -19,9 +20,9 @@ from amd_kernels.indexer.mxfp4_paged_score_topk_d128_h32_top2048 import host
 from amd_kernels.indexer.mxfp4_paged_score_topk_d128_h32_top2048.reference import TOPK
 
 NIN = 24
-HBM_TBS = 8.0
-ACHIEVABLE = 0.8
-FP4_PFLOPS = 5.0
+HBM_TBS = 6.4
+FP4_PFLOPS = 8.24
+LAUNCH_FLOOR_US = 2 * 1.57 + 2 * 0.245
 SHAPES = [  # (sequences, rows a sequence, mean key count a sequence per rank)
     (3, 4, 8192),
     (3, 4, 32768),
@@ -33,6 +34,9 @@ SHAPES = [  # (sequences, rows a sequence, mean key count a sequence per rank)
     (48, 4, 8192),
     (48, 4, 32768),
     (8, 4, 94208),
+    (2, 6, 15360),
+    (2, 6, 20480),
+    (2, 6, 94208),
 ]
 
 
@@ -111,15 +115,15 @@ def stock_calls(inputs, out_idx, out_val):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--quick", action="store_true", help="three shapes")
+    ap.add_argument("--quick", action="store_true", help="three shapes (first of the list, the 2 x 6 ones)")
     args = ap.parse_args()
-    shapes = SHAPES[:3] if args.quick else SHAPES
+    shapes = SHAPES[-3:] if args.quick else SHAPES
     gen = torch.Generator(device="cuda").manual_seed(0)
     pool_pages = 3 * 1024 * 1024 * 1024 // 4352  # 3 GiB of index pages: far past the last-level cache
     pool = torch.randint(0, 256, (pool_pages, 4352), dtype=torch.uint8, device="cuda", generator=gen)
     pool[:, 4096:] = torch.randint(118, 124, (pool_pages, 256), dtype=torch.uint8, device="cuda", generator=gen)
     pool = pool.unflatten(1, (64, 68))
-    print("seqs x rows | width | stock us | fused us | speedup | key MB | TB/s | % of 6.4 TB/s | fp4 floor us | % of floor")
+    print("seqs x rows | width | stock us | fused us | speedup | key MB | TB/s | HBM us | fp4 us | ceiling us | % of ceiling")
     for seqs, qlen, width in shapes:
         sets, keys = zip(*(make_set(seqs, qlen, width, pool, gen) for _ in range(NIN)))
         rows = seqs * qlen
@@ -134,11 +138,12 @@ def main():
         written = rows * TOPK * 8
         total = read + written
         tbs = total / (t_fused * 1e-6) / 1e12
-        floor = max(total / (HBM_TBS * ACHIEVABLE * 1e12), mean_keys * qlen * 32 * 128 * 2 / (FP4_PFLOPS * 1e15)) * 1e6
+        hbm = total / (HBM_TBS * 1e12) * 1e6
+        fp4 = mean_keys * qlen * 32 * 128 * 2 / (FP4_PFLOPS * 1e15) * 1e6
+        ceiling = max(hbm, fp4) + LAUNCH_FLOOR_US
         print(
             f"{seqs:3d} x {qlen} | {width:6d} | {t_stock:7.1f} | {t_fused:7.1f} | {t_stock / t_fused:5.2f}x | "
-            f"{total / 1e6:6.1f} | {tbs:5.2f} | {100 * tbs / (HBM_TBS * ACHIEVABLE):5.1f}% | {floor:6.1f} | "
-            f"{100 * floor / t_fused:5.1f}%",
+            f"{total / 1e6:6.1f} | {tbs:5.2f} | {hbm:5.1f} | {fp4:5.1f} | {ceiling:6.1f} | {100 * ceiling / t_fused:5.1f}%",
             flush=True,
         )
 
