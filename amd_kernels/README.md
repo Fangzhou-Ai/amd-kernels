@@ -61,6 +61,8 @@ One line per kernel package. Each package's README has what it does, its entry p
   Gemma norm with bf16-rounded MXFP8.
 - [`norm/gemma_rmsnorm_bf16_mxfp8_h6144`](norm/gemma_rmsnorm_bf16_mxfp8_h6144/README.md): Gemma RMSNorm to
   bf16-rounded MXFP8.
+- [`norm/allreduce_attnres_rmsnorm_h7168_ranks8`](norm/allreduce_attnres_rmsnorm_h7168_ranks8/README.md): eight-rank
+  all-reduce + AttnRes block mix + RMSNorm of a decode step (hidden 7168, bf16).
 
 ## Collectives (four ranks)
 
