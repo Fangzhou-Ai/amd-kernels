@@ -96,6 +96,28 @@ def memrealtime():
     return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
 
 
+def scalar_atomic_add(addr, v):
+    """Returning scalar (SMEM) atomic add on the 64-bit address ``addr``, wave-uniform: the old value. It retires
+    through lgkmcnt, so it does not wait for the wave's vector loads in flight."""
+    low = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int64(addr).to(fx.Int32)))
+    high = fx.Int32(rocdl.readfirstlane(T.i32, (fx.Int64(addr) >> 32).to(fx.Int32)))
+    pointer = (
+        low.to(fx.Uint32).to(fx.Uint64) | (high.to(fx.Uint32).to(fx.Uint64) << 32)
+    ).bitcast(fx.Int64)
+    inc = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(v)))
+    return fx.Int32(
+        llvm.inline_asm(
+            T.i32,
+            [as_ir_value(inc), as_ir_value(pointer)],
+            "s_atomic_add $0, $2, 0 glc\n\ts_waitcnt lgkmcnt(0)",
+            "=s,0,s,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
 def unlikely(cond):
     """``cond`` marked cold (llvm.expect): LLVM lays the branch out of the hot
     path. A rare path's code inline among the hot stages costs them even when it

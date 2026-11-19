@@ -137,6 +137,37 @@ def rows_to_lds(tid, src, k, s, xl, xrow, cm=0, ldk=None, k0=0, t0=0):
     gpu.barrier()
 
 
+@traced
+def rows_to_lds_batched(tid, src, k, s, xl, xrow, cm=0, ldk=None, k0=0, t0=0):
+    """``rows_to_lds`` with every 16 B load issued before the first LDS store."""
+    ldk = k if ldk is None else ldk
+    words = s * k // 8
+    rounds = (words + THREADS - 1) // THREADS
+    got = []
+    for i in range_constexpr(rounds):
+        e = fx.min(tid + THREADS * i, words - 1)
+        t = e // (k // 8)
+        kk = e % (k // 8) * 8
+        got.append(
+            fx.Vector(
+                bo.buffer_load(
+                    rsrc(src),
+                    ((t0 + t) * ldk + k0 + kk) // 2,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=cm,
+                )
+            )
+        )
+    for i in range_constexpr(rounds):
+        e = fx.min(tid + THREADS * i, words - 1)
+        t = e // (k // 8)
+        kk = e % (k // 8) * 8
+        if tid + THREADS * i < words:
+            fx.ptr_store(got[i], xl + (t * xrow + kk) // 2)
+    gpu.barrier()
+
+
 def dev_rows_to_lds(tid, src, k, s, xl, xrow, t0=0):
     """``rows_to_lds`` at device scope: rows another CTA of this launch wrote."""
     rows_to_lds(tid, src, k, s, xl, xrow, CM_DEV, t0=t0)

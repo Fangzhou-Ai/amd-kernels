@@ -228,16 +228,18 @@ class Mailbox:
             cache_modifier=_SCOPE_CM[a.space],
         )
 
-    def poll(self, specs, batch=POLL_MAX):
+    def poll(self, specs, batch=POLL_MAX, lives=None):
         """Batched poll of pairs ``specs`` = [(Addr, pair index, npairs in {1, 2})],
         all of one space.
 
         All pairs are re-loaded together while any tag is stale, so a batch costs
-        one round trip after its last producer lands. Returns the value words."""
+        one round trip after its last producer lands. ``lives`` (one traced bool a
+        one-pair spec): a dead spec is not waited for. Returns the value words."""
         if const_expr(len(specs) == 0):
             return []
         if const_expr(len(specs) > batch):
-            return self.poll(specs[:batch], batch) + self.poll(specs[batch:], batch)
+            ls = (None, None) if lives is None else (lives[:batch], lives[batch:])
+            return self.poll(specs[:batch], batch, ls[0]) + self.poll(specs[batch:], batch, ls[1])
         spaces = {a.space for a, _, _ in specs}
         assert len(spaces) == 1, f"one poll batch spans {spaces}"
         cm = _SCOPE_CM[spaces.pop()]
@@ -262,6 +264,11 @@ class Mailbox:
         nw = sum(2 * n for _, _, n in specs)
 
         def pending(v):
+            if const_expr(lives is not None):
+                bad = (v[1] != tag) & lives[0]
+                for k in range_constexpr(1, len(specs)):
+                    bad = bad | ((v[2 * k + 1] != tag) & lives[k])
+                return bad
             bad = v[1] != tag
             for e in range_constexpr(3, nw, 2):
                 bad = bad | (v[e] != tag)

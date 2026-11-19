@@ -26,6 +26,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from .attn_res import (
+    stage_gram,
     COLS,
     HIDDEN,
     LDS_PAD,
@@ -140,9 +141,10 @@ def scratch_layout(s: int, nblocks: int) -> dict:
     ns = nblocks + 1
     pairs = {
         "part": NA * s * ns * 2,
-        "wgt": s * (ns + 1),
+        "wgt": s * (ns + 2),
         "msq": NA * s,
         "xrdy": NA,
+        "gram": NA * s * (ns * (ns - 1) // 2),
     }
     return pair_layout(pairs.items())
 
@@ -430,6 +432,9 @@ def stage_slice_pre(c, task, ld):
             c["put"](c["part"], at, sq)
             c["put"](c["part"], at + 1, dt)
     gpu.barrier()
+    if const_expr(c["use_gram"]):
+        assert c["vals_all"]
+        stage_gram(c, task)
 
 
 @traced

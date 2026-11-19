@@ -2,14 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """Host side of the layer tail K2: the launch, and the per-rank state (scratch, epoch, health words, peer memory)."""
 
+from dataclasses import dataclass
+
 import torch
 
+from amd_kernels import warm_up
 from amd_kernels.common.mono.abi import PEER_HEAD
 from amd_kernels.common.mono.peer import PeerBuffer
 from amd_kernels.common.mono.plan import HEALTH_WORDS
 
 from . import kernel as K
-from .kernel import ABI, K2Build, build
+from .kernel import K2Build, build
 
 TP = K.TP_
 
@@ -137,3 +140,86 @@ def k2_launch(
         _ptr(tl),
         torch.cuda.current_stream(),
     )
+
+
+@dataclass
+class LayerTailWeights:
+    """A layer's weights as vLLM loads them (no copies, no re-quantization): ``w_o`` the rank's o_proj columns
+    [7168, 1536]; ``w13`` / ``w2`` AITER's shuffled MXFP4 experts with ``w13s`` / ``w2s`` their E8M0 scales;
+    ``w_up`` this rank's [896, 3584] rows of the latent up projection."""
+
+    w_o: torch.Tensor
+    ares_nw: torch.Tensor
+    ares_qk: torch.Tensor
+    in_nw: torch.Tensor
+    w_gate: torch.Tensor
+    bias: torch.Tensor
+    w_ld: torch.Tensor
+    w_sgu: torch.Tensor
+    w_sd: torch.Tensor
+    w13: torch.Tensor
+    w13s: torch.Tensor
+    w2: torch.Tensor
+    w2s: torch.Tensor
+    ln_w: torch.Tensor
+    w_up: torch.Tensor
+    eps: float = 1e-5
+    out_eps: float = 1e-5
+    ln_eps: float = 1e-5
+
+
+SERVED_ROWS = (4, 6, 8, 12, 16)
+
+
+def _mode(comm, w, core, prefix, blocks, *, nblocks, reset=False, layer, out=None):
+    return (nblocks, bool(reset))
+
+
+def _sizes(mode):
+    return SERVED_ROWS
+
+
+def _inputs(mode, n, comm, w, core, prefix, blocks, *, nblocks, reset=False, layer, out=None):
+    z = torch.zeros
+    blocks = z((n, *blocks.shape[1:]), dtype=blocks.dtype, device=blocks.device)
+    return (comm, w, z((n, core.size(1)), dtype=core.dtype, device=core.device),
+            z((n, prefix.size(1)), dtype=prefix.dtype, device=prefix.device), blocks), {
+        "nblocks": nblocks, "reset": reset, "layer": layer}  # fmt: skip
+
+
+@warm_up.entry("moe.layer_tail_k2_h7168_ranks8", mode=_mode, sizes=_sizes, inputs=_inputs)
+def layer_tail(comm, w, core, prefix, blocks, *, nblocks, reset=False, layer, out=None):
+    """One layer's tail on this rank: ``core`` [S, 1536] (o_proj's input) -> the MoE output [S, 7168] (``out``).
+    ``prefix`` [S, 7168] is updated in place (written when ``reset``, a block-write layer); ``blocks`` [S, B, 7168]
+    holds the AttnRes block sources, ``nblocks`` the layer's valid ones before this layer's own block. ``layer`` is
+    the layer index; the caller bumps ``comm.step_begin()`` once before the first launch of a step."""
+    out = torch.empty_like(prefix) if out is None else out
+    key = K2Build(
+        tokens=core.size(0), nblocks=nblocks + int(reset), reset=reset, eps=w.eps, out_eps=w.out_eps, ln_eps=w.ln_eps
+    )
+    k2_launch(
+        key,
+        core=core,
+        w_o=w.w_o,
+        prefix=prefix,
+        blocks=blocks,
+        ares_nw=w.ares_nw,
+        ares_qk=w.ares_qk,
+        in_nw=w.in_nw,
+        w_gate=w.w_gate,
+        bias=w.bias,
+        w_ld=w.w_ld,
+        w_sgu=w.w_sgu,
+        w_sd=w.w_sd,
+        w13=w.w13,
+        w13s=w.w13s,
+        w2=w.w2,
+        w2s=w.w2s,
+        ln_w=w.ln_w,
+        w_up=w.w_up,
+        out=out,
+        layer=128 + layer,
+        **comm.launch_args(),
+        **comm.peer_args(),
+    )
+    return out

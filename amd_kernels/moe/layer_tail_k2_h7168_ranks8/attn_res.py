@@ -17,6 +17,7 @@ from amd_kernels.common.mono.ops import (
     butterfly,
     hw_exp2,
     hw_rsq,
+    lane_gather,
     ld_i32,
     rsrc,
     traced,
@@ -220,6 +221,45 @@ def stage_slice(c, task):
     gpu.barrier()
 
 
+def pair_list(ns):
+    return [(i, j) for i in range(ns) for j in range(i + 1, ns)]
+
+
+def pick_pair(p, ns):
+    """(a, b) of the traced pair index ``p`` in ``pair_list(ns)``."""
+    pl = pair_list(ns)
+    ia, ib = fx.Int32(pl[0][0]), fx.Int32(pl[0][1])
+    for k in range(1, len(pl)):
+        hit = p == k
+        ia = hit.select(fx.Int32(pl[k][0]), ia)
+        ib = hit.select(fx.Int32(pl[k][1]), ib)
+    return ia, ib
+
+
+@traced
+def stage_gram(c, task):
+    """This slice's source-pair dot products of every token (the Gram matrix's off-diagonal) -> GRAM, from the
+    LDS ``vals``: the sum of squares of the mix comes from them (``stage_gate``), no second exchange."""
+    s, ns, tid, lane = c["S"], c["NS"], c["tid"], c["lane"]
+    pl = pair_list(ns)
+    npair = len(pl)
+    ngroups = s * npair
+    per = THREADS // QC
+    q = tid % QC
+    for rr in range_constexpr((ngroups + per - 1) // per):
+        gi = tid // QC + per * rr
+        gc = fx.min(gi, ngroups - 1)
+        t = gc // npair
+        pa, pb = pick_pair(gc % npair, ns)
+        va = [fx.ptr_load(c["vals"] + ((t * ns + pa) * COLS + q * 4 + j)) for j in range(4)]
+        vb = [fx.ptr_load(c["vals"] + ((t * ns + pb) * COLS + q * 4 + j)) for j in range(4)]
+        d = va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2] + va[3] * vb[3]
+        d = butterfly(d, (16, 8, 4, 2, 1))
+        if (gi < ngroups) & (lane % 32 == 0):
+            c["put"](c["gram"], (task * s + t) * npair + gc % npair, d)
+    gpu.barrier()
+
+
 @traced
 def stage_gate(c, t):
     """Token t: the 56 slices' partials -> source weights e_s and their sum."""
@@ -239,6 +279,16 @@ def stage_gate(c, t):
             [(c["part"], (((g * GSL + k) * s + t) * ns) * 2 + q, 1) for k in range(GSL)]
         )
         fx.ptr_store(sum_polled(vals), red + (g * nq + q))
+    npair = ns * (ns - 1) // 2
+    if const_expr(c["use_gram"]):
+        gt = tid - 8 * nq
+        if (gt >= 0) & (gt < 8 * npair):
+            g = gt // npair
+            p = gt % npair
+            gv = c["poll"](
+                [(c["gram"], ((g * GSL + k) * s + t) * npair + p, 1) for k in range(GSL)]
+            )
+            fx.ptr_store(sum_polled(gv), red + (512 + g * npair + p))
     gpu.barrier()
     if wave == 0:
         src = fx.min(lane, ns - 1)
@@ -257,6 +307,19 @@ def stage_gate(c, t):
             c["put"](c["wgt"], t * (ns + 1) + lane, ex)
         if lane == 0:
             c["put"](c["wgt"], t * (ns + 1) + ns, den)
+        if const_expr(c["use_gram"]):
+            # |sum_s e_s v_s|^2 = sum_s e_s^2 G_ss + 2 sum_{a<b} e_a e_b G_ab
+            pa, pb = pick_pair(fx.min(lane, npair - 1), ns)
+            gab = fx.ptr_load(red + (512 + fx.min(lane, npair - 1)))
+            for g in range_constexpr(1, 8):
+                gab = gab + fx.ptr_load(red + (512 + g * npair + fx.min(lane, npair - 1)))
+            ea = fx.Float32(lane_gather(ex.bitcast(fx.Int32), pa).bitcast(fx.Float32))
+            eb = fx.Float32(lane_gather(ex.bitcast(fx.Int32), pb).bitcast(fx.Float32))
+            term = (lane < npair).select(fx.Float32(2.0) * ea * eb * gab, fx.Float32(0.0))
+            term = term + ex * ex * sq
+            tot = butterfly(term, (32, 16, 8, 4, 2, 1))
+            if lane == 0:
+                c["put"](c["wgt"], s * (ns + 1) + t, tot / (den * den))
     gpu.barrier()
 
 
@@ -284,7 +347,7 @@ def stage_mix(c, task):
     s, ns, tid, lane, red = c["S"], c["NS"], c["tid"], c["lane"], c["red"]
     a = c["args"]
     c0 = task * COLS
-    nw = s * (ns + 1)
+    nw = s * (ns + 1) + (s if c["use_gram"] else 0)
     assert nw <= MSQ0 and 8 * s <= THREADS
     # read here, not in a traced branch (a method call on ``c`` there makes
     # FlyDSL carry ``c`` as branch state)
@@ -316,21 +379,26 @@ def stage_mix(c, task):
             + mixed[3] * mixed[3]
         )
         sq = butterfly(sq, (16, 8, 4, 2, 1))
-        if mine & (lane % 32 == 0):
-            c["put"](c["msq"], task * s + t, sq)
+        if const_expr(not c["use_gram"]):
+            if mine & (lane % 32 == 0):
+                c["put"](c["msq"], task * s + t, sq)
         rounds.append((mine, t, mixed))
     gpu.barrier()
-    if tid < 8 * s:
-        g = tid // s
-        tt = tid % s
-        vals = c["poll"]([(c["msq"], (g * GSL + k) * s + tt, 1) for k in range(GSL)])
-        fx.ptr_store(sum_polled(vals), red + (MSQ0 + g * s + tt))
-    gpu.barrier()
+    if const_expr(not c["use_gram"]):
+        if tid < 8 * s:
+            g = tid // s
+            tt = tid % s
+            vals = c["poll"]([(c["msq"], (g * GSL + k) * s + tt, 1) for k in range(GSL)])
+            fx.ptr_store(sum_polled(vals), red + (MSQ0 + g * s + tt))
+        gpu.barrier()
     wn = ld_bf4(a["in_nw"], c0 + cc)
     for mine, t, mixed in rounds:
-        tot = fx.ptr_load(red + (MSQ0 + t))
-        for g in range_constexpr(1, 8):
-            tot = tot + fx.ptr_load(red + (MSQ0 + g * s + t))
+        if const_expr(c["use_gram"]):
+            tot = fx.ptr_load(red + (s * (ns + 1) + t))
+        else:
+            tot = fx.ptr_load(red + (MSQ0 + t))
+            for g in range_constexpr(1, 8):
+                tot = tot + fx.ptr_load(red + (MSQ0 + g * s + t))
         r = hw_rsq(tot * fx.Float32(1.0 / HIDDEN) + fx.Float32(c["out_eps"]))
         xw = bf4_words([mixed[j] * r * wn[j] for j in range(4)])
         if mine:
