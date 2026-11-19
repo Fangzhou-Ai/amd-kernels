@@ -666,7 +666,7 @@ def kda_inputs(c, k, req, h):
     got = c["poll"](specs)
     for i in range_constexpr(nfa):
         if tid + THREADS * i < n_fa:
-            fx.ptr_store(f32_of(got[L + i][0]), c["fa"] + fa_at[i])
+            fx.ptr_store(fx.BFloat16(f32_of(got[L + i][0])), c["fa"] + fa_at[i])
     if tid < L:
         fx.ptr_store(sigmoid(f32_of(got[L + nfa][0])), c["beta"] + tid)
     xv = [f32_of(got[j][0]) for j in range(L)]
@@ -695,8 +695,9 @@ def kda_gates(c, k, req, h):
     stamp(c["on"], c["tls"], tid, 17)
     for q in range_constexpr(4):
         kb = (lane // 16) * 32 + 8 * q
-        xs = [fx.ptr_load(c["fa"] + (t * HD + kb + e)) for e in range(8)]
-        xb = fx.Vector.from_elements(xs, fx.Float32).to(fx.BFloat16)
+        xb = fx.Vector(
+            fx.ptr_load(c["fa"] + (t * HD + kb), result_type=fx.Vector.make_type(8, fx.BFloat16))
+        )
         acc = mfma_bf16(k["fb"][q].bitcast(fx.BFloat16), xb, acc)
     for i in range_constexpr(4):
         kk = wave * 16 + 4 * (lane // 16) + i
@@ -745,16 +746,16 @@ def kda_recur(c, k, req, h, ch):
         o = bf16r(sum32_dpp(sum4(stv, qv[j])))
         o = live0.select(o, fx.Float32(0.0))
         slot = k["slots"][j]
-        if (slot > 0) & live0:
-            dst = rsrc(a["rstate"] + fx.Int64(slot) * fx.Int64(a["rs_seq"]) * 4)
-            bo.buffer_store(
-                fx.Vector.from_elements(stv, fx.Float32),
-                dst,
-                k["head_off"],
-                cache_modifier=c["st_cm"],
-            )
-        if lane % 32 == 0:
-            fx.ptr_store(o, c["ol"] + (j * VCH + v))
+        # branch-free: a null / dead slot's store lands past the bounded descriptor, and every lane of a
+        # row's 32 holds the same o
+        bo.buffer_store(
+            fx.Vector.from_elements(stv, fx.Float32),
+            rsrc(a["rstate"] + fx.Int64(fx.max(slot, 0)) * fx.Int64(a["rs_seq"]) * 4, NH * HD * HD * 4),
+            k["head_off"],
+            mask=(slot > 0) & live0,
+            cache_modifier=c["st_cm"],
+        )
+        fx.ptr_store(o, c["ol"] + (j * VCH + v))
         if const_expr(j == 0):
             stamp(c["on"], c["tls"], tid, 13)
     stamp(c["on"], c["tls"], tid, 14)
@@ -835,7 +836,7 @@ def build(key: KdaPreBuild):
 
     @fx.struct
     class KdaLds:
-        fa: fx.Array[fx.Float32, L * HD, 16]
+        fa: fx.Array[fx.BFloat16, L * HD, 16]
         qkl: fx.Array[fx.Float32, L * 2 * HD, 16]
         decay: fx.Array[fx.Float32, L * HD, 16]
         vloc: fx.Array[fx.Float32, L * VCH, 16]
