@@ -138,10 +138,9 @@ def compile_threshold(NT=512, CAP=6144):
                 return b + (b >> 6)
 
             def scan_hist(need_):
-                vals = [I(smem.hist.ptr[(63 - lane) * 65 + t]) for t in range_constexpr(64)]
-                ssum = vals[0]
+                ssum = I(smem.hist.ptr[(63 - lane) * 65])
                 for t in range_constexpr(1, 64):
-                    ssum = ssum + vals[t]
+                    ssum = ssum + I(smem.hist.ptr[(63 - lane) * 65 + t])
                 incl = _wave_scan(ssum, "add")
                 hit = _ballot(incl >= need_)
                 lstar = I(fx.math.cttz(hit).to(I))
@@ -275,7 +274,7 @@ def compile_threshold(NT=512, CAP=6144):
 # K2: stream the window, keep every value >= threshold in an index-ascending list; retry with a corrected threshold
 # =====================================================================================================================
 @launcher
-def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
+def compile_stream(NT=512, V=4, CAP=6144, MARG=4000, NC_ST=2, stamps=0, ac=1, depth=1):
     NW = NT // 64
     CH = NT * 4 * V
     SW = V * 256
@@ -293,13 +292,15 @@ def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
 
     @flyc.kernel(known_block_size=[NT, 1, 1])
     def k2(arg_lg: fx.Int64, arg_ks: fx.Int64, arg_ke: fx.Int64, arg_meta: fx.Int64, arg_cnt: fx.Int64, arg_cand: fx.Int64,
-           i64_stride: fx.Int64, i32_cstride: fx.Int32):
+           i64_stride: fx.Int64, i32_cstride: fx.Int32, arg_order: fx.Int64):
         tx = fx.thread_idx.x
         lane = tx % 64
         wave = _uniform(tx // 64)
         g = lane // 16
         l16 = lane % 16
         row = I(fx.block_idx.x)
+        if arg_order != I64(0):
+            row = _uniform(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_order), row, vec_width=1, dtype=I))
         smem = fx.SharedAllocator().allocate(Shared).peek()
 
         ks_r = buffer_ops.create_buffer_resource_from_addr(arg_ks)
@@ -333,7 +334,9 @@ def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
                                                   cache_modifier=NC_ST, mask=ok))
             return out
 
-        first = load_chunk(I(0), nit > 0)
+        first = []
+        for d_ in range_constexpr(depth):
+            first = first + load_chunk(I(d_), nit > d_)
 
         def lsr(x, s):
             return (s == 0).select(x, (x >> s) & ((I(1) << (I(32) - s)) - 1))
@@ -342,10 +345,9 @@ def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
             return b + (b >> 6)
 
         def scan_hist(need_):
-            vals = [I(smem.hist.ptr[(63 - lane) * 65 + t]) for t in range_constexpr(64)]
-            ssum = vals[0]
+            ssum = I(smem.hist.ptr[(63 - lane) * 65])
             for t in range_constexpr(1, 64):
-                ssum = ssum + vals[t]
+                ssum = ssum + I(smem.hist.ptr[(63 - lane) * 65 + t])
             incl = _wave_scan(ssum, "add")
             hit = _ballot(incl >= need_)
             lstar = I(fx.math.cttz(hit).to(I))
@@ -374,7 +376,7 @@ def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
             fx.gpu.barrier()
             return outs
 
-        def blk_sum_uniform(vals):
+        def blk_sumuniform(vals):
             for q in range_constexpr(len(vals)):
                 if lane == 0:
                     _sts(smem.wred, q * NW + wave, vals[q])
@@ -457,7 +459,7 @@ def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
             ta_c = _uniform(st[4])
             tc_c = _uniform(st[5])
             have_c = _uniform(st[6])
-            first_c = [st[7 + v] for v in range_constexpr(V)]
+            first_c = [st[7 + q] for q in range_constexpr(depth * V)]
             r_n = r_c
             done_n = done_c
             cnt_n = cnt_c
@@ -474,10 +476,10 @@ def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
                     thr, thr_a, thr_c = resample_thresholds(r_c)
                 for i, state in range(0, nit, 1, init=list(first_c) + [I(0), I(0), I(0)]):
                     cur = [fx.Vector(state[v]) for v in range_constexpr(V)]
-                    run0 = _uniform(state[V])
-                    na0 = _uniform(state[V + 1])
-                    nc0 = _uniform(state[V + 2])
-                    nxt = load_chunk(I(i) + 1, (I(i) + 1) < nit)
+                    run0 = _uniform(state[depth * V])
+                    na0 = _uniform(state[depth * V + 1])
+                    nc0 = _uniform(state[depth * V + 2])
+                    nxt = load_chunk(I(i) + depth, (I(i) + depth) < nit)
                     base = ks_al + I(i) * CH + wave * SW
                     hv, incls, tots = [], [], []
                     wtot = I(0)
@@ -493,8 +495,9 @@ def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
                             hh = (xv >= thr) & inr
                             hk.append(hh)
                             cl = cl + hh.select(I(1), I(0))
-                            ia = ia + _popc(_ballot((xv >= thr_a) & inr))
-                            ic = ic + _popc(_ballot((xv >= thr_c) & inr))
+                            if fx.const_expr(ac):
+                                ia = ia + _popc(_ballot((xv >= thr_a) & inr))
+                                ic = ic + _popc(_ballot((xv >= thr_c) & inr))
                         incl = _wave_scan(cl, "add")
                         tv = _readlane(incl, 63)
                         hv.append(hk)
@@ -521,11 +524,11 @@ def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
                             _sts(smem.lkey, wp, F(cur[v][k]).bitcast(I))
                             pos = pos + hv[v][k].select(I(1), I(0))
                         runv = runv + tots[v]
-                    res = yield [nxt[v] for v in range_constexpr(V)] + [run0 + itot, na0 + ia, nc0 + ic]
+                    res = yield [state[V + q] for q in range_constexpr((depth - 1) * V)] + [nxt[v] for v in range_constexpr(V)] + [run0 + itot, na0 + ia, nc0 + ic]
                 fx.gpu.barrier()
-                cnt_n = _uniform(res[V])
-                na_w, nc_w = res[V + 1], res[V + 2]
-                n_a, n_c = blk_sum_uniform([na_w, nc_w])
+                cnt_n = _uniform(res[depth * V])
+                na_w, nc_w = res[depth * V + 1], res[depth * V + 2]
+                n_a, n_c = blk_sumuniform([na_w, nc_w])
                 ok_n = exact | ((cnt_n >= K) & (cnt_n <= CAP))
                 done_n = ok_n.select(I(1), I(0))
                 # next pass when this one failed: a threshold whose exact count lies in [K, CAP] if one of the three does,
@@ -537,7 +540,9 @@ def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
                 ta_n = tm_n
                 tc_n = tm_n
                 r_n = fx.max(fx.min((r_c * TMID) // fx.max(cnt_n, I(1)), nv), I(1))
-                nf = load_chunk(I(0), (~ok_n) & (nit > 0))
+                nf = []
+                for d_ in range_constexpr(depth):
+                    nf = nf + load_chunk(I(d_), (~ok_n) & (nit > d_))
                 fx.gpu.barrier()
             att_res = yield [r_n, done_n, cnt_n, tm_n, ta_n, tc_n, have_n] + list(nf)
         count = _uniform(att_res[2])
@@ -554,8 +559,8 @@ def compile_stream(NT=512, V=4, CAP=6144, NC_ST=2):
 
     @flyc.jit
     def launch(arg_lg: fx.Int64, arg_ks: fx.Int64, arg_ke: fx.Int64, arg_meta: fx.Int64, arg_cnt: fx.Int64, arg_cand: fx.Int64,
-               i64_stride: fx.Int64, i32_cstride: fx.Int32, rows: fx.Int32, stream: fx.Stream):
-        k2(arg_lg, arg_ks, arg_ke, arg_meta, arg_cnt, arg_cand, i64_stride, i32_cstride).launch(
+               i64_stride: fx.Int64, i32_cstride: fx.Int32, arg_order: fx.Int64, rows: fx.Int32, stream: fx.Stream):
+        k2(arg_lg, arg_ks, arg_ke, arg_meta, arg_cnt, arg_cand, i64_stride, i32_cstride, arg_order).launch(
             grid=(I64(rows), 1, 1), block=(NT, 1, 1), stream=stream)
 
     return launch
@@ -623,10 +628,9 @@ def compile_select(NT=256, CAP=6144, POPMAX=64):
             fx.atomic_add(fx.add_offset(smem.hist.ptr, pad(idx)), I(1), syncscope="workgroup")
 
         def scan_hist(need_):
-            vals = [I(smem.hist.ptr[(63 - lane) * 65 + t]) for t in range_constexpr(64)]
-            ssum = vals[0]
+            ssum = I(smem.hist.ptr[(63 - lane) * 65])
             for t in range_constexpr(1, 64):
-                ssum = ssum + vals[t]
+                ssum = ssum + I(smem.hist.ptr[(63 - lane) * 65 + t])
             incl = _wave_scan(ssum, "add")
             hit = _ballot(incl >= need_)
             lstar = I(fx.math.cttz(hit).to(I))

@@ -57,6 +57,16 @@ def test_positions_outside_windows_are_ignored():
         assert torch.equal(run(dirty, ks, ke), want)
 
 
+def test_infinite_logits():
+    require_gfx950()
+    rows, width = 12, 30000
+    logits = make_logits("gauss", rows, width)
+    ks, ke = make_windows(rows, width, "causal")
+    logits[:, 100:140] = float("inf")  # 40 tied +inf
+    logits[:, 500:900] = -float("inf")
+    assert torch.equal(run(logits, ks, ke), reference.reference_topk(logits, ks, ke))
+
+
 def test_row_stride_larger_than_width():
     require_gfx950()
     rows, width = 12, 25000
@@ -64,6 +74,17 @@ def test_row_stride_larger_than_width():
     logits = wide[:, :width]
     ks, ke = make_windows(rows, width, "causal")
     assert torch.equal(run(logits, ks, ke), reference.reference_topk(logits, ks, ke))
+
+
+def test_row_order_does_not_change_the_result():
+    require_gfx950()
+    rows, width = 40, 40000
+    logits = make_logits("gauss", rows, width)
+    ks, ke = make_windows(rows, width, "requests")
+    order = torch.argsort(ke - ks, descending=True, stable=True).int()
+    out = torch.full((rows, 2048), -7, dtype=torch.int32, device="cuda")
+    host.topk_rows(logits, ks, ke, out, order)
+    assert torch.equal(out, reference.reference_topk(logits, ks, ke))
 
 
 def test_deterministic():

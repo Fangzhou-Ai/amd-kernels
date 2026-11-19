@@ -57,15 +57,18 @@ def _warm_inputs(mode, n, logits, ks, ke, out):
 
 
 @entry("indexer.mxfp4_prefill_topk_d128_h32_top2048", mode=_mode, sizes=_sizes, inputs=_warm_inputs)
-def topk_rows(logits: torch.Tensor, ks: torch.Tensor, ke: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+def topk_rows(logits: torch.Tensor, ks: torch.Tensor, ke: torch.Tensor, out: torch.Tensor, order: torch.Tensor | None = None) -> torch.Tensor:
     """Write the window-relative positions of every row's 2048 largest logits of ``[ks, ke)`` into ``out`` (int32 [rows, 2048]),
-    ascending, ties to the smaller position, -1 filling rows of fewer than 2048 keys."""
+    ascending, ties to the smaller position, -1 filling rows of fewer than 2048 keys. ``order`` (int32 [rows], optional) is the
+    order in which the streaming launch takes the rows, longest window first (``argsort(ke - ks, descending=True)``): it only
+    balances a chunk of requests of different lengths and never changes the result."""
     rows, width = logits.shape
     assert logits.dtype == torch.float32 and logits.stride(1) == 1 and logits.stride(0) % 4 == 0
     assert logits.data_ptr() % 16 == 0
     assert ks.dtype == ke.dtype == torch.int32 and ks.is_contiguous() and ke.is_contiguous()
     assert ks.shape == ke.shape == (rows,)
     assert out.dtype == torch.int32 and out.shape == (rows, TOPK) and out.stride(1) == 1
+    assert order is None or (order.dtype == torch.int32 and order.shape == (rows,) and order.is_contiguous())
     if rows == 0:
         return out
     cstride = min(CAP, width)
@@ -75,6 +78,6 @@ def topk_rows(logits: torch.Tensor, ks: torch.Tensor, ke: torch.Tensor, out: tor
     s = torch.cuda.current_stream()
     stride = logits.stride(0)
     _run_compiled(threshold, logits.data_ptr(), ks.data_ptr(), ke.data_ptr(), meta.data_ptr(), stride, rows, s)
-    _run_compiled(stream, logits.data_ptr(), ks.data_ptr(), ke.data_ptr(), meta.data_ptr(), cnt.data_ptr(), cand.data_ptr(), stride, cstride, rows, s)
+    _run_compiled(stream, logits.data_ptr(), ks.data_ptr(), ke.data_ptr(), meta.data_ptr(), cnt.data_ptr(), cand.data_ptr(), stride, cstride, 0 if order is None else order.data_ptr(), rows, s)
     _run_compiled(select, logits.data_ptr(), ks.data_ptr(), ke.data_ptr(), cnt.data_ptr(), cand.data_ptr(), out.data_ptr(), stride, cstride, out.stride(0), rows, s)
     return out
