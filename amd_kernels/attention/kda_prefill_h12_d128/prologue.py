@@ -62,8 +62,6 @@ R_KBT = R_X
 R_VBT = R_Y + 8192
 R_KD, R_KI = R_X, R_Y
 LDS_BYTES = R_TOTAL
-import os
-WPE = int(os.environ.get("K1_WPE", "2"))
 
 PAIRS = [(i, j) for i in range(4) for j in range(i + 1)]
 OFFD = [(1, 0), (2, 0), (2, 1), (3, 0), (3, 1), (3, 2)]
@@ -119,6 +117,7 @@ def stf(val, addr):
 
 def barrier():
     fx.gpu.barrier()
+    fx.rocdl.sched_barrier(0)
 
 
 def pack_bf16(vals):
@@ -129,7 +128,7 @@ def pack_bf16(vals):
 
 
 def pk_bf16(a, b):
-    """Two fp32 -> two bf16 in a dword (RNE) by inline asm: cheaper to schedule, invisible to the MFMA hazard recognizer."""
+    """Two fp32 -> two bf16 in a dword (RNE) by inline asm (cheaper to schedule than the compiler's conversion)."""
     return fx.Int32(fx.rocdl.cvt_pk_bf16_f32(fx.as_ir_value(fx.Float32(a)), fx.as_ir_value(fx.Float32(b))))
 
 
@@ -188,6 +187,13 @@ def sum16(v):
     return v
 
 
+def dot2(a, b, c):
+    """c + a.lo * b.lo + a.hi * b.hi for bf16 pairs in dwords (fp32 accumulate)."""
+    av = Vec.from_elements([fx.Int32(a)], fx.Int32).bitcast(fx.BFloat16)
+    bv = Vec.from_elements([fx.Int32(b)], fx.Int32).bitcast(fx.BFloat16)
+    return fx.Float32(fx.rocdl.fdot2_f32_bf16_(T.f32, raw(av), raw(bv), fx.as_ir_value(fx.Float32(c))))
+
+
 def mfma_bf16(a4, b4, acc):
     a = Vec(a4).bitcast(fx.BFloat16)
     b = Vec(b4).bitcast(fx.BFloat16)
@@ -218,12 +224,12 @@ def pack8(vals):
 
 
 @launcher
-def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
+def compile_prologue():
     @fx.struct
     class Shared:
         buf: fx.Array[fx.Uint8, LDS_BYTES, 16]
 
-    @flyc.kernel(name=f"kda_prefill_prologue_h12_d128_s{stage}_p{prof}_w{wpe}", known_block_size=[256, 1, 1])
+    @flyc.kernel(name="kda_prefill_prologue_h12_d128", known_block_size=[256, 1, 1])
     def kernel(
         arg_mixed: fx.Int64,
         i32_ldx: fx.Int32,
@@ -239,15 +245,11 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
         i32_cs_slot: fx.Int32,
         i32_cs_dim: fx.Int32,
         i32_cs_pos: fx.Int32,
-        arg_cu: fx.Int64,
-        arg_ci: fx.Int64,
-        arg_sidx: fx.Int64,
-        arg_hasinit: fx.Int64,
+        arg_tab: fx.Int64,
         arg_ws: fx.Int64,
         i32_nc: fx.Int32,
         f32_lb: fx.Float32,
         f32_scale: fx.Float32,
-        arg_prof: fx.Int64,
     ):
         smem = fx.SharedAllocator().allocate(Shared).peek()
         base = fx.Int32(fx.ptrtoint(smem.buf.ptr))
@@ -259,6 +261,7 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
         hf = lg // 2
         qq = 2 * (wave % 2) + (lg % 2)
         ks_t = wave // 2
+        role = (wave + fx.Int32(fx.block_idx.x)) % 4
         run = 8 * ks_t + 4 * hf + qq
         r0 = 4 * run
         cid = fx.Int32(fx.block_idx.x)
@@ -267,19 +270,12 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
         def sload(rsrc, off):
             return fx.Int32(buffer_ops.buffer_load(rsrc, off, vec_width=1, is_scalar=True))
 
-        cu_r = buffer_ops.create_buffer_resource_from_addr(arg_cu, num_records_bytes=fx.Int32(0x7FFFFFF0))
-        ci_r = buffer_ops.create_buffer_resource_from_addr(arg_ci, num_records_bytes=fx.Int32(0x7FFFFFF0))
-        sidx_r = buffer_ops.create_buffer_resource_from_addr(arg_sidx, num_records_bytes=fx.Int32(0x7FFFFFF0))
-        hi_r = buffer_ops.create_buffer_resource_from_addr(arg_hasinit, num_records_bytes=fx.Int32(0x7FFFFFF0))
-        n_seq = sload(ci_r, cid * 2)
-        ci_loc = sload(ci_r, cid * 2 + 1)
-        bos = sload(cu_r, n_seq)
-        tn = sload(cu_r, n_seq + 1) - bos
-        t0 = ci_loc * 64
+        tab_r = buffer_ops.create_buffer_resource_from_addr(arg_tab, num_records_bytes=fx.Int32(0x7FFFFFF0))
+        row = Vec(buffer_ops.buffer_load(tab_r, cid * 4, vec_width=4, is_scalar=True))
+        bos, tn, t0, enc = fx.Int32(row[0]), fx.Int32(row[1]), fx.Int32(row[2]), fx.Int32(row[3])
         rows = fx.min(fx.Int32(64), tn - t0)
-        slot = sload(sidx_r, n_seq)
-        hi_word = sload(hi_r, n_seq // 4)
-        has_init = ((hi_word >> ((n_seq % 4) * 8)) & 0xFF) != 0
+        slot = enc & 0x3FFFFFFF
+        has_init = (enc >> 30) == 0
         first = t0 == 0
 
         mr = buffer_ops.create_buffer_resource_from_addr(arg_mixed, num_records_bytes=i32_mixed_bytes)
@@ -291,14 +287,6 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
             arg_ws + fx.Int64(h * i32_nc + cid) * fx.Int64(RECORD_BYTES), num_records_bytes=RECORD_BYTES
         )
 
-        profr = buffer_ops.create_buffer_resource_from_addr(arg_prof, num_records_bytes=fx.Int32(0x7FFFFFF0))
-
-        def mark(i):
-            if prof:
-                ts = fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memtime", [], [], []))
-                buffer_ops.buffer_store(ts, profr, ((h * i32_nc + cid) * 4 + wave) * 16 + i, mask=lane == 0)
-
-        mark(0)
         # ---- conv history of the sequence's slot (chunk 0 only) -> LDS [band][pos][128]
         hit = tx < 144
         hb_i = tx // 48
@@ -323,16 +311,11 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
                 )
             return rowsv
 
-        def band_wts(band):
-            wts = []
-            for tap in range_constexpr(4):
-                for k in range_constexpr(2):
-                    wts.append(Vec(buffer_ops.buffer_load(cwr, (band * 4 + tap) * LP + h * D + cg * 8 + 4 * k, vec_width=4)))
-            return wts
+        def band_wts(band, half):
+            return [Vec(buffer_ops.buffer_load(cwr, (band * 4 + tap) * LP + h * D + cg * 8 + 4 * half, vec_width=4)) for tap in range_constexpr(4)]
 
         # ---- loads that start the HBM latency early: k band, gate, beta
         k_rows = band_rows(1)
-        k_wts = band_wts(1)
         dtr = buffer_ops.create_buffer_resource_from_addr(arg_dtb, num_records_bytes=LP * 4)
         dtb = []
         for k in range_constexpr(2):
@@ -385,7 +368,6 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
             for j in range_constexpr(4):
                 stf(betas[j], base + R_BETA + (r0 + j) * 4)
         barrier()
-        mark(1)
         glast = [ldf(base + R_GL + (cg * 8 + c) * 4) for c in range_constexpr(8)]
         gnb = ld4f(base + R_GN + ((run // 4) * D + cg * 8) * 4)
         gnb2 = ld4f(base + R_GN + ((run // 4) * D + cg * 8) * 4 + 16)
@@ -403,8 +385,9 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
             jb = (p == 0).select(fx.Int32(0), (p == 1).select(fx.Int32(0), (p == 2).select(fx.Int32(1), (p == 3).select(fx.Int32(0), (p == 4).select(fx.Int32(1), fx.Int32(2))))))
             stf(exp2(ldf(base + R_GN + (ib * D + c) * 4) - ldf(base + R_GN + (jb * D + c) * 4)), base + R_BR + (p * D + c) * 4)
 
-        def band_conv(band, rowsv, wts):
-            xs = []
+        def band_conv(band, rowsv):
+            """conv + silu of the thread's 4 tokens x 8 channels, as bf16 pairs [row][4]."""
+            words = []
             for j in range_constexpr(7):
                 v4 = [rowsv[j][k] for k in range_constexpr(4)]
                 if j < 3:
@@ -412,51 +395,62 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
                     pos = fx.min(fx.max(s + 3, fx.Int32(0)), fx.Int32(2))
                     hv4 = ld4i(base + R_HIST + (band * 3 + pos) * 256 + cg * 16)
                     v4 = [(s < 0).select(hv4[k], v4[k]) for k in range_constexpr(4)]
-                xs.append(unpack8(v4))
-            ys = []
-            for r in range_constexpr(4):
-                ys_pre = []
-                for c in range_constexpr(8):
-                    wk = [wts[tap * 2 + c // 4][c % 4] for tap in range_constexpr(4)]
-                    acc = xs[r][c] * wk[0]
-                    for tap in range_constexpr(1, 4):
-                        acc = fma(xs[r + tap][c], wk[tap], acc)
-                    ys_pre.append(acc * rcp(fx.Float32(1.0) + exp2(acc * fx.Float32(-LOG2E))))
-                ys.append(unpack8(pack8(ys_pre)))
-            return ys
+                words.append(v4)
+            yp = [[] for _ in range_constexpr(4)]
+            for half in range_constexpr(2):
+                wts = band_wts(band, half)
+                ypre = [[None] * 4 for _ in range_constexpr(4)]
+                for cc in range_constexpr(4):
+                    c = 4 * half + cc
+                    xc = [bf_hi(words[j][c // 2]) if c % 2 else bf_lo(words[j][c // 2]) for j in range_constexpr(7)]
+                    for r in range_constexpr(4):
+                        acc = xc[r] * wts[0][cc]
+                        for tap in range_constexpr(1, 4):
+                            acc = fma(xc[r + tap], wts[tap][cc], acc)
+                        ypre[r][cc] = acc * rcp(fx.Float32(1.0) + exp2(acc * fx.Float32(-LOG2E)))
+                for r in range_constexpr(4):
+                    yp[r] += pack_bf16(ypre[r])
+            return yp
 
-        def row_scale(ys):
+        def row_scale(yp):
             out = []
             for r in range_constexpr(4):
                 ss = fx.Float32(0.0)
-                for c in range_constexpr(8):
-                    ss = fma(ys[r][c], ys[r][c], ss)
+                for w in yp[r]:
+                    ss = dot2(w, w, ss)
                 out.append(((r0 + r) < rows).select(rsqrt(sum16(ss) + EPS_QK), fx.Float32(0.0)))
             return out
+
+        def unp(yp_row):
+            return unpack8(yp_row)
 
         def tile_store(res, vals_per_row):
             for r in range_constexpr(4):
                 st4(pack8(vals_per_row[r]), base + res + (r0 + r) * PITCH_T + cg * 16, fx.Int32)
 
         # ---- k band
-        ys = band_conv(1, k_rows, k_wts)
-        rk = row_scale(ys)
-        kd, ki, kg, kb = [], [], [], []
-        for r in range_constexpr(4):
-            kn = [ys[r][c] * rk[r] for c in range_constexpr(8)]
-            kd.append([kn[c] * exp2(g[r][c] - gn[c]) for c in range_constexpr(8)])
-            ki.append([kn[c] * exp2(gn[c] - g[r][c]) for c in range_constexpr(8)])
-            kg.append([kn[c] * exp2(fx.min(glast[c] - g[r][c], fx.Float32(0.0))) for c in range_constexpr(8)])
-            kb.append([kn[c] * betas[r] * exp2(g[r][c]) for c in range_constexpr(8)])
-        tile_store(R_KD, kd)
-        tile_store(R_KI, ki)
-        kb_pk = [[pk_bf16(kb[0][c], kb[1][c]), pk_bf16(kb[2][c], kb[3][c])] for c in range_constexpr(8)]
+        yp = band_conv(1, k_rows)
+        rk = row_scale(yp)
+        kg_pairs, kb_pairs = [], []
+        for rp in range_constexpr(2):
+            kgv, kbv = [], []
+            for rr in range_constexpr(2):
+                r = 2 * rp + rr
+                yv = unp(yp[r])
+                kn = [yv[c] * rk[r] for c in range_constexpr(8)]
+                st4(pack8([kn[c] * exp2(g[r][c] - gn[c]) for c in range_constexpr(8)]), base + R_KD + (r0 + r) * PITCH_T + cg * 16, fx.Int32)
+                st4(pack8([kn[c] * exp2(gn[c] - g[r][c]) for c in range_constexpr(8)]), base + R_KI + (r0 + r) * PITCH_T + cg * 16, fx.Int32)
+                kgv.append([kn[c] * exp2(fx.min(glast[c] - g[r][c], fx.Float32(0.0))) for c in range_constexpr(8)])
+                kbv.append([kn[c] * betas[r] * exp2(g[r][c]) for c in range_constexpr(8)])
+            kg_pairs.append([pk_bf16(kgv[0][c], kgv[1][c]) for c in range_constexpr(8)])
+            kb_pairs.append([pk_bf16(kbv[0][c], kbv[1][c]) for c in range_constexpr(8)])
+        kb_pk = [[kb_pairs[0][c], kb_pairs[1][c]] for c in range_constexpr(8)]
 
         # kg straight to the workspace: fragment (mt = cg // 2, ks_t), lane qq * 16 + i, slot half hf
         for pp in range_constexpr(4):
             c = 2 * pp
-            a2 = [pk_bf16(kg[0][c], kg[1][c]), pk_bf16(kg[2][c], kg[3][c])]
-            b2 = [pk_bf16(kg[0][c + 1], kg[1][c + 1]), pk_bf16(kg[2][c + 1], kg[3][c + 1])]
+            a2 = [kg_pairs[0][c], kg_pairs[1][c]]
+            b2 = [kg_pairs[0][c + 1], kg_pairs[1][c + 1]]
             sw = [swap32(a2[d], b2[d]) for d in range_constexpr(2)]
             is0 = hf == 0
             recv = [is0.select(sw[d][1], sw[d][0]) for d in range_constexpr(2)]
@@ -468,12 +462,8 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
             frag = ((cg // 2) * 2 + ks_t) * 64 + qq * 16 + i_ch
             buffer_ops.buffer_store(Vec.from_elements(lo + hi_, fx.Int32), wsr, (REC_KGT + frag * 16) // 4)
 
-        if stage < 0:
-            return
 
-        mark(2)
         # ---- loads of the q and v bands issued ahead of the Akk matrix phase
-        q_rows = band_rows(0)
 
         barrier()
 
@@ -494,24 +484,26 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
             bs = [b0[k] for k in range_constexpr(4)] + [b1[k] for k in range_constexpr(4)]
             return Vec.from_elements(pack_bf16([vals[k] * bs[k] for k in range_constexpr(8)]), fx.Int32)
 
-        def pair_acc(ib, jb, qd_res):
-            acc = Vec.filled(4, 0.0, fx.Float32)
+        def pair_accs(pairs, qd_res):
+            """Accumulators of several block pairs, their MFMA chains interleaved."""
+            accs = [Vec.filled(4, 0.0, fx.Float32) for _ in pairs]
             for ks in range_constexpr(4):
-                a = rd_t(R_KI, 16 * jb + cg, ks)
-                b = rd_t(qd_res, 16 * ib + cg, ks)
-                if ib != jb:
-                    b = scale_frag(b, OFFD.index((ib, jb)), ks)
-                acc = mfma_bf16(a, b, acc)
-            return acc
+                for n, (ib, jb) in enumerate(pairs):
+                    a = rd_t(R_KI, 16 * jb + cg, ks)
+                    b = rd_t(qd_res, 16 * ib + cg, ks)
+                    if ib != jb:
+                        b = scale_frag(b, OFFD.index((ib, jb)), ks)
+                    accs[n] = mfma_bf16(a, b, accs[n])
+            return accs
 
-        mark(3)
         zero = fx.Float32(0.0)
         # Akk -> L (fp32 blocks)
         for w_i in range_constexpr(4):
-            if wave == w_i:
-                for pi in range_constexpr(w_i, 10, 4):
+            if role == w_i:
+                mine = list(range(w_i, 10, 4))
+                accs_all = pair_accs([PAIRS[pi] for pi in mine], R_KD)
+                for pi, acc in zip(mine, accs_all):
                     ib, jb = PAIRS[pi]
-                    acc = pair_acc(ib, jb, R_KD)
                     bt = ldf(base + R_BETA + (16 * ib + cg) * 4)
                     outv = []
                     for e in range_constexpr(4):
@@ -522,21 +514,17 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
                     st4(outv, base + R_L + pi * 1024 + (cg * 16 + 4 * lg) * 4, fx.Float32)
         barrier()
 
-        mark(4)
         # ---- q band and v band
-        ys = band_conv(0, q_rows, band_wts(0))
-        rq = row_scale(ys)
-        qd, qg = [], []
-        for r in range_constexpr(4):
-            qn = [ys[r][c] * rq[r] * f32_scale for c in range_constexpr(8)]
-            qd.append([qn[c] * exp2(g[r][c] - gn[c]) for c in range_constexpr(8)])
-            qg.append([qn[c] * exp2(g[r][c]) for c in range_constexpr(8)])
-        tile_store(R_KD, qd)
+        q_rows = band_rows(0)
+        yp = band_conv(0, q_rows)
+        rq = row_scale(yp)
         hc_ = (cg % 4) // 2
+        h0 = hc_ == 0
         for r in range_constexpr(4):
-            w4 = pack8(qg[r])
-            own = [hc_ == 0, ]
-            h0 = hc_ == 0
+            yv = unp(yp[r])
+            qn = [yv[c] * rq[r] * f32_scale for c in range_constexpr(8)]
+            st4(pack8([qn[c] * exp2(g[r][c] - gn[c]) for c in range_constexpr(8)]), base + R_KD + (r0 + r) * PITCH_T + cg * 16, fx.Int32)
+            w4 = pack8([qn[c] * exp2(g[r][c]) for c in range_constexpr(8)])
             send = [h0.select(w4[2], w4[0]), h0.select(w4[3], w4[1])]
             recv = [dpp_i(send[0], 0x4E), dpp_i(send[1], 0x4E)]
             mine = [h0.select(w4[0], w4[2]), h0.select(w4[1], w4[3])]
@@ -547,26 +535,29 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
             frag = ((run // 4) * 4 + cg // 4) * 64 + q_c * 16 + tok16
             buffer_ops.buffer_store(Vec.from_elements(lo + hi_, fx.Int32), wsr, (REC_QG + frag * 16) // 4)
         v_rows = band_rows(2)
-        ys = band_conv(2, v_rows, band_wts(2))
+        yp = band_conv(2, v_rows)
+        yv = [unp(yp[r]) for r in range_constexpr(4)]
         vb_pk = []
         for c in range_constexpr(8):
-            vb = [ys[r][c] * betas[r] for r in range_constexpr(4)]
+            vb = [yv[r][c] * betas[r] for r in range_constexpr(4)]
             vb_pk.append([pk_bf16(vb[0], vb[1]), pk_bf16(vb[2], vb[3])])
         barrier()
 
-        mark(5)
         # Aqk straight to the workspace
         groups = [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1), (3, 0), (3, 1)]
         for w_i in range_constexpr(4):
-            if wave == w_i:
-                for gi in range_constexpr(w_i, 8, 4):
+            if role == w_i:
+                gs = list(range(w_i, 8, 4))
+                need = [(groups[gi][0], jb) for gi in gs for jb in range(2 * groups[gi][1], 2 * groups[gi][1] + 2) if jb <= groups[gi][0]]
+                accd = dict(zip(need, pair_accs(need, R_KD)))
+                for gi in gs:
                     ib, ks2 = groups[gi]
                     tiles = []
-                    for jb in range_constexpr(2 * ks2, 2 * ks2 + 2):
+                    for jb in range(2 * ks2, 2 * ks2 + 2):
                         if jb > ib:
                             tiles.append([zero] * 4)
                         else:
-                            acc = pair_acc(ib, jb, R_KD)
+                            acc = accd[(ib, jb)]
                             vals = [acc[e] for e in range_constexpr(4)]
                             if ib == jb:
                                 vals = [(4 * lg + e <= cg).select(vals[e], zero) for e in range_constexpr(4)]
@@ -575,12 +566,11 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
                     buffer_ops.buffer_store(Vec.from_elements(words, fx.Int32), wsr, (REC_AQK + ((ib * 2 + ks2) * 64 + lane) * 16) // 4)
         barrier()
 
-        mark(6)
         # ---- (I + L)^-1: diagonal blocks by forward substitution (wave 0, one block per 16-lane group)
         def lblk(i, j):
             return i * (i + 1) // 2 + j
 
-        if wave == 0:
+        if role == 0:
             lb_addr = base + R_L + (lg * (lg + 1) // 2 + lg) * 1024
             xs = []
             for i in range_constexpr(16):
@@ -601,8 +591,6 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
             for i in range_constexpr(16):
                 stf(xs[i], ai_addr + (i * 16 + cg) * 4)
         barrier()
-
-        mark(7)
         def mm_acc(a_addr_fn, b_addr_fn, acc):
             for kk in range_constexpr(0, 16, 4):
                 acc = mfma_f32(ldf(a_addr_fn(kk)), ldf(b_addr_fn(kk)), acc)
@@ -611,7 +599,7 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
         levels = [[(1, 0), (2, 1), (3, 2)], [(2, 0), (3, 1)], [(3, 0)]]
         for lv in range_constexpr(3):
             for w_i in range_constexpr(len(levels[lv])):
-                if wave == w_i:
+                if role == w_i:
                     i_b, j_b = levels[lv][w_i]
                     acc = Vec.filled(4, 0.0, fx.Float32)
                     for m in range_constexpr(j_b, i_b):
@@ -631,8 +619,6 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
                     for e in range_constexpr(4):
                         stf(zero - r_[e], base + R_AINV + lblk(i_b, j_b) * 1024 + ((4 * lg + e) * 16 + cg) * 4)
             barrier()
-
-        mark(8)
         # A as bf16 blocks [ib][jb][16][16], zero above the diagonal
         jb_t = tx % 4
         r_t = (tx // 4) % 16
@@ -655,7 +641,6 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
             st2i(vb_pk[c], base + R_VBT + (cg * 8 + c) * PITCH_C + r0 * 2)
         barrier()
 
-        mark(9)
         def rd_a(ib, ks):
             a = base + R_A + ((ib * 4 + 2 * ks) * 16 + cg) * 32 + 8 * lg
             x, y = ld2i(a), ld2i(a + 512)
@@ -668,24 +653,23 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
             for kt in range_constexpr(2 * 0, 2):
                 acc = Vec.filled(4, 0.0, fx.Float32)
                 for ks in ksl:
-                    a = rd_c(R_KBT, 16 * (2 * wave + kt) + cg, ks)
+                    a = rd_c(R_KBT, 16 * (2 * role + kt) + cg, ks)
                     b = rd_a(nt, ks)
                     acc = mfma_bf16(a, b, acc)
                 accs.append(acc)
             words = pack_bf16([zero - accs[0][e] for e in range_constexpr(4)] + [zero - accs[1][e] for e in range_constexpr(4)])
-            buffer_ops.buffer_store(Vec.from_elements(words, fx.Int32), wsr, (REC_W + ((nt * 4 + wave) * 64 + lane) * 16) // 4)
+            buffer_ops.buffer_store(Vec.from_elements(words, fx.Int32), wsr, (REC_W + ((nt * 4 + role) * 64 + lane) * 16) // 4)
         # u = A (beta v): wave w owns v tiles 2w, 2w + 1
         for vt2 in range_constexpr(2):
             for mt in range_constexpr(4):
                 acc = Vec.filled(4, 0.0, fx.Float32)
                 for ks in (range(2) if mt >= 2 else range(1)):
                     a = rd_a(mt, ks)
-                    b = rd_c(R_VBT, 16 * (2 * wave + vt2) + cg, ks)
+                    b = rd_c(R_VBT, 16 * (2 * role + vt2) + cg, ks)
                     acc = mfma_bf16(a, b, acc)
                 words = pack_bf16([acc[e] for e in range_constexpr(4)])
-                buffer_ops.buffer_store(Vec.from_elements(words, fx.Int32), wsr, (REC_U + (((2 * wave + vt2) * 4 + mt) * 64 + lane) * 8) // 4)
+                buffer_ops.buffer_store(Vec.from_elements(words, fx.Int32), wsr, (REC_U + (((2 * role + vt2) * 4 + mt) * 64 + lane) * 8) // 4)
 
-        mark(10)
         # ---- roll the conv state: the last 3 raw inputs of the sequence (chunk 0 only; history is in LDS)
         if first:
             for it in range_constexpr(2):
@@ -704,7 +688,6 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
                         raw(val.to(fx.Int16)), csr, slot * i32_cs_slot + dim * i32_cs_dim + p * i32_cs_pos, mask=okc
                     )
 
-        mark(11)
 
     @flyc.jit
     def launch(
@@ -722,44 +705,49 @@ def compile_prologue(stage: int = 3, prof: int = 0, wpe: int = 0):
         i32_cs_slot: fx.Int32,
         i32_cs_dim: fx.Int32,
         i32_cs_pos: fx.Int32,
-        arg_cu: fx.Int64,
-        arg_ci: fx.Int64,
-        arg_sidx: fx.Int64,
-        arg_hasinit: fx.Int64,
+        arg_tab: fx.Int64,
         arg_ws: fx.Int64,
         i32_nc: fx.Int32,
         f32_lb: fx.Float32,
         f32_scale: fx.Float32,
-        arg_prof: fx.Int64,
         stream: fx.Stream,
     ):
         kernel(
             arg_mixed, i32_ldx, i32_mixed_bytes, arg_rawg, i32_ldg, arg_beta, i32_ldb, arg_alog, arg_dtb, arg_cw, arg_cs,
-            i32_cs_slot, i32_cs_dim, i32_cs_pos, arg_cu, arg_ci, arg_sidx, arg_hasinit, arg_ws, i32_nc, f32_lb, f32_scale, arg_prof,
-            **({"value_attrs": {"rocdl.waves_per_eu": wpe, "rocdl.flat_work_group_size": "256,256"}} if wpe else {}),
+            i32_cs_slot, i32_cs_dim, i32_cs_pos, arg_tab, arg_ws, i32_nc, f32_lb, f32_scale,
         ).launch(grid=(fx.Int64(i32_nc), NH, 1), block=(256, 1, 1), stream=stream)
 
     return launch
 
 
 @functools.cache
-def _launcher(stage, prof, wpe=WPE):
-    return compile_prologue(stage, prof, wpe)
+def _launcher():
+    return compile_prologue()
+
+
+def chunk_table(cu_seqlens, chunk_indices, state_indices, has_initial_state):
+    """int32 [Nc, 4] per-chunk rows (sequence start, length, chunk start, slot | no-initial-state << 30); once per step."""
+    seq = chunk_indices[:, 0].long()
+    bos = cu_seqlens[seq]
+    tn = cu_seqlens[seq + 1] - bos
+    enc = state_indices[seq] | ((~has_initial_state[seq]).to(torch.int32) << 30)
+    return torch.stack([bos, tn, chunk_indices[:, 1] * 64, enc], 1).to(torch.int32).contiguous()
 
 
 def prologue(mixed, raw_g, beta_logit, A_log, dt_bias, lower_bound, scale, conv_weight, conv_state, state_indices,
-             has_initial_state, cu_seqlens, chunk_indices, ws=None, stage=3, prof=None):
+             has_initial_state, cu_seqlens, chunk_indices, ws=None, table=None):
     """Workspace records [H, Nc, RECORD_BYTES] uint8 of the chunks of ``cu_seqlens``; rolls ``conv_state`` in place."""
     nc = chunk_indices.shape[0]
     if ws is None:
         ws = torch.empty(NH, nc, RECORD_BYTES, dtype=torch.uint8, device=mixed.device)
     cs = conv_state
+    if table is None:
+        table = chunk_table(cu_seqlens, chunk_indices, state_indices, has_initial_state)
     _run_compiled(
-        _launcher(stage, prof is not None),
+        _launcher(),
         mixed.data_ptr(), mixed.stride(0), mixed.shape[0] * mixed.stride(0) * 2,
         raw_g.data_ptr(), raw_g.stride(0) if raw_g.dim() == 2 else raw_g.stride(0), beta_logit.data_ptr(), beta_logit.stride(0),
         A_log.data_ptr(), dt_bias.data_ptr(), conv_weight.data_ptr(), cs.data_ptr(), cs.stride(0), cs.stride(1), cs.stride(2),
-        cu_seqlens.data_ptr(), chunk_indices.data_ptr(), state_indices.data_ptr(), has_initial_state.data_ptr(),
-        ws.data_ptr(), nc, float(lower_bound), float(scale), (prof if prof is not None else ws).data_ptr(), torch.cuda.current_stream(),
+        table.data_ptr(), ws.data_ptr(), nc, float(lower_bound), float(scale), torch.cuda.current_stream(),
     )
     return ws
