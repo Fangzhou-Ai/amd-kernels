@@ -36,6 +36,9 @@ def weights():
 def test_pack_is_a_permutation(weights):
     w, wp = weights(*SHAPES[0])
     assert torch.equal(unpack_weight(wp).view(torch.int16), w.view(torch.int16))
+    scratch = torch.empty_like(w)
+    assert unpack_weight(wp, scratch) is scratch
+    assert torch.equal(scratch.view(torch.int16), w.view(torch.int16))
 
 
 @pytest.mark.parametrize("shape", SHAPES, ids=lambda s: f"n{s[0]}_k{s[1]}")

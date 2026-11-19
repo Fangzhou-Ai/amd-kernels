@@ -39,10 +39,14 @@ def pack_weight(w: torch.Tensor) -> torch.Tensor:
     return w.view(n // 16, 16, k // 32, 4, 8).permute(0, 2, 3, 1, 4).contiguous().view(n, k)
 
 
-def unpack_weight(wp: torch.Tensor) -> torch.Tensor:
-    """The inverse of ``pack_weight``."""
+def unpack_weight(wp: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """The inverse of ``pack_weight`` (into ``out`` when given: a shared scratch for readers that need row-major)."""
     n, k = wp.shape
-    return wp.view(n // 16, k // 32, 4, 16, 8).permute(0, 3, 1, 2, 4).contiguous().view(n, k)
+    src = wp.view(n // 16, k // 32, 4, 16, 8).permute(0, 3, 1, 2, 4)
+    if out is None:
+        return src.contiguous().view(n, k)
+    out.view(n // 16, 16, k // 32, 4, 8).copy_(src)
+    return out
 
 
 def m_tier(m: int) -> int:
