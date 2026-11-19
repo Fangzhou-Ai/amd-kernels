@@ -32,6 +32,8 @@ One line per kernel package. Each package's README has what it does, its entry p
   MXFP8 shared expert.
 - [`moe/allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8`](moe/allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8/README.md):
   the MoE tail on eight ranks: latent all-reduce + RMSNorm + the hidden-shard up projection of the shared output.
+- [`moe/mxfp4_h3584_i3072_e896_top16`](moe/mxfp4_h3584_i3072_e896_top16/README.md): routed MXFP4 experts (A4W4, SiTUv2)
+  of one Kimi-K3.1 TP8 rank: activation quant, GEMM1 + GEMM2 in one launch, deterministic top-16 sum.
 
 ## Attention
 

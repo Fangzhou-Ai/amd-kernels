@@ -53,6 +53,7 @@ attention/nvfp4_sparse_prefill_gqa16_d128_p128_top16/test_compile.py	compile
 attention/swa_decode_fp8kv_gqa16_d128/test_compile.py	compile
 gemm/mxfp8_common/test_compile.py	compile
 indexer/indexer_nvfp4_d128_p128_top16/test_compile.py	compile
+moe/mxfp4_h3584_i3072_e896_top16/test_compile_entry.py	compile
 moe/mxfp4_h6144_i768_e128_top4/test_compile_entry.py	compile
 norm/gemma_add_rmsnorm_h6144/test_compile.py	compile
 sampling/markov_gumbel_fused_v163840_r512/test_compile.py	compile
@@ -62,6 +63,7 @@ sampling/markov_gumbel_fused_v163840_r512/test_compile.py	compile
 gemm/bf16_n50016_k6144/test_gemm.py	1		same
 gemm/bf16_skinny_common/test_linear.py	1		same
 gemm/bf16_skinny_common/test_graph.py	1		same
+moe/mxfp4_h3584_i3072_e896_top16/test_experts.py	1		same
 attention/nvfp4_sparse_decode_gqa16_d128_p128_top16/test_index_decode_ranks4.py	4
 sampling/batch_sharded_markov_v200064_h6144_r256_ranks4/test_batch_sharded.py	4
 decoder/dense_mxfp8_h6144_i3072_ranks4/test_decoder_ranks4.py	4
