@@ -64,9 +64,12 @@ def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
             if lane < 16:
                 store_lds(smem.st, wave * 16 + lane, I(0))
         stamp(13)
-        b = bid % i32_batch
-        c = (bid // i32_batch) % i32_nch_grid
-        tile = bid // (i32_batch * i32_nch_grid)
+        # sequence-major: a sequence's workgroups are consecutive, so sequences finish one after the other and the
+        # merge workgroups of the early ones run while the later ones are still scored
+        tiles_n = (i32_qlen + (rows - 1)) // rows
+        c = bid % i32_nch_grid
+        tile = (bid // i32_nch_grid) % tiles_n
+        b = bid // (i32_nch_grid * tiles_n)
         qsl = buffer_ops.create_buffer_resource_from_addr(arg_qsl)
         bt_head = buffer_ops.create_buffer_resource_from_addr(arg_bt, num_records_bytes=I64(i32_batch * i32_bt_stride) * 4)
         spec = [I(buffer_ops.buffer_load(bt_head, b * i32_bt_stride + c * (size // 64) + wave, vec_width=1, dtype=I, is_scalar=True))

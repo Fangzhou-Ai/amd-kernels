@@ -7,8 +7,8 @@ Every shape runs ``NIN`` distinct inputs (query rows and a key cache whose pages
 larger than the last-level cache) in one graph; median of 5 rounds x 5 replays, us per call. The roofline columns
 count the index-cache bytes the call must read (68 B a key, once a sequence: its rows share the keys), the query,
 weight and output bytes at the measured 6.4 TB/s HBM rate, the fp4 MFMA work (rows x keys x 32 heads x 128 x 2 flop at
-the measured 8.24 PFLOP/s), and the launch floor of the design: two graph kernels at 1.57 us each plus two cold
-dependent loads (245 ns). "ceiling" = max(bytes, flops) time + that floor; the last column is ceiling / measured.
+the measured 8.24 PFLOP/s), and the launch floor of the design: one graph kernel (1.57 us), one cross-workgroup
+flag (0.8 us) and two cold dependent loads (245 ns). "ceiling" = max(bytes, flops) time + that floor; the last column is ceiling / measured.
 Run: python3 benchmarks/indexer/mxfp4_paged_score_topk_d128_h32_top2048/benchmark_score_topk.py [--quick]
 """
 
@@ -22,7 +22,7 @@ from amd_kernels.indexer.mxfp4_paged_score_topk_d128_h32_top2048.reference impor
 NIN = 24
 HBM_TBS = 6.4
 FP4_PFLOPS = 8.24
-LAUNCH_FLOOR_US = 2 * 1.57 + 2 * 0.245
+LAUNCH_FLOOR_US = 1.57 + 0.8 + 2 * 0.245  # one graph launch, one cross-workgroup flag, two cold dependent loads
 SHAPES = [  # (sequences, rows a sequence, mean key count a sequence per rank)
     (3, 4, 8192),
     (3, 4, 32768),
@@ -130,7 +130,7 @@ def main():
         out_idx = torch.empty(rows, TOPK, dtype=torch.int32, device="cuda")
         out_val = torch.empty(rows, TOPK, dtype=torch.float32, device="cuda")
         stock = [stock_calls(s, out_idx, out_val) for s in sets]
-        host_calls = [lambda s=s: host._score_topk(**s, out_indices=out_idx, out_scores=out_val) for s in sets]
+        host_calls = [lambda s=s: host._score_topk(**s, out_indices=out_idx, out_scores=out_val, uniform=True) for s in sets]
         t_stock = timed(graph(lambda: [c() for c in stock]), NIN)
         t_fused = timed(graph(lambda: [c() for c in host_calls]), NIN)
         mean_keys = sum(keys) / NIN

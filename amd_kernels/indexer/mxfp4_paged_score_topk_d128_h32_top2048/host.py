@@ -17,7 +17,7 @@ from .geometry import (CHUNK_MAX, CHUNKS_TARGET, MAX_ROWS, NCH_MAX, QMAX, TOPK, 
 HEADS = 32
 _FORCE = None
 _NOMERGE = False  # experiments: launch the chunk workgroups only
-_WIDE_BATCH = 16  # sequences above which a workgroup scores all rows of a sequence
+_WIDE_BATCH = 4  # sequences above which a workgroup scores all rows of a sequence
 PAGE = 64
 
 
@@ -46,18 +46,18 @@ def _scratch(device: torch.device):
 
 
 def plan(max_query_len: int, batch: int) -> tuple[int, int]:
-    """``(rows, chunks)``: query rows of a sequence a chunk workgroup scores, and the chunks a sequence is cut into.
-    Few sequences leave workgroups idle, so a sequence is cut finely and its rows split; many sequences fill the
-    machine, so they take whole rows and big chunks."""
+    """``(rows, chunks)``: query rows of a sequence a chunk workgroup scores, and the chunks a sequence is cut into
+    (the chunk size follows from the longest row bound at launch). A workgroup is resident one or two a CU, so the
+    work is about ``batch * tiles * chunks`` workgroups: few sequences are cut finely into row pairs to fill the
+    machine, many take whole rows and as many chunks as fit one wave of workgroups (measured on cold pages)."""
     if not 1 <= max_query_len <= QMAX:
         raise ValueError(f"1 - {QMAX} query rows a sequence, got {max_query_len}")
     if _FORCE is not None:  # experiments: (rows, chunks)
         return min(max_query_len, _FORCE[0]), _FORCE[1]
     if batch <= 4:
         return min(max_query_len, 2), CHUNKS_TARGET
-    if batch <= _WIDE_BATCH:
-        return min(max_query_len, 2), 20
-    return max_query_len, 12
+    wave = 400 if max_query_len <= 4 else 240  # workgroups of one wave: whole rows of 5 and 6 fill a CU alone
+    return max_query_len, max(8, min(40, round(wave / batch)))
 
 
 @functools.cache

@@ -28,7 +28,8 @@ DEPTH = int(_os.environ.get('KK_DEPTH', '0'))  # 0: by the rows of the tile (1 f
 SPEC_SIZES = (512, 1024, 1536, 2048)
 import os
 SC = int(os.environ.get('KK_SC', '0'))
-TAG = f"s{SC}d{DEPTH}k{_os.environ.get('KK_SKIP', '0')}"  # experiment switches: part of the kernel names
+SB = int(os.environ.get('KK_SB', '0'))  # sched barriers between key tiles
+TAG = f"s{SC}b{SB}d{DEPTH}k{_os.environ.get('KK_SKIP', '0')}"  # experiment switches: part of the kernel names
 
 
 @dataclass
@@ -140,6 +141,8 @@ def score_chunk(sc, rows, cmax, num_waves, cb, cc, field, base, hook=None):
                         total = vop("v_mul_f32 $0, $1, $2", t, wv) if total is None else vop("v_fma_f32 $0, $1, $2, $3", t, wv, total)
                 sums.append(total)
             per_tile.append(sums)
+            if fx.const_expr(SB):
+                fx.rocdl.sched_barrier(0)
         key = (wave + k * num_waves) * 64 + g * 16 + l
         for r in range_constexpr(rows):
             p = [per_tile[nt][r] for nt in range(4)]
