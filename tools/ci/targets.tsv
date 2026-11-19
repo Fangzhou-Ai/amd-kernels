@@ -20,6 +20,9 @@ norm/allreduce_gemma_bf16_mxfp8_h6144	4
 embedding/vocab_gather_h6144	4
 gemm/bf16_concat_linear_n1536_k30720/test_gather.py	4
 gemm/bf16_concat_linear_n1536_k30720/test_compile.py	4
+gemm/bf16_linear_gather_n896_k35840_ranks8/test_context_proj.py	8
+gemm/bf16_linear_gather_n896_k35840_ranks8/test_reduce_gather.py	8
+gemm/bf16_linear_gather_n896_k35840_ranks8/test_warm_up.py	8
 embedding/vocab_gather_gemma_mxfp8_h6144	4
 collectives/pull_collectives_ranks4/test_norm_gather_h6144.py	4
 collectives/pull_collectives_ranks4/test_unpack_q2048_shuffled.py	4

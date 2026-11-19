@@ -21,6 +21,8 @@ One line per kernel package. Each package's README has what it does, its entry p
 - [`gemm/bf16_n200064_k256`](gemm/bf16_n200064_k256/README.md): the draft's Markov projection over selected rows.
 - [`gemm/bf16_concat_linear_n1536_k30720`](gemm/bf16_concat_linear_n1536_k30720/README.md): the draft's input fc over
   five taps, and the four-rank gather.
+- [`gemm/bf16_linear_gather_n896_k35840_ranks8`](gemm/bf16_linear_gather_n896_k35840_ranks8/README.md): the drafter's
+  context projection as an eight-rank N-shard GEMM with the column gather and RMSNorm in one launch.
 
 ## MoE
 
