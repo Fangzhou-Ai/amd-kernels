@@ -94,7 +94,7 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
     MT, KS, SHUF, FUSED, WN, NRW, AUX, TS, SKEL, MS = mt, ks, shuf, fused, wn, nrw, aux, ts, skel, ms
     # ``skel`` bits (floor measurements, results meaningless): 1 no LDS reads / MFMAs; 2 no top-16 after the slab gather;
     # 4 no activation DMAs; 8 no consumer; 16 no slab stores
-    assert not TS or not AUX  # ``ts``: the reverse_sorted argument is a buffer of per-workgroup realtime stamps (16 int64 each)
+    # ``ts``: the reverse_sorted (moe_buf with ``aux``) argument is a buffer of per-workgroup realtime stamps (16 int64 each)
     assert not AUX or FUSED
     WM = NWV // WN
     NF = WN * NRW  # weight fragments of the tile
@@ -125,12 +125,12 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
     class Shared:
         buf: fx.Array[fx.Uint8, LDS, 16]
         xch: fx.Array[fx.Int32, NWV * 64 * 8, 16]
-        ent: fx.Array[fx.Int32, NWV * LDS_WORDS["ent"], 16]
-        osig: fx.Array[fx.Float32, NWV * LDS_WORDS["osig"], 16]
-        oid: fx.Array[fx.Int32, NWV * LDS_WORDS["oid"], 16]
-        tie: fx.Array[fx.Int32, NWV * LDS_WORDS["tie"], 16]
-        tex: fx.Array[fx.Int32, NWV * LDS_WORDS["tex"], 16]
-        tmask: fx.Array[fx.Int32, NWV * LDS_WORDS["tmask"], 16]
+        ent: fx.Array[fx.Int32, LDS_WORDS["ent"], 16]
+        osig: fx.Array[fx.Float32, LDS_WORDS["osig"], 16]
+        oid: fx.Array[fx.Int32, LDS_WORDS["oid"], 16]
+        tie: fx.Array[fx.Int32, LDS_WORDS["tie"], 16]
+        tex: fx.Array[fx.Int32, LDS_WORDS["tex"], 16]
+        tmask: fx.Array[fx.Int32, LDS_WORDS["tmask"], 16]
 
     name = f"router_{'fused' if FUSED else 'partials'}_e896_h7168_mt{MT}_ks{KS}_w{WN}n{NRW}" + ("_aux" if AUX else "") + ("_ts" if TS else "") + (f"_skel{SKEL}" if SKEL else "") + ("_shuf" if SHUF else "_row")
 
@@ -164,7 +164,7 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
             if const_expr(TS):  # wave 0 / thread 0 of the workgroup: s_memrealtime (100 MHz) of event k_
                 fx.rocdl.sched_barrier(0)
                 t_ = fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], [])) if val is None else fx.Int64(val)
-                tsr = buffer_ops.create_buffer_resource_from_addr(arg_rs, num_records_bytes=4096 * 16 * 8)
+                tsr = buffer_ops.create_buffer_resource_from_addr(arg_mb if AUX else arg_rs, num_records_bytes=4096 * 16 * 8)
                 buffer_ops.buffer_store(t_, tsr, (bid * 16 + k_) * 8, offset_is_bytes=True, mask=tx == 0)
                 fx.rocdl.sched_barrier(0)
 
@@ -383,6 +383,7 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
                             if lane < TOPK:
                                 atomic_or(arg_aux + fx.Int64((out_id * MASK_WORDS + (tok >> 5)) * 4), fx.Int32(1) << (tok & 31))
                             fx.rocdl.s_waitcnt(vmcnt=0)
+                            stamp(13)
                             fres = buffer_ops.create_buffer_resource_from_addr(arg_aux + FLAG_BASE * 4, num_records_bytes=256 * 4)
                             buffer_ops.buffer_store(tag, fres, tok, mask=lane == 0, cache_modifier=SC1)
                             fx.rocdl.s_waitcnt(vmcnt=0)
@@ -394,9 +395,11 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
                                                                         mask=(lane + 64 * r) < i32_m, cache_modifier=SC1 | 1))
                                     done = done + _popcount(_ballot((f == tag) | ((lane + 64 * r) >= i32_m)))
                                 fx.rocdl.s_sleep(POLL_SLEEP)
+                            stamp(14)
                             mres = buffer_ops.create_buffer_resource_from_addr(arg_aux, num_records_bytes=FLAG_BASE * 4)
                             ac = aux_counts(mres, lane)
                             aux_publish_cum(ac, lds_base, wave, lane)
+                            stamp(15)
                             row = aux_pair_row(lds_base, wave, mres, out_id, tok)
                             cap_bytes = fx.Int64(i32_cap) * 4
                             sti_r = buffer_ops.create_buffer_resource_from_addr(arg_sti, num_records_bytes=cap_bytes)
@@ -408,6 +411,7 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
                             buffer_ops.buffer_store(out_w, sw_r, row, mask=keep, cache_modifier=SC1)
                             buffer_ops.buffer_store(tok, mi_r, row, mask=keep, cache_modifier=SC1)
                             buffer_ops.buffer_store(row, rs_r, tok * TOPK + lane, mask=keep, cache_modifier=SC1)
+                            stamp(5)
                             if tok == 0:
                                 sei_r = buffer_ops.create_buffer_resource_from_addr(arg_sei, num_records_bytes=cap_bytes)
                                 nv_r = buffer_ops.create_buffer_resource_from_addr(arg_nv, num_records_bytes=8)
