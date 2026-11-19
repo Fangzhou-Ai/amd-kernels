@@ -51,6 +51,7 @@ attention/kda_mono_decode_k1_h12_d128_ranks8/test_compile.py	1
 # compile tests: compile-only mode, sharing one card (the same FlyDSL compiles, kernel and cache key, as a normal run)
 attention/fp8_sparse_mla_decode_dcp8_h96_kv512_top2048/test_compile.py	compile
 attention/dsa_prologue_qkv_a_norm_kv_insert_h7168/test_compile.py	compile
+attention/kda_prefill_h12_d128/test_compile.py	compile
 attention/norm_rope_fp8_insert_d128_rot64/test_compile.py	compile
 attention/fp8_dense_mla_decode_h96_kv512/test_warm_up.py	compile
 attention/kda_decode_fb_gate_spec_h12_d128/test_compile.py	compile

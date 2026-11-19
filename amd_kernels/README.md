@@ -57,6 +57,9 @@ One line per kernel package. Each package's README has what it does, its entry p
 - [`attention/kda_decode_fb_gate_spec_h12_d128`](attention/kda_decode_fb_gate_spec_h12_d128/README.md): the linear-attention
   (KDA) spec-verify decode: f_b gate GEMM, conv + SiLU, delta rule with per-token state snapshots and the gated RMSNorm in
   one launch.
+- [`attention/kda_prefill_h12_d128`](attention/kda_prefill_h12_d128/README.md): the linear-attention (KDA) chunked prefill: conv +
+  SiLU, gate and q / k norms, the chunk-group delta-rule scan with fp32 recurrent states, the gated RMSNorm (one launch for short
+  batches, staged launches for long ones).
 - [`attention/swa_decode_fp8kv_gqa16_d128`](attention/swa_decode_fp8kv_gqa16_d128/README.md): the draft's
   sliding-window decode attention over an fp8 KV cache.
 - [`attention/fp8_sparse_mla_decode_dcp8_h96_kv512_top2048`](attention/fp8_sparse_mla_decode_dcp8_h96_kv512_top2048/README.md):
