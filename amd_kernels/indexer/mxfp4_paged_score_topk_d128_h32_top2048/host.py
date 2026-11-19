@@ -11,7 +11,7 @@ from amd_kernels.warm_up import entry
 from . import fused as _fused
 from . import lists as _lists
 from . import merge as _merge
-from .geometry import (CHUNK_MAX, CHUNKS_TARGET, MAX_ROWS, NCH_MAX, QMAX, TOPK, chunk_size, list_size, num_chunks,
+from .geometry import (CHUNK_MAX, CHUNKS_TARGET, pack_target, MAX_ROWS, NCH_MAX, QMAX, TOPK, chunk_size, list_size, num_chunks,
                        scratch_words, slot_size, COUNTER_GROUPS)
 
 HEADS = 32
@@ -49,26 +49,26 @@ def _scratch(device: torch.device):
     return _scratch_set(device, torch.cuda.current_stream(device).cuda_stream)
 
 
-def plan(max_query_len: int, batch: int) -> tuple[int, int]:
-    """``(rows, chunks)``: query rows of a sequence a chunk workgroup scores, and the chunks a sequence is cut into
-    (the chunk size follows from the longest row bound at launch). A workgroup is resident one or two a CU, so the
+def plan(max_query_len: int, batch: int) -> tuple[int, int, int]:
+    """``(rows, chunks, min chunk)``: query rows of a sequence a chunk workgroup scores, and the chunks a sequence is cut into
+    (the chunk size follows from the longest row bound at launch, none shorter than the minimum). A workgroup is resident one or two a CU, so the
     work is about ``batch * tiles * chunks`` workgroups: few sequences are cut finely into row pairs to fill the
     machine, many take whole rows (at most four, or threes) and about one wave of workgroups (cold-page sweeps)."""
     if not 1 <= max_query_len <= QMAX:
         raise ValueError(f"1 - {QMAX} query rows a sequence, got {max_query_len}")
     if _FORCE is not None:  # experiments: (rows, chunks)
-        return min(max_query_len, _FORCE[0]), _FORCE[1]
+        return min(max_query_len, _FORCE[0]), _FORCE[1], (_FORCE[2] if len(_FORCE) > 2 else 512)
     if batch <= 4:
-        return min(max_query_len, 2), CHUNKS_TARGET
+        return min(max_query_len, 2), CHUNKS_TARGET, 512
     if max_query_len >= 5:  # rows of 3 (two tiles): two workgroups a CU, a chunk selected on two waves
-        return 3, 12
-    return max_query_len, max(8, min(40, round(300 / batch)))  # whole rows, about one wave of workgroups
+        return 3, 12, 512
+    return max_query_len, max(8, min(40, round(300 / batch))), (1024 if batch > 16 else 512)  # whole rows, a wave of workgroups
 
 
 @functools.cache
-def grid_chunks(width: int, target: int) -> int:
+def grid_chunks(width: int, target: int, min_chunk: int = 512) -> int:
     """Chunks per sequence the chunk kernel's grid covers: the most any bound up to ``width`` keys gets."""
-    return max(num_chunks(n, chunk_size(n, target)) for n in range(64, width + 1, 64))
+    return max(num_chunks(n, chunk_size(n, target, min_chunk)) for n in range(64, width + 1, 64))
 
 
 def _run_compiled(exe, *args):
@@ -91,12 +91,12 @@ TIER_WIDTHS = (8192, 16384, 131072)  # the widest block table of each
 
 
 @functools.cache
-def merge_blocks(width: int, target: int) -> int:
+def merge_blocks(width: int, target: int, min_chunk: int = 512) -> int:
     """The merge variant (pool blocks of 2048 entries a thread holds) that takes the widest pool of up to ``width``
     keys a sequence cut into ``target`` chunks."""
     need = 1
     for n in range(64, width + 1, 64):
-        cb = chunk_size(n, target)
+        cb = chunk_size(n, target, min_chunk)
         nch = num_chunks(n, cb)
         need = max(need, -(-((nch - 1) * slot_size(list_size(nch, cb)) + cb) // 2048))
     return next(b for b in BLOCK_TIERS if b >= need)
@@ -140,8 +140,8 @@ def _score_topk(
     width = block_table.shape[1] * PAGE
     if width > NCH_MAX * CHUNK_MAX:
         raise ValueError(f"at most {NCH_MAX * CHUNK_MAX} keys a sequence, got a block table of {width}")
-    tile, target = plan(max_query_len, batch)
-    nch = grid_chunks(width, target)
+    tile, target, min_chunk = plan(max_query_len, batch)
+    nch = grid_chunks(width, target, min_chunk)
     keys, pos, meta, full, cnt = _scratch(cache.device)
     stream = torch.cuda.current_stream()
     common = (
@@ -152,19 +152,19 @@ def _score_topk(
     tiles = -(-max_query_len // tile)
     tiles = -(-max_query_len // tile)
     assert batch * tiles <= COUNTER_GROUPS
-    blocks = merge_blocks(width, target)
+    blocks = merge_blocks(width, target, min_chunk)
     dbg_ptr = dbg.data_ptr() if dbg is not None else 0
     if not split:
         _run_compiled(_fused_exe(tile, blocks, dbg is not None), query_start_loc.data_ptr(), block_table.data_ptr(),
                       row_ends.data_ptr(), q_payload.data_ptr(), weights.data_ptr(), q_scales.data_ptr(), payload.data_ptr(),
                       batch, nch, scales.data_ptr(), keys.data_ptr(), pos.data_ptr(), meta.data_ptr(), full.data_ptr(),
                       cnt.data_ptr(), out_indices.data_ptr(), out_scores.data_ptr(), block_table.stride(0),
-                      cache.stride(0), cache.shape[0] - 1, max_query_len, int(uniform), target, out_indices.stride(0),
+                      cache.stride(0), cache.shape[0] - 1, max_query_len, int(uniform), pack_target(target, min_chunk), out_indices.stride(0),
                       out_scores.stride(0), tiles, tile, batch * nch * tiles, dbg_ptr,
                       batch * nch * tiles + rows, stream)
         return
     _run_compiled(_chunk_exe(tile, dbg is not None), *common, keys.data_ptr(), pos.data_ptr(), meta.data_ptr(),
-                  full.data_ptr(), *geom, nch, max_query_len, target, int(uniform), dbg_ptr, batch * nch * tiles, stream)
+                  full.data_ptr(), *geom, nch, max_query_len, pack_target(target, min_chunk), int(uniform), dbg_ptr, batch * nch * tiles, stream)
     _run_compiled(_merge_exe(blocks, dbg is not None), query_start_loc.data_ptr(), keys.data_ptr(), pos.data_ptr(),
                   meta.data_ptr(), full.data_ptr(), out_indices.data_ptr(), out_scores.data_ptr(), batch,
                   out_indices.stride(0), out_scores.stride(0), max_query_len, int(uniform),

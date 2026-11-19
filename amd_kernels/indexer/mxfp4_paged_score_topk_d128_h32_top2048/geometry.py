@@ -35,10 +35,15 @@ SPREAD = 2688  # list keys a sequence's chunks share when its selected keys spre
 POOL_TARGET = POOL  # entries a pool is cut to
 
 
-def chunk_size(max_end: int, target: int = CHUNKS_TARGET) -> int:
+def pack_target(chunks: int, min_chunk: int = CHUNK_STEP) -> int:
+    """The launch's chunk plan as one int: about ``chunks`` a sequence, none shorter than ``min_chunk`` keys."""
+    return chunks | (min_chunk // CHUNK_STEP) << 16
+
+
+def chunk_size(max_end: int, target: int = CHUNKS_TARGET, min_chunk: int = CHUNK_STEP) -> int:
     per = -(-max_end // target)
     cb = -(-per // CHUNK_STEP) * CHUNK_STEP
-    return min(max(cb, CHUNK_STEP), CHUNK_MAX)
+    return min(max(cb, min_chunk, CHUNK_STEP), CHUNK_MAX)
 
 
 def num_chunks(max_end: int, cb: int) -> int:
@@ -54,10 +59,11 @@ def list_size(nch: int, cb: int) -> int:
     return min(max(floor, min(want, pool, LIST_MAX)), cb)
 
 
-def chunk_size_rt(max_end, target):
-    """``chunk_size`` on kernel values."""
+def chunk_size_rt(max_end, packed):
+    """``chunk_size`` on kernel values (``packed``: ``pack_target``)."""
+    target = packed & 0xFFFF
     cb = (((max_end + (target - 1)) // target + (CHUNK_STEP - 1)) // CHUNK_STEP) * CHUNK_STEP
-    return fx.min(fx.max(cb, I(CHUNK_STEP)), I(CHUNK_MAX))
+    return fx.min(fx.max(cb, (packed >> 16) * CHUNK_STEP), I(CHUNK_MAX))
 
 
 def list_size_rt(nch, cb):
