@@ -31,21 +31,23 @@ feeding QK and PV waves a tile apart, with a lazy online-softmax rescale.
 
 ## Performance
 
-Graph replay, inputs cold, min of 15 replays, us per launch, ~256 keys per row, 4 rows per request, MI355X. "skeleton" is
-the same launch grid doing only the index + KV gather DMA with its barriers (no math); roofline is bytes at 6.4 TB/s.
+Graph replay, inputs cold, min of 15 replays, us per launch, ~256 keys per row, 4 rows per request, MI355X. Triton is
+AITER's `sparse_mla_fwd` (vLLM's path), measured in the same harness. "skeleton" is the same launch grid doing only the
+index + KV gather DMA with its barriers (no math); roofline is bytes at 6.4 TB/s.
 
-| rows | v1 | v2 bf16 q | v2 q8 | skeleton | v2 q8 / skeleton | roofline |
-|---|---|---|---|---|---|---|
-| 12 | 16.2 | 11.7 | 11.6 | 7.1 | 61% | 0.7 |
-| 24 | 16.7 | 12.8 | 12.6 | 7.1 | 56% | 1.4 |
-| 40 | 17.2 | 13.6 | 13.6 | 7.2 | 53% | 2.4 |
-| 65 | 23.8 | 20.2 | 19.1 | 12.1 | 63% | 3.8 |
-| 80 | 25.2 | 20.6 | 19.6 | 11.7 | 60% | 4.7 |
-| 128 | 37.9 | 22.6 | 21.6 | 16.7 | 77% | 7.6 |
-| 192 | 54.0 | 38.4 | 36.8 | 23.5 | 64% | 11.4 |
+| rows | Triton | v1 | v2 bf16 q | v2 q8 | skeleton | v2 bf16 / skeleton | roofline |
+|---|---|---|---|---|---|---|---|
+| 12 | 17.6 | 16.3 | 11.8 | 11.6 | 7.1 | 60% | 0.7 |
+| 24 | 22.4 | 16.7 | 12.7 | 12.5 | 7.1 | 56% | 1.4 |
+| 40 | 25.4 | 17.3 | 13.6 | 13.5 | 7.3 | 54% | 2.4 |
+| 65 | 28.9 | 24.1 | 19.5 | 18.6 | 12.2 | 62% | 3.8 |
+| 80 | 29.7 | 24.8 | 19.8 | 19.2 | 11.9 | 60% | 4.7 |
+| 128 | 49.8 | 38.5 | 22.0 | 21.4 | 17.1 | 78% | 7.6 |
+| 192 | 66.7 | 54.3 | 37.8 | 36.4 | 24.0 | 63% | 11.3 |
 
-The 90%-of-skeleton bar is not met at any row count (53-77%); `analysis/kernels/sparse_mla_v2.md` has the stamps, PMC
-counters and attempts. Persistent CTAs and a cross-workgroup token split were not built.
+The 90%-of-skeleton bar is not met at any row count (54-78%); `analysis/kernels/sparse_mla_v2.md` has the stamps, PMC
+counters, ablations and attempts. q8 saves 0.1-1.6 us here but costs the q-gather kernel more than that to emit
+(+0.7 us at 12 rows, +8 us at 192), so bf16 q is the default. Persistent CTAs and a cross-workgroup token split were not built.
 
 ## Tests
 
