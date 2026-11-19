@@ -13,8 +13,9 @@ bit; `y` differs from the fp64 product only by sum order (cosine >= 0.99999). We
 
 ## Entry points
 - `bf16_latent_down_mxfp4_quant_k7168_n3584`: the projection and quant of any row count, graph-safe, no host sync; an
-  `amd_kernels.warm_up` entry (the first call of each mode, layout x bf16 output, compiles its 12 row tiles). One call
-  at a time per stream (partial slabs and tile tickets live in a per-stream workspace).
+  `amd_kernels.warm_up` entry (the first call of each mode, layout x bf16 output, compiles its 12 row tiles; the first
+  call on a device also runs a placement probe, `xcc_probe`). One call at a time per stream (partial slabs and tile
+  counters live in a per-stream workspace).
 - `shuffle_weight`, `shuffle_weight_` (in place), `unshuffle_weight`: the `shuf` layout.
 - `supports`: whether a weight is the bf16 contiguous [3584, 7168] one and there is no bias.
 
@@ -22,21 +23,22 @@ bit; `y` differs from the fp64 product only by sum order (cosine >= 0.99999). We
 
 ## Performance
 One MI355X, exclusive GPU, graph replay of 12 calls over 12 distinct weight copies (617 MB > the MALL) and activation sets,
-median us. Stock = vLLM `rocm_unquantized_gemm_impl` (VLLM_ROCM_USE_AITER=1: aiter tuned hgemm) + aiter
+min of 15 rounds, us. Stock = vLLM `rocm_unquantized_gemm_impl` (VLLM_ROCM_USE_AITER=1: aiter tuned hgemm) + aiter
 `per_1x32_mx_quant_hip`. Floor = the 51.4 MB weight stream at the measured nontemporal HBM rate: 1.57 us graph node +
-7.4 us (6.95 TB/s) = 9.0 us (a pure-read skeleton of the same grid measures 9.1-9.6).
+7.4 us (6.95 TB/s) = 9.0 us. DMA-only = the same grid issuing the same weight + activation DMAs with no MFMA and no epilogue.
 
 | M | 1 | 4 | 12 | 24 | 40 | 65 | 80 | 128 | 192 |
 |---|---|---|---|---|---|---|---|---|---|
-| stock gemm + quant | 11.6 | 12.9 | 14.3 | 14.7 | 16.0 | 19.9 | 20.4 | 23.3 | 33.8 |
-| fused | 11.9 | 11.9 | 11.7 | 12.2 | 13.3 | 15.0 | 15.6 | 19.7 | 25.8 |
-| % of the 9.0 us floor | 76 | 76 | 77 | 74 | 68 | 60 | 58 | 46 | 35 |
-| speedup | 0.97x | 1.09x | 1.23x | 1.20x | 1.20x | 1.32x | 1.31x | 1.19x | 1.31x |
+| stock gemm + quant | 11.4 | 12.6 | 14.3 | 14.7 | 15.6 | 19.7 | 20.2 | 23.3 | 33.6 |
+| fused | 11.1 | 10.8 | 10.9 | 11.5 | 12.1 | 13.9 | 14.4 | 17.2 | 23.1 |
+| DMA-only | 8.9 | 8.8 | 8.9 | 9.2 | 9.7 | 10.8 | 11.4 | 13.6 | 17.7 |
+| % of the 9.0 us floor | 81 | 83 | 82 | 78 | 74 | 65 | 62 | 52 | 39 |
+| speedup | 1.03x | 1.17x | 1.31x | 1.27x | 1.28x | 1.42x | 1.40x | 1.35x | 1.45x |
 
-In-kernel timestamps (`s_memrealtime`, M 12): the weight stream (first block 1.2 us, last loop end 8.0 us median) runs at
-the HBM ceiling; the epilogue after the slowest main loop is 1.9 us (K halves 0.16, slab stores + drain 0.45, ticket 0.6,
-slab loads + LDS tile 0.44, quant + stores 0.3). Above M ~ 40 the limiter is the per-CU load rate (~45-50 GB/s: weights
-229 KB + activation 28 blocks x 2 MT KB per workgroup) and the 11 MB slab round trip at M 192.
+The fused kernel runs at 77-83% of its own DMA-only skeleton at every M: the weight stream is at the HBM ceiling, and
+from M 40 the per-CU activation path (L2 to LDS, ~110 GB/s per CU, additive to the weight stream) sets the floor, not HBM.
+The epilogue after the slowest main loop is 1.2 us at M 12 (K halves 0.16, slab stores 0.25, wait for the tile 0.45,
+slab loads + LDS tile 0.45, quant + stores 0.3) and 3.6 us at M 192.
 
 ## Tests
 - `python3 -m pytest tests/gemm/bf16_latent_down_mxfp4_quant_k7168_n3584 -q`
