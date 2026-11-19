@@ -471,3 +471,25 @@ def sld_i32(addr, i):
             [],
         )
     )
+
+
+def sum32_dpp(v):
+    """Sum of v over the 32 lanes of each half-wave, in every lane: one
+    permlane16_swap between the two 16-lane rows, then v_add_f32_dpp with
+    row_ror 8, 4, 2, 1 inside the row (a ring: every step adds the lane's
+    partner and the partner's sum). One instruction a step where ``xred`` takes
+    a move, a DPP move and an add."""
+    x = v.bitcast(fx.Int32)
+    a, b = permlane_swap(16, x, x)
+    s = a.bitcast(fx.Float32) + b.bitcast(fx.Float32)
+    for ror in (8, 4, 2, 1):
+        s = fx.Float32(
+            llvm.inline_asm(
+                T.f32,
+                [s.ir_value()],
+                f"s_nop 1\n\tv_add_f32_dpp $0, $1, $1 row_ror:{ror} row_mask:0xf bank_mask:0xf",
+                "=v,v",
+                has_side_effects=False,
+            )
+        )
+    return s

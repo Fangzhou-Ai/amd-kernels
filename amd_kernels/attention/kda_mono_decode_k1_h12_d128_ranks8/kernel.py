@@ -7,7 +7,7 @@ tokens, S = R L rows), in one launch of ``BLOCKS`` CTAs x ``THREADS`` threads (a
                           row (plain device-scope stores) and its XRDY flag
     the other CTAs        26 rows of in_proj each (tile A: 16 rows, tile B: up to 10), issued at kernel start into
                           registers: the stream is HBM-bound, so every wave but one issues them at once. The
-                          stager wave (``STAGER``) issues its own after it has polled the XRDY flags and DMA'd x
+                          stager waves (``NSTAGER``) issue the rest of theirs after they have polled the XRDY flags and DMA'd x
                           into LDS (``stage_x``): a poll or DMA queued behind a wave's weight loads lands with them.
                           The MFMAs of a wave wait for its own chunks only; the sums over the waves' K slices -> PROJ
     KDA tasks             (request, head, 16 state rows), NVCH consecutive CTAs a head, in rounds when R x 12 x 8
@@ -59,6 +59,7 @@ from amd_kernels.common.mono.ops import (
     uniform,
     wave_max,
     wave_sum,
+    sum32_dpp,
 )
 from amd_kernels.common.mono.abi import FAILED  # noqa: F401
 from amd_kernels.common.mono.plan import (
@@ -90,11 +91,8 @@ ROWS = 16
 KCH = 128  # K a chunk: 4 MFMAs of 32
 NKCH = HIDDEN // KCH  # 56
 PER_WAVE = NKCH // WAVES  # 7
-STAGER = WAVES - 1  # the wave that stages x
-import os
-WCM = int(os.environ.get('WCM', '0'))
-NSTAGER = int(os.environ.get('NSTAGER', '1'))
-EARLY = int(os.environ.get('EARLY', '7'))
+NSTAGER = 2  # waves that stage x
+EARLY = 4  # a stager wave's K chunks in flight with everyone's
 VCH = 16  # state rows a KDA task
 NVCH = HD // VCH  # 8
 CONV_W = 4
@@ -112,7 +110,7 @@ TL_POINTS = 32
 _STREAM = fx.Stream(None)
 REGIONS = ("xrdy", "proj", "onrm")
 # every mono source file: in every build's JIT cache key
-_SOURCES = source_digest("common/mono", "attention/kda_mono_decode_k1_h12_d128_ranks8") + f"wcm{WCM}ns{NSTAGER}e{EARLY}"
+_SOURCES = source_digest("common/mono", "attention/kda_mono_decode_k1_h12_d128_ranks8")
 
 
 @dataclass(frozen=True)
@@ -229,6 +227,10 @@ def sigmoid(z):
 
 def f32_of(w):
     return w.bitcast(fx.Float32)
+
+
+def sum4(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
 
 
 def sum_polled(vals):
@@ -398,7 +400,7 @@ def gemv_loads(c, lr0, nrows, chunks):
         out += [
             fx.Vector(
                 bo.buffer_load(
-                    r_w, base + 16 * q, vec_width=4, dtype=T.i32, cache_modifier=WCM
+                    r_w, base + 16 * q, vec_width=4, dtype=T.i32, cache_modifier=0
                 )
             )
             for q in range(4)
@@ -417,7 +419,7 @@ def stage_x(c):
     nb = c["XB"]
     if lane < c["S"]:
         c["poll"]([(c["xrdy"], lane, 1)])
-    stamp(c["on"], c["tls"], c["tid"] - 64 * STAGER, 24)
+    stamp(c["on"], c["tls"], c["tid"] - 64 * (WAVES - 1), 24)
     l4 = lane // 4
     col0 = (l4 % 8) * KCH + (l4 // 8) * 32 + (lane % 4) * 8
     pieces = (nb + 15) // 16
@@ -434,7 +436,9 @@ def stage_x(c):
             else:
                 if mine & (p * 16 + l4 < nb):
                     lds_dma(src, dst, "sc1")
+    stamp(c["on"], c["tls"], c["tid"] - 64 * (WAVES - 1), 25)
     vm_wait(0)
+    stamp(c["on"], c["tls"], c["tid"] - 64 * (WAVES - 1), 26)
 
 
 def xblock_col(blk):
@@ -448,9 +452,10 @@ def xblock_col(blk):
 
 @traced
 def gemv_weights(c, lr_a, n_a, lr_b, n_b):
-    """Every wave's weights in flight at once, except the stager wave's (wave
-    ``STAGER``): it polls and stages x first (``stage_x``), then loads its own,
-    which lands while the others' MFMAs wait for the barrier."""
+    """Every wave's weights in flight at once, except the last K chunks of the
+    stager waves' (the last ``NSTAGER`` waves): they poll and stage x first
+    (``stage_x``), then load those, which land while the others' MFMAs wait for
+    the barrier."""
     wave = uniform(c["wave"])
     me = wave >= WAVES - NSTAGER
     zero = fx.Int32(0)
@@ -729,12 +734,11 @@ def kda_recur(c, k, req, h, ch):
     bt = [fx.ptr_load(c["beta"] + j) for j in range(L)]
     for j in range_constexpr(L):
         stv = [stv[e] * dk[j][e] for e in range(4)]
-        p = stv[0] * kv[j][0] + stv[1] * kv[j][1] + stv[2] * kv[j][2] + stv[3] * kv[j][3]
-        p = butterfly(p, (16, 8, 4, 2, 1))
+        p = sum4(stv, kv[j])
+        p = sum32_dpp(p)
         vn = (vl[j] - p) * bt[j]
         stv = [stv[e] + vn * kv[j][e] for e in range(4)]
-        o = stv[0] * qv[j][0] + stv[1] * qv[j][1] + stv[2] * qv[j][2] + stv[3] * qv[j][3]
-        o = bf16r(butterfly(o, (16, 8, 4, 2, 1)))
+        o = bf16r(sum32_dpp(sum4(stv, qv[j])))
         o = live0.select(o, fx.Float32(0.0))
         slot = k["slots"][j]
         if (slot > 0) & live0:
@@ -966,6 +970,7 @@ def build(key: KdaPreBuild):
         lr_b = ROWS * ng + rows_b * gi
         n_b = isg.select(fx.max(fx.min(fx.Int32(rows_b), NPROJ - lr_b), 0), fx.Int32(0))
         ops_a, ops_b = gemv_weights(c, lr_a, n_a, lr_b, n_b)
+        stamp(on, tls, tid, 27)
         xd = x_direct(c)
         stamp(on, tls, tid, 5)
         accs = gemv_mfma(c, ops_a, ops_b, xd)
