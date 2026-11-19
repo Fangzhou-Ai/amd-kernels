@@ -23,6 +23,7 @@ FOLD_WAVES = 1
 FOLD_NVT = 1
 FOLD_STAGES = 3
 MIN_CHUNKS = 4
+MIN_GROUP_CHUNKS = 5
 MAX_GROUPS = 32
 NUM_CUS = 256
 
@@ -44,19 +45,31 @@ def _fold_launcher():
 
 @functools.cache
 def _norm_launcher(w_f32):
-    return _norm.compile_norm(4, 4, w_f32)
+    return _norm.compile_norm(4, 2, w_f32)
 
 
-def plan_groups(num_seqs, num_chunks):
-    """Chunk groups per sequence: as many as fill the walk kernel's grid on the CUs, each at least ``MIN_CHUNKS`` long."""
-    per_seq = num_chunks // max(num_seqs, 1)
-    fill = NUM_CUS // (num_seqs * NH * (8 // (WALK_WAVES * WALK_NVT)))
-    return max(1, min(fill, per_seq // MIN_CHUNKS, MAX_GROUPS))
+SHORT_CHAIN = 20  # chunks: a sequence this short (every sequence) is walked whole
+MAX_UNITS = 128  # (pair, group) units of one launch: 128 fill the 32 CUs of each of the 8 XCDs (two slice groups per unit)
 
 
-def scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_state, out, groups=None):
+def plan_groups(chunk_counts):
+    """Chunk groups per sequence for sequences of ``chunk_counts`` chunks (host ints): the most groups whose (pair, group) units
+    still fit one round of the CUs, none for short chains (the chain / fold launches cost more than they save)."""
+    if max(chunk_counts) <= SHORT_CHAIN:
+        return 1
+    best = 1
+    for g in range(2, MAX_GROUPS + 1):
+        units = NH * sum(min(g, max(1, nt // MIN_CHUNKS)) for nt in chunk_counts)
+        if units > MAX_UNITS or -(-max(chunk_counts) // g) < MIN_GROUP_CHUNKS:
+            break
+        best = g
+    return best
+
+
+def scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_state, out, chunk_counts=None, groups=None):
     """Chunk scan over the workspace records ``ws`` [H, Nc, RECORD_BYTES]; updates ``state_cache`` rows in place and writes the
-    bf16 outputs of the tokens into ``out`` [T, 12, 128] (row stride ``out.stride(0)``)."""
+    bf16 outputs of the tokens into ``out`` [T, 12, 128] (row stride ``out.stride(0)``). ``chunk_counts``: the chunks of each
+    sequence as host ints (the grouping of long chains follows it; evenly split when ``None``); ``groups`` forces the grouping."""
     n = cu_seqlens.numel() - 1
     nc = ws.shape[1]
     assert ws.dtype == torch.uint8 and ws.shape[0] == NH and ws.shape[2] == RECORD_BYTES and ws.is_contiguous()
@@ -64,7 +77,9 @@ def scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_
     assert out.dtype == torch.bfloat16 and out.shape[1:] == (NH, D) and out.stride(1) == D and out.stride(2) == 1
     assert chunk_offsets.dtype == torch.int64 and cu_seqlens.dtype == torch.int32 and state_indices.dtype == torch.int32
     has = has_initial_state.to(torch.uint8) if has_initial_state.dtype != torch.uint8 else has_initial_state
-    g = plan_groups(n, nc) if groups is None else groups
+    if groups is None:
+        groups = plan_groups(chunk_counts if chunk_counts is not None else [-(-nc // n)] * n)
+    g = groups
     dev = ws.device
     if g > 1:
         gb = torch.empty(n * NH, g, D, D, dtype=torch.float32, device=dev)
@@ -100,10 +115,12 @@ def gated_norm(o, gate, norm_weight, eps, out=None):
 
 
 def prefill(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices, has_initial_state,
-            cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale=D ** -0.5):
+            cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale=D ** -0.5, table=None,
+            chunk_counts=None):
     """The KDA prefill of one layer: conv + prologue, chunk scan, gated RMSNorm. Writes ``out`` [T, 12, 128] bf16, rolls
-    ``conv_state`` and updates ``state_cache`` rows in place."""
+    ``conv_state`` and updates ``state_cache`` rows in place. ``table``: ``prologue.chunk_table`` of the step (built once per step
+    and shared by the layers; built here when ``None``)."""
     ws = _prologue.prologue(mixed, raw_g, beta_logit, A_log, dt_bias, lower_bound, scale, conv_weight, conv_state, state_indices,
-                            has_initial_state, cu_seqlens, chunk_indices)
-    scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_state, out)
+                            has_initial_state, cu_seqlens, chunk_indices, table=table)
+    scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_initial_state, out, chunk_counts)
     return gated_norm(out, gate, norm_weight, norm_eps, out)

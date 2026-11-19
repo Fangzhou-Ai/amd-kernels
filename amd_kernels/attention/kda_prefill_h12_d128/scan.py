@@ -150,13 +150,15 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2):
             h = pair % NH
             cu_r = buffer_ops.create_buffer_resource_from_addr(arg_cu)
             tok0 = fx.Int32(buffer_ops.buffer_load(cu_r, n, vec_width=1, is_scalar=True))
-            ntok = fx.Int32(buffer_ops.buffer_load(cu_r, n + 1, vec_width=1, is_scalar=True)) - tok0
+            tok1 = fx.Int32(buffer_ops.buffer_load(cu_r, n + 1, vec_width=1, is_scalar=True))
+            c0 = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_choff), n * 2, vec_width=1, is_scalar=True))
+            slot = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_sidx), n, vec_width=1, is_scalar=True))
+            has_w = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_has), n // 4, vec_width=1, is_scalar=True))
+            ntok = tok1 - tok0
             nt = (ntok + (BT - 1)) // BT
             gn = _group(nt, i32_groups, i32_minc)
             live = (g < gn - 1) if chain else (g < gn)
             if live & (nt > 0):
-                choff_r = buffer_ops.create_buffer_resource_from_addr(arg_choff)
-                c0 = fx.Int32(buffer_ops.buffer_load(choff_r, n * 2, vec_width=1, is_scalar=True))
                 lo = _first(nt, gn, g)
                 nch = _count(nt, gn, g)
                 nhg = pair * i32_groups + g
@@ -181,9 +183,7 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2):
                                 vals.append(hit.select(fx.Float32(1.0), fx.Float32(0.0)))
                             s0.append(Vec.from_elements(vals, fx.Float32))
                 else:
-                    slot = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_sidx), n, vec_width=1, is_scalar=True))
-                    has = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_has), n // 4, vec_width=1, is_scalar=True))
-                    has = ((has >> ((n % 4) * 8)) & 0xFF) != 0
+                    has = ((has_w >> ((n % 4) * 8)) & 0xFF) != 0
                     grouped = gn > 1
                     src = grouped.select(fx.Int64(arg_sin) + fx.Int64(nhg) * STATE_BYTES, fx.Int64(arg_state) + fx.Int64(slot) * i64_slot_bytes + fx.Int64(h) * STATE_BYTES)
                     ok = grouped | has
@@ -382,7 +382,6 @@ def compile_scan(waves: int, nvt: int, chain: bool, stages: int = 2):
                 else:
                     last = g == gn - 1
                     if last:
-                        slot = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_sidx), n, vec_width=1, is_scalar=True))
                         dst_r = _fp(arg_state + fx.Int64(slot) * i64_slot_bytes + fx.Int64(h) * STATE_BYTES, STATE_BYTES)
                         for vt in range_constexpr(nvt):
                             for kt in range_constexpr(8):
@@ -465,13 +464,14 @@ def compile_fold(waves: int, nvt: int, stages: int):
             h = pair % NH
             cu_r = buffer_ops.create_buffer_resource_from_addr(arg_cu)
             tok0 = fx.Int32(buffer_ops.buffer_load(cu_r, n, vec_width=1, is_scalar=True))
-            ntok = fx.Int32(buffer_ops.buffer_load(cu_r, n + 1, vec_width=1, is_scalar=True)) - tok0
+            tok1 = fx.Int32(buffer_ops.buffer_load(cu_r, n + 1, vec_width=1, is_scalar=True))
+            slot = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_sidx), n, vec_width=1, is_scalar=True))
+            has_w = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_has), n // 4, vec_width=1, is_scalar=True))
+            ntok = tok1 - tok0
             nt = (ntok + (BT - 1)) // BT
             gn = _group(nt, i32_groups, i32_minc)
             if gn > 1:
-                slot = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_sidx), n, vec_width=1, is_scalar=True))
-                has = fx.Int32(buffer_ops.buffer_load(buffer_ops.create_buffer_resource_from_addr(arg_has), n // 4, vec_width=1, is_scalar=True))
-                has = ((has >> ((n % 4) * 8)) & 0xFF) != 0
+                has = ((has_w >> ((n % 4) * 8)) & 0xFF) != 0
                 lds_base = fx.Int32(fx.ptrtoint(smem.buf.ptr))
                 lane16 = lane * 16
                 vs0 = (sg * waves + wave) * nvt
