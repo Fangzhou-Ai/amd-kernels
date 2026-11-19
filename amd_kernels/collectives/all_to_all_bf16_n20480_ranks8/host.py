@@ -12,7 +12,7 @@ from . import kernel
 from .kernel import BUFFERS, N, RECV_ROWS, V, WORLD
 
 # rows up to which the GEMM pushes its rows itself (owner mode, all-gather mode): the measured crossovers of the README
-SERIAL_ABOVE = {True: 96, False: 24}
+SERIAL_ABOVE = {True: 96, False: 16}
 
 
 class _IpcHandle(ctypes.Structure):
