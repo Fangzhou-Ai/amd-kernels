@@ -78,3 +78,5 @@ collectives/dcp8_topk_gather_merge_top2048/test_topk_gather_merge.py	8
 attention/dcp8_lse_combine_vup_mla_h12_kv512/test_combine.py	8
 attention/dcp8_lse_combine_vup_mla_h12_kv512/test_warm_up.py	8
 attention/dcp8_lse_combine_vup_mla_h12_kv512/test_compile.py	compile
+attention/dcp8_q_bproj_wuk_gather_h96_kv512/test_query_gather.py	8
+attention/dcp8_q_bproj_wuk_gather_h96_kv512/test_compile.py	8
