@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """Eight-rank contract at the served row counts: eager and graph calls, replayed and changed inputs, determinism."""
-import os
-
 import torch
 import torch.distributed as dist
 from amd_kernels.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8 import LatentTailComm
@@ -59,17 +57,15 @@ def contract(c, rank, dev, rows, tag):
 
 def worker(rank, errors):
     dev = torch.device("cuda", rank)
-    mode = os.environ.get("LATENT_LL", "0")
-    ll, ll2 = mode in ("1", "2"), mode == "2"
-    c = LatentTailComm(rank, dist.group.WORLD, dev, ll=ll, ll2=ll2)
-    contract(c, rank, dev, SERVED_ROWS, f"mode{mode}")
+    c = LatentTailComm(rank, dist.group.WORLD, dev)
+    contract(c, rank, dev, SERVED_ROWS, "fused")
     c.close()
-    split_and_replicated(rank, dev, ll, ll2)
+    split_and_replicated(rank, dev)
 
 
-def split_and_replicated(rank, dev, ll, ll2):
+def split_and_replicated(rank, dev):
     """The two-launch mode, and the replicated-shared layout: ``out`` a compact shard view apart from ``shared``."""
-    c = LatentTailComm(rank, dist.group.WORLD, dev, fused=False, ll=ll, ll2=ll2)
+    c = LatentTailComm(rank, dist.group.WORLD, dev, fused=False)
     for m in (12, 80, 192):
         parts, nw, w, shared0 = make(m, 7000 + m, dev, rank)
         full = torch.zeros(m, 7168, dtype=torch.bfloat16, device=dev)  # persistent zero-padded partial buffer

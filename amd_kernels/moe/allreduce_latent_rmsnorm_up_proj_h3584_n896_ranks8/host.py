@@ -11,7 +11,7 @@ from amd_kernels import warm_up
 from amd_kernels.common import hip_runtime as ops
 
 from . import tail_kernel as T
-from .ipc import alloc_handle, as_tensor, close_handle, exchange, f32_bits, open_handle, run_compiled
+from .ipc import alloc_handle, close_handle, exchange, f32_bits, open_handle, run_compiled
 from .norm_math import K, N, WORLD
 
 NAME = "moe/allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8"
@@ -19,8 +19,8 @@ MAX_ROWS = T.MAX_ROWS
 
 
 @functools.cache
-def _kernel(mode, mpg, ts=False, ll=False, ll2=False):
-    return T.compile_tail(mode, 1 if mode == "ar" else mpg, ts, ll, ll2)
+def _kernel(mode, mpg, rb, ts=False):
+    return T.compile_tail(mode, mpg, rb, ts)
 
 
 def _release(ptr, peer):
@@ -37,7 +37,8 @@ def _mode(comm, partial, norm_weight, up_weight, shared, out=None, eps=1e-6):
 
 
 def _sizes(mode):
-    return tuple(16 * T.GROUPS * i for i in range(1, T.MAX_MT // T.GROUPS + 1))
+    """Row counts that reach every (rows per tile group, rows per all-reduce workgroup) variant."""
+    return (64, 96, 128, 192, 256)
 
 
 def _inputs(mode, n, comm, partial, norm_weight, up_weight, shared, out=None, eps=1e-6):
@@ -56,10 +57,11 @@ def allreduce_latent_rmsnorm_up_proj(comm, partial, norm_weight, up_weight, shar
 class LatentTailComm:
     """One communicator per stream, created collectively on eight ranks (``device``: this rank's GPU).
 
-    All ranks make the same calls in the same order; close only after the work completes.
+    All ranks make the same calls in the same order; close only after the work completes. ``fused=False`` runs the
+    all-reduce and the up projection as two launches (the same kernels in their single-role modes).
     """
 
-    def __init__(self, rank, group, device, fused=True, ll=False, ll2=False):
+    def __init__(self, rank, group, device, fused=True):
         if dist.get_world_size(group) != WORLD:
             raise ValueError("eight ranks required")
         device = torch.device(device)
@@ -67,7 +69,7 @@ class LatentTailComm:
             device = torch.device("cuda", torch.cuda.current_device())
         if torch.cuda.current_device() != device.index or dist.get_rank(group) != rank:
             raise ValueError("select this rank device before creating the communicator")
-        self.rank, self.group, self.device, self.fused, self.ll, self.ll2 = rank, group, device, fused, ll, ll2
+        self.rank, self.group, self.device, self.fused = rank, group, device, fused
         ptr, handle = ops.allocate_shared_buffer_and_handle(T.BUF_BYTES)
         peers = exchange(handle, rank, group)
         self.bufs = [ptr if r == rank else ops.open_mem_handle(peers[r]) for r in range(WORLD)]
@@ -79,13 +81,10 @@ class LatentTailComm:
         lats = [self.lat_buf.data_ptr() if r == rank else next(opened) + lat_peers[r][1] for r in range(WORLD)]
         self.buf_table = torch.tensor(self.bufs + lats, dtype=torch.int64, device=device)
         self.counts = torch.zeros(T.CNT_WORDS, dtype=torch.int32, device=device)
-        self.ts = None  # a [workgroup, 8] int32 tensor of phase stamps (profiling build), set by the caller
+        self.rb_override = 0  # experiments: rows per all-reduce workgroup (2, 4 or 8) instead of ``tail_kernel.rb_of``
+        self.ts = None  # a [workgroup, wave, 8] int32 tensor of phase stamps (a profiling build), set by the caller
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
-
-    @property
-    def ts_ptr(self):
-        return 0 if self.ts is None else self.ts.data_ptr()
 
     def _launch(self, x, norm_weight, w, shared, out, eps, modes=None):
         if not self.bufs:
@@ -105,11 +104,13 @@ class LatentTailComm:
             raise ValueError(f"shared and out must be [{m}, {N}]")
         stream = torch.cuda.current_stream()
         mpg = T.mpg_of((m + 15) // 16)
-        args = (m, (m + T.RB - 1) // T.RB, self.rank, self.buf_table.data_ptr(), self.counts.data_ptr(),
-                x.data_ptr(), x.stride(0), norm_weight.data_ptr(), w.data_ptr(), shared.data_ptr(), shared.stride(0),
-                out.data_ptr(), out.stride(0), f32_bits(eps), 0, self.ts_ptr, stream)
+        rb = self.rb_override or T.rb_of(m)
+        ts = 0 if self.ts is None else self.ts.data_ptr()
+        args = (m, (m + rb - 1) // rb, self.rank, self.buf_table.data_ptr(), self.counts.data_ptr(), x.data_ptr(),
+                x.stride(0), norm_weight.data_ptr(), w.data_ptr(), shared.data_ptr(), shared.stride(0),
+                out.data_ptr(), out.stride(0), f32_bits(eps), 0, ts, stream)
         for mode in modes or (("fused",) if self.fused else ("ar", "up")):
-            run_compiled(_kernel(mode, mpg, bool(self.ts_ptr), self.ll, self.ll2), *args)
+            run_compiled(_kernel(mode, mpg, rb, bool(ts)), *args)
         return out
 
     def close(self):

@@ -80,12 +80,11 @@ def _gptr(addr):
 
 
 def flag_store(addr, v):
-    """An atomic exchange at system scope (write-through)."""
-    _llvm.AtomicRMWOp(
-        _llvm.AtomicBinOp.xchg,
-        _gptr(addr).llvm_ptr,
+    """An atomic store at system scope (a posted write-through: no read-modify-write at the remote memory)."""
+    _llvm.StoreOp(
         fx.Int32(v).ir_value(),
-        _llvm.AtomicOrdering.monotonic,
+        _gptr(addr).llvm_ptr,
+        ordering=_llvm.AtomicOrdering.monotonic,
         syncscope="",
         alignment=4,
     )
