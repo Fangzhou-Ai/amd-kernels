@@ -159,7 +159,7 @@ def shared_expert_full(codes, scales, w, *, stream=None, keep=None):
 FULL_WARM_UP_ROWS = (1, 1281, 2561, 4097)
 
 
-def _full_inputs(mode, n, codes, scales, w, *, stream=None):
+def _full_inputs(mode, n, codes, scales, w, *, stream=None, keep=None):
     dev = codes.device
     def zeros(cols):
         return torch.zeros((n, cols), dtype=torch.uint8, device=dev)
