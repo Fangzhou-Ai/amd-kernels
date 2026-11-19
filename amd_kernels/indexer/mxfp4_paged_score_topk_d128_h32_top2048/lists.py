@@ -34,18 +34,18 @@ SKIP = int(os.environ.get('KK_SKIP', '0'))
 FENCE_SCOPE = os.environ.get('KK_FENCE', 'wavefront')  # the select's LDS exchanges stay inside one wave
 
 
-def chunk_parts(rows: int, uniform: bool = False, timing: bool = False, sync: bool = False):
+def chunk_parts(rows: int, timing: bool = False, sync: bool = False):
     """``rows``: query rows a workgroup scores of a sequence (1 - 6; a sequence of more rows takes several workgroups
     a chunk)."""
     assert 1 <= rows <= QMAX
-    OFFS, WORDS = layout(keys=rows * CHUNK_MAX, hist=rows * HIST)
+    OFFS, WORDS = layout(keys=rows * CHUNK_MAX, hist=rows * HIST, st=128 if timing else 0)
     CM = (SC1 if os.environ.get('KK_CM', '1') == '1' else 0) if sync else 0  # stores a merge workgroup of another XCD reads: write-through
 
     @flyc.jit
     def role(smem, arg_q: fx.Int64, arg_qs: fx.Int64, arg_kv: fx.Int64, arg_kvs: fx.Int64, arg_bt: fx.Int64,
                arg_w: fx.Int64, arg_ends: fx.Int64, arg_qsl: fx.Int64, arg_keys: fx.Int64, arg_idx: fx.Int64,
                arg_meta: fx.Int64, arg_full: fx.Int64, i32_bt_stride: fx.Int32, i32_page_stride: fx.Int32,
-               i32_last_page: fx.Int32, i32_batch: fx.Int32, i32_nch_grid: fx.Int32, i32_qlen: fx.Int32, i32_target: fx.Int32, arg_cnt: fx.Int64, i32_tiles: fx.Int32, arg_dbg: fx.Int64):
+               i32_last_page: fx.Int32, i32_batch: fx.Int32, i32_nch_grid: fx.Int32, i32_qlen: fx.Int32, i32_target: fx.Int32, i32_uniform: fx.Int32, arg_cnt: fx.Int64, i32_tiles: fx.Int32, arg_dbg: fx.Int64):
         tx = fx.thread_idx.x
         lane = tx % 64
         wave = I(rocdl.readfirstlane(T.i32, tx // 64))
@@ -53,11 +53,16 @@ def chunk_parts(rows: int, uniform: bool = False, timing: bool = False, sync: bo
         dbg = buffer_ops.create_buffer_resource_from_addr(arg_dbg, num_records_bytes=NUM_REC)
 
         def stamp(k):
+            """Timing builds: the wave's clock into its LDS slot (flushed at the end; a global store here would
+            delay later waits on the store counter)."""
             if fx.const_expr(timing):
                 t_ = now()
-                if tx == 0:
-                    buffer_ops.buffer_store(t_.to(I), dbg, bid * 16 + k)
+                if lane == 0:
+                    store_lds(smem.st, wave * 16 + k, t_.to(I))
 
+        if fx.const_expr(timing):
+            if lane < 16:
+                store_lds(smem.st, wave * 16 + lane, I(0))
         stamp(13)
         b = bid % i32_batch
         c = (bid // i32_batch) % i32_nch_grid
@@ -66,10 +71,9 @@ def chunk_parts(rows: int, uniform: bool = False, timing: bool = False, sync: bo
         bt_head = buffer_ops.create_buffer_resource_from_addr(arg_bt, num_records_bytes=I64(i32_batch * i32_bt_stride) * 4)
         spec = [I(buffer_ops.buffer_load(bt_head, b * i32_bt_stride + c * (size // 64) + wave, vec_width=1, dtype=I, is_scalar=True))
                 for size in SPEC_SIZES]
-        if fx.const_expr(uniform):
-            first = b * i32_qlen
-            last = first + i32_qlen
-        else:
+        first = b * i32_qlen  # a uniform batch: every sequence has ``qlen`` rows
+        last = first + i32_qlen
+        if i32_uniform == 0:
             first = uniform_value(buffer_ops.buffer_load(qsl, b, vec_width=1, dtype=I))
             last = uniform_value(buffer_ops.buffer_load(qsl, b + 1, vec_width=1, dtype=I))
         count = last - first
@@ -329,16 +333,20 @@ def chunk_parts(rows: int, uniform: bool = False, timing: bool = False, sync: bo
             fx.gpu.barrier()
             if tx == 0:
                 atomic_agent(AtomicBinOp.add, arg_cnt + I64((b * i32_tiles + tile) * COUNTER_BYTES), 1)
+        if fx.const_expr(timing):
+            fx.gpu.barrier()
+            if tx < 128:
+                buffer_ops.buffer_store(I(smem.st.ptr[tx]), dbg, bid * 128 + tx)
 
     return role, OFFS, WORDS
 
 @launcher
-def compile_chunk_lists(rows: int, uniform: bool = False, timing: bool = False):
+def compile_chunk_lists(rows: int, timing: bool = False):
     """``rows``: query rows a workgroup scores of a sequence (1 - 6; a sequence of more rows takes several workgroups
     a chunk)."""
     assert 1 <= rows <= QMAX
-    name = f"mxfp4_paged_chunk_lists_d128_h32_r{rows}_{TAG}" + ("_u" if uniform else "") + ("_t" if timing else "")
-    role, OFFS, WORDS = chunk_parts(rows, uniform, timing)
+    name = f"mxfp4_paged_chunk_lists_d128_h32_r{rows}_{TAG}" + ("_t" if timing else "")
+    role, OFFS, WORDS = chunk_parts(rows, timing)
 
     @fx.struct
     class Raw:
@@ -348,19 +356,19 @@ def compile_chunk_lists(rows: int, uniform: bool = False, timing: bool = False):
     def kernel(arg_q: fx.Int64, arg_qs: fx.Int64, arg_kv: fx.Int64, arg_kvs: fx.Int64, arg_bt: fx.Int64,
                arg_w: fx.Int64, arg_ends: fx.Int64, arg_qsl: fx.Int64, arg_keys: fx.Int64, arg_idx: fx.Int64,
                arg_meta: fx.Int64, arg_full: fx.Int64, i32_bt_stride: fx.Int32, i32_page_stride: fx.Int32,
-               i32_last_page: fx.Int32, i32_batch: fx.Int32, i32_nch_grid: fx.Int32, i32_qlen: fx.Int32, i32_target: fx.Int32, arg_dbg: fx.Int64):
+               i32_last_page: fx.Int32, i32_batch: fx.Int32, i32_nch_grid: fx.Int32, i32_qlen: fx.Int32, i32_target: fx.Int32, i32_uniform: fx.Int32, arg_dbg: fx.Int64):
         smem = carve(fx.SharedAllocator().allocate(Raw).peek().u, **OFFS)
         role(smem, arg_q, arg_qs, arg_kv, arg_kvs, arg_bt, arg_w, arg_ends, arg_qsl, arg_keys, arg_idx, arg_meta, arg_full,
-             i32_bt_stride, i32_page_stride, i32_last_page, i32_batch, i32_nch_grid, i32_qlen, i32_target, I64(0), I(0), arg_dbg)
+             i32_bt_stride, i32_page_stride, i32_last_page, i32_batch, i32_nch_grid, i32_qlen, i32_target, i32_uniform, I64(0), I(0), arg_dbg)
 
     @flyc.jit
     def launch_chunk_lists(arg_q: fx.Int64, arg_qs: fx.Int64, arg_kv: fx.Int64, arg_kvs: fx.Int64, arg_bt: fx.Int64,
                            arg_w: fx.Int64, arg_ends: fx.Int64, arg_qsl: fx.Int64, arg_keys: fx.Int64,
                            arg_idx: fx.Int64, arg_meta: fx.Int64, arg_full: fx.Int64, i32_bt_stride: fx.Int32,
                            i32_page_stride: fx.Int32, i32_last_page: fx.Int32, i32_batch: fx.Int32, i32_nch_grid: fx.Int32, i32_qlen: fx.Int32,
-                           i32_target: fx.Int32, arg_dbg: fx.Int64, grid_x: fx.Int32, stream: fx.Stream):
+                           i32_target: fx.Int32, i32_uniform: fx.Int32, arg_dbg: fx.Int64, grid_x: fx.Int32, stream: fx.Stream):
         kernel(arg_q, arg_qs, arg_kv, arg_kvs, arg_bt, arg_w, arg_ends, arg_qsl, arg_keys, arg_idx, arg_meta, arg_full,
-               i32_bt_stride, i32_page_stride, i32_last_page, i32_batch, i32_nch_grid, i32_qlen, i32_target, arg_dbg).launch(
+               i32_bt_stride, i32_page_stride, i32_last_page, i32_batch, i32_nch_grid, i32_qlen, i32_target, i32_uniform, arg_dbg).launch(
             grid=(I64(grid_x), 1, 1), block=(NW * 64, 1, 1), stream=stream)
 
     launch_chunk_lists.kernel_name = name

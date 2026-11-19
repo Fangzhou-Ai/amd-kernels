@@ -77,8 +77,8 @@ def _run_compiled(exe, *args):
 
 
 @functools.cache
-def _chunk_exe(rows: int, uniform: bool = False, timing: bool = False):
-    return _lists.compile_chunk_lists(rows, uniform, timing)
+def _chunk_exe(rows: int, timing: bool = False):
+    return _lists.compile_chunk_lists(rows, timing)
 
 
 BLOCK_TIERS = (2, 3, 4)  # pool blocks the merge kernel holds: its variants
@@ -98,13 +98,13 @@ def merge_blocks(width: int, target: int) -> int:
 
 
 @functools.cache
-def _fused_exe(rows: int, blocks: int, uniform: bool = False, timing: bool = False):
-    return _fused.compile_fused(rows, blocks, uniform, timing)
+def _fused_exe(rows: int, blocks: int, timing: bool = False):
+    return _fused.compile_fused(rows, blocks, timing)
 
 
 @functools.cache
-def _merge_exe(blocks: int, uniform: bool = False, timing: bool = False):
-    return _merge.compile_merge(blocks, uniform, timing)
+def _merge_exe(blocks: int, timing: bool = False):
+    return _merge.compile_merge(blocks, timing)
 
 
 def _score_topk(
@@ -150,17 +150,20 @@ def _score_topk(
     blocks = merge_blocks(width, target)
     dbg_ptr = dbg.data_ptr() if dbg is not None else 0
     if not split:
-        _run_compiled(_fused_exe(tile, blocks, uniform, dbg is not None), *common, keys.data_ptr(), pos.data_ptr(),
-                      meta.data_ptr(), full.data_ptr(), cnt.data_ptr(), out_indices.data_ptr(), out_scores.data_ptr(),
-                      *geom, nch, max_query_len, target, out_indices.stride(0), out_scores.stride(0), tiles, tile,
-                      batch * nch * tiles, dbg_ptr, batch * nch * tiles + (0 if _NOMERGE else rows), stream)
+        _run_compiled(_fused_exe(tile, blocks, dbg is not None), query_start_loc.data_ptr(), block_table.data_ptr(),
+                      row_ends.data_ptr(), q_payload.data_ptr(), weights.data_ptr(), q_scales.data_ptr(), payload.data_ptr(),
+                      batch, nch, scales.data_ptr(), keys.data_ptr(), pos.data_ptr(), meta.data_ptr(), full.data_ptr(),
+                      cnt.data_ptr(), out_indices.data_ptr(), out_scores.data_ptr(), block_table.stride(0),
+                      cache.stride(0), cache.shape[0] - 1, max_query_len, int(uniform), target, out_indices.stride(0),
+                      out_scores.stride(0), tiles, tile, batch * nch * tiles, dbg_ptr,
+                      batch * nch * tiles + (0 if _NOMERGE else rows), stream)
         return
-    _run_compiled(_chunk_exe(tile, uniform, dbg is not None), *common, keys.data_ptr(), pos.data_ptr(), meta.data_ptr(),
-                  full.data_ptr(), *geom, nch, max_query_len, target, dbg_ptr, batch * nch * tiles, stream)
-    _run_compiled(_merge_exe(blocks, uniform, dbg is not None), query_start_loc.data_ptr(), keys.data_ptr(), pos.data_ptr(),
+    _run_compiled(_chunk_exe(tile, dbg is not None), *common, keys.data_ptr(), pos.data_ptr(), meta.data_ptr(),
+                  full.data_ptr(), *geom, nch, max_query_len, target, int(uniform), dbg_ptr, batch * nch * tiles, stream)
+    _run_compiled(_merge_exe(blocks, dbg is not None), query_start_loc.data_ptr(), keys.data_ptr(), pos.data_ptr(),
                   meta.data_ptr(), full.data_ptr(), out_indices.data_ptr(), out_scores.data_ptr(), batch,
-                  out_indices.stride(0), out_scores.stride(0), max_query_len,
-                  dbg_ptr + 4 * 4096 * 16 if dbg is not None else 0, rows, stream)
+                  out_indices.stride(0), out_scores.stride(0), max_query_len, int(uniform),
+                  dbg_ptr + (4 << 20) if dbg is not None else 0, rows, stream)
 
 
 def prefer_fused(batch: int, width: int) -> bool:

@@ -16,11 +16,11 @@ from amd_kernels.indexer.mxfp4_paged_score_topk_d128_h32_top2048.reference impor
 from .inputs import make_inputs, require_gfx950
 
 
-def run(inputs):
+def run(inputs, **kwargs):
     rows = inputs["q_payload"].shape[0]
     idx = torch.full((rows, TOPK), -7, dtype=torch.int32, device="cuda")
     val = torch.full((rows, TOPK), 3.0, dtype=torch.float32, device="cuda")
-    host._score_topk(**inputs, out_indices=idx, out_scores=val)
+    host._score_topk(**inputs, out_indices=idx, out_scores=val, **kwargs)
     torch.cuda.synchronize()
     return idx, val
 
@@ -81,6 +81,15 @@ def test_matches_reference(seqs, qlen, width):
     exact = aiter_logits(inputs)
     if exact is not None:
         check_selection(idx, val, exact)
+
+
+@pytest.mark.parametrize("seqs,qlen,width", [(2, 6, 15360), (13, 5, 24576), (3, 1, 8192)])
+def test_uniform_batches(seqs, qlen, width):
+    """``uniform=True`` (every sequence has ``max_query_len`` rows: the row ranges need no table read) selects the same."""
+    require_gfx950()
+    inputs = make_inputs(seqs, qlen, width, seed=seqs + width)
+    idx, val = run(inputs, uniform=True)
+    check_selection(idx, val, reference_logits(inputs), rtol=LOGIT_RTOL)
 
 
 @pytest.mark.parametrize("length", [512, 1500, 4000, 20000, 20480, 40000, 64000, 131072])
