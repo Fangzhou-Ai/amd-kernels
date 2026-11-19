@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Shapes shared by the chunk kernel, the merge kernel and the host: chunk size, list sizes and the scratch layout.
+"""Shapes shared by the chunk role, the merge role and the host: chunk size, list sizes and the scratch layout.
 
-A sequence's keys are cut into ``nch = ceil(longest row bound / cb)`` chunks of ``cb`` keys, ``cb`` a multiple of 512 in
-``[512, CHUNK_MAX]`` chosen from the bound so that a sequence has about ``CHUNKS_TARGET`` chunks (a long context is
-scored by as many workgroups as a short one, up to the chunk size's cap). A row keeps from chunk ``c`` its ``tb`` largest
-keys (all of them if it has fewer) and from the sequence's last chunk, where the newest keys are, all of its keys, so a row's pool is
-``(nch - 1) * tb + cb`` entries, at most ``POOL``. A row's pool is ``keys`` and ``positions`` int32 planes of ``POOL`` entries;
-``meta`` holds per (row, chunk) the list's lower bound, the counts of live and listed keys and the chunk's extreme keys;
-a truncated chunk's scores are also stored whole, for the merge to read when its list falls short.
+A sequence's keys are cut into chunks of ``cb`` keys, ``cb`` a multiple of 512 in ``[512, CHUNK_MAX]`` chosen from the
+longest row bound so that a sequence has about the planned number of chunks (``host.plan``; a long context is scored by
+as many workgroups as a short one, up to the chunk size's cap). A workgroup that selects a chunk on two waves cuts it in
+halves: a list is then of a "chunk" of ``cbv = cb / 2`` keys, and ``nvch`` of them (at most ``NCH_MAX``) are all the merge
+sees. A row keeps from list ``c`` its ``tb`` largest keys (all of them if it has fewer) and from the sequence's last
+chunk, where the newest keys are, all of its keys, so a row's pool is ``(nvch - 1) * slot + cbv`` entries, at most ``POOL``
+(four 2048-entry blocks of the merge). A row's pool is ``keys`` and ``positions`` int32 planes of ``POOL`` entries;
+``meta`` holds per (row, list) its lower bound, the counts of live and listed keys and the chunk's extreme keys; a
+truncated chunk's scores are also stored whole, for the merge to read when its list falls short.
 """
 
 import flydsl.expr as fx
