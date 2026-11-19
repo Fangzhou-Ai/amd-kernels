@@ -13,6 +13,7 @@ from .reference import RANK, V
 NWG = 256
 REC_DW = 4
 REC_OFF = 2048
+SCRATCH_DW = 2048 + 8 * 48 * 32 * 4 + 48 * 8 * 4
 MAX_ROWS = 48
 NAME = "sampling/markov_gumbel_fused_v163840_r512"
 
@@ -23,7 +24,7 @@ def row_tiles(n: int) -> int:
 
 def scratch_dwords(n: int) -> int:
     """Size of the int32 scratch for ``n`` rows: generation, per-row results, per-workgroup (value, column, tag) records."""
-    return REC_OFF + n * NWG * REC_DW
+    return SCRATCH_DW
 
 
 @functools.cache
