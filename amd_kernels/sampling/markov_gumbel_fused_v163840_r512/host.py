@@ -12,8 +12,7 @@ from .reference import RANK, V
 
 NWG = 256
 REC_DW = 4
-REC_OFF = 2048
-SCRATCH_DW = 2048 + 8 * 48 * 32 * 4 + 48 * 8 * 4
+SCRATCH_DW = 2048 + 48 * 256 * 4
 MAX_ROWS = 48
 NAME = "sampling/markov_gumbel_fused_v163840_r512"
 
