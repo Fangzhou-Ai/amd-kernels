@@ -36,9 +36,8 @@ def global_i32(addr, words, nontemporal=False):
 
 
 def relu2(x):
-    """2 relu(x) as x + |x| (the 1/2 is in the head weights)."""
-    x = F(x)
-    return x + F(fmath.absf(x))
+    """relu(x), one VALU op (AITER's 2 relu(x) = x + |x| with the 1/2 in the head weights is the same product bit for bit)."""
+    return fx.max(F(x), F(0.0))
 
 
 def inclusive_scan(v):

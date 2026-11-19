@@ -25,7 +25,9 @@ MAX_ROWS = 256  # rows one call may hold
 INFO_OFFSET = MAX_ROWS * NCH_MAX * 16  # bytes: the per-row records follow the meta plane
 OVF_KEYS = 7 * 2048  # keys of chunks the merge reads whole
 FULL_STRIDE = NCH_MAX * CHUNK_MAX  # a row's plane of all scores of its truncated chunks
-SPREAD = 2688  # list keys a sequence's chunks share when its selected keys spread evenly (1.3 x TOPK)
+import os
+TBDIV = int(os.environ.get('KK_TBDIV', '4'))
+SPREAD = int(os.environ.get('KK_SPREAD', '2688'))  # list keys a sequence's chunks share when its selected keys spread evenly (1.3 x TOPK)
 POOL_TARGET = 12288  # entries a pool is cut to where the exactness bound below allows
 
 
@@ -45,7 +47,7 @@ def list_size(nch: int, cb: int) -> int:
     slots = OVF_KEYS // cb
     floor = -(-(2047 // (slots + 1) + 1) // 32) * 32
     pool = (POOL_TARGET - cb) // max(nch - 1, 1) * 8 // 9 // 32 * 32 if nch > 1 else cb
-    want = max(cb // 4 // 32 * 32, 32, SPREAD // max(nch, 1) // 32 * 32)
+    want = max(cb // TBDIV // 32 * 32, 32, SPREAD // max(nch, 1) // 32 * 32)
     return min(max(floor, min(want, pool)), cb)
 
 
@@ -61,7 +63,7 @@ def list_size_rt(nch, cb):
     floor = ((I(2047) // (slots + 1) + 1 + 31) // 32) * 32
     pool = ((I(POOL_TARGET) - cb) // fx.max(nch - 1, I(1)) * 8 // 9 // 32) * 32
     pool = (nch > 1).select(pool, cb)
-    want = fx.max(fx.max(cb // 4 // 32 * 32, I(32)), I(SPREAD) // fx.max(nch, I(1)) // 32 * 32)
+    want = fx.max(fx.max(cb // TBDIV // 32 * 32, I(32)), I(SPREAD) // fx.max(nch, I(1)) // 32 * 32)
     return fx.min(fx.max(floor, fx.min(want, pool)), cb)
 
 

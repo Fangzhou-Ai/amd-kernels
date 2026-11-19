@@ -30,8 +30,6 @@ from .geometry import FULL_STRIDE, INFO_OFFSET, NCH_MAX, OVF_KEYS, POOL, TOPK, l
 
 NT = 512
 NWAVES = NT // 64
-BLOCKS = POOL // (NT * 4)  # pool blocks a thread holds
-OVERFLOW = OVF_KEYS // (NT * 4)  # blocks of replacement keys
 HPAD = 2304  # a histogram of 2048 bins in 32-bin groups of 36 words: the scan reads a lane's group conflict-free
 BUF = HPAD + NT  # + a dummy word a thread for keys outside the pass's prefix
 NCAND = 64  # keys in the threshold's bin that are ranked exactly
@@ -41,8 +39,10 @@ NEG_INF_BITS = 0xFF800000 - (1 << 32)
 
 
 @launcher
-def compile_merge(uniform: bool = False, timing: bool = False):
-    name = "mxfp4_paged_topk_merge_d128_h32" + ("_u" if uniform else "") + ("_t" if timing else "")
+def compile_merge(blocks: int, uniform: bool = False, timing: bool = False):
+    """``blocks``: 2048-entry pool blocks a thread holds (the host picks the fewest that hold the widest pool)."""
+    BLOCKS = blocks
+    name = f"mxfp4_paged_topk_merge_d128_h32_b{blocks}" + ("_u" if uniform else "") + ("_t" if timing else "")
 
     @fx.struct
     class Shared:
@@ -99,6 +99,17 @@ def compile_merge(uniform: bool = False, timing: bool = False):
         def lds_add(field, idx, v):
             fx.atomic_add(fx.add_offset(field.ptr, idx), v, syncscope="workgroup")
 
+        def stream_load(s_, st):
+            """Block ``s_`` of the replacement keys: the full scores of the saturated chunks (``smem.cof``: their
+            ids) in chunk order; four keys a thread, INT_MIN past the last, and the position of the first."""
+            nb_, cb_, nkeys, full_ = st
+            e0 = I(s_) * (NT * 4) + tid * 4
+            ok = e0 < nkeys
+            q = fx.min(e0 // cb_, I(31))
+            at = I(smem.cof.ptr[q]) * cb_ + (e0 - q * cb_)
+            v4 = fx.Vector(buffer_ops.buffer_load(full_, at, vec_width=4, dtype=I, mask=ok))
+            return [ok.select(I(v4[k]), I(INT_MIN)) for k in range(4)], at
+
         def hist_scan(base, need):
             """Wave 0: the bin holding the ``need``-th largest key of the histogram at ``base`` (a lane's 32 bins: 8
             vector reads, then one 32-bin group re-read across lanes), the keys in bins above it, the total."""
@@ -136,26 +147,35 @@ def compile_merge(uniform: bool = False, timing: bool = False):
                 store_lds(smem.acc, 3, I(0))
             fx.gpu.barrier()
 
-        def radix(keys, active):
+        def radix(keys, active, st, inv, offset):
             """-> the 2048th largest live key (INT_MIN when there are at most 2048), the number of keys equal to it
             to take. Three passes over two alternating histograms: wave 0 scans one while the other waves clear
-            the next. ``active[b]`` (uniform): block ``b``'s four keys per thread may be live."""
+            the next. ``active[b]`` (uniform): block ``b``'s four keys per thread may be live; ``st``: the streamed
+            replacement keys (see ``stream_load``) or None."""
             for pi in range_constexpr(len(PASSES)):
                 shift, width = PASSES[pi]
                 nb = 1 << width
                 base = (pi % 2) * BUF
                 prefix = I(smem.acc.ptr[0])
                 dmask = I(smem.acc.ptr[1])
+
+                def add(key):
+                    u = key ^ I(INT_MIN)
+                    hit = key != I(INT_MIN)
+                    if pi > 0:
+                        hit = hit & ((u & dmask) == prefix)
+                    bn = (u >> shift) & (nb - 1)
+                    lds_add(smem.bins, base + hit.select(bn + ((bn >> 5) << 2), I(HPAD) + tid), I(1))
+
                 for blk in range_constexpr(len(active)):
                     if active[blk]:
                         for k in range_constexpr(4):
-                            key = keys[blk * 4 + k]
-                            u = key ^ I(INT_MIN)
-                            hit = key != I(INT_MIN)
-                            if pi > 0:
-                                hit = hit & ((u & dmask) == prefix)
-                            bn = (u >> shift) & (nb - 1)
-                            lds_add(smem.bins, base + hit.select(bn + ((bn >> 5) << 2), I(HPAD) + tid), I(1))
+                            add(keys[blk * 4 + k])
+                if fx.const_expr(st is not None):
+                    for s_ in range(0, st[0], 1):
+                        ks, at = stream_load(s_, st)
+                        for k in range_constexpr(4):
+                            add(ks[k])
                 fx.gpu.barrier()
                 if wave == 0:
                     rem = I(smem.acc.ptr[2])
@@ -173,7 +193,7 @@ def compile_merge(uniform: bool = False, timing: bool = False):
             short = I(smem.acc.ptr[3]) <= TOPK
             return short.select(I(INT_MIN), I(smem.acc.ptr[0]) ^ I(INT_MIN)), short.select(I(0), I(smem.acc.ptr[2]))
 
-        def emit(keys, idxs, active, kt, room):
+        def emit(keys, idxs, active, kt, room, st):
             """Compacts the keys above ``kt`` and the first ``room`` equal to it (thread, then entry order) into the
             stage and stores it."""
             ngt, neq = I(0), I(0)
@@ -183,6 +203,15 @@ def compile_merge(uniform: bool = False, timing: bool = False):
                         key = keys[blk * 4 + k]
                         ngt = ngt + (key > kt).select(I(1), I(0))
                         neq = neq + ((key == kt) & (key != I(INT_MIN))).select(I(1), I(0))
+            if fx.const_expr(st is not None):
+                for s_, c2 in range(0, st[0], 1, init=[ngt, neq]):
+                    ks, at = stream_load(s_, st)
+                    g_, e_ = c2[0], c2[1]
+                    for k in range_constexpr(4):
+                        g_ = g_ + (ks[k] > kt).select(I(1), I(0))
+                        e_ = e_ + ((ks[k] == kt) & (ks[k] != I(INT_MIN))).select(I(1), I(0))
+                    c2 = yield [g_, e_]
+                ngt, neq = c2[0], c2[1]
             pack = (ngt << 16) + neq
             inc = inclusive_scan(pack)
             if lane == 63:
@@ -203,15 +232,30 @@ def compile_merge(uniform: bool = False, timing: bool = False):
                         store_lds(smem.sval, pos, key)
                         ab = ab + gt.select(I(1), I(0))
                         eb = eb + eq.select(I(1), I(0))
+            if fx.const_expr(st is not None):
+                for s_, c2 in range(0, st[0], 1, init=[ab, eb]):
+                    ks, at = stream_load(s_, st)
+                    a_, e_ = c2[0], c2[1]
+                    for k in range_constexpr(4):
+                        gt = ks[k] > kt
+                        eq = (ks[k] == kt) & (ks[k] != I(INT_MIN))
+                        pos = (gt | (eq & (e_ < room))).select(a_ + fx.min(e_, room), I(TOPK))
+                        store_lds(smem.sidx, pos, at + k)
+                        store_lds(smem.sval, pos, ks[k])
+                        a_ = a_ + gt.select(I(1), I(0))
+                        e_ = e_ + eq.select(I(1), I(0))
+                    c2 = yield [a_, e_]
             fx.gpu.barrier()
             store_stage()
 
-        def bins_of(keys, active, inv, offset):
-            """The keys' bins, 1 + (0 .. 2045) in the pool's score range (0: no key), two to a register."""
+        def bin_key(key, inv, offset):
+            """The key's bin, 1 + (0 .. 2045) in the pool's score range (0: no key)."""
+            b1 = fx.min(fx.max(vop("v_fma_f32 $0, $1, $2, $3", key_to_float(key), inv, offset).to(I), I(0)), I(2045)) + 1
+            return (key != I(INT_MIN)).select(b1, I(0))
 
-            def one(key):
-                b1 = fx.min(fx.max(vop("v_fma_f32 $0, $1, $2, $3", key_to_float(key), inv, offset).to(I), I(0)), I(2045)) + 1
-                return (key != I(INT_MIN)).select(b1, I(0))
+        def bins_of(keys, active, inv, offset):
+            """The keys' bins, two to a register."""
+            one = lambda key: bin_key(key, inv, offset)
 
             packed = []
             for blk in range_constexpr(len(active)):
@@ -246,8 +290,9 @@ def compile_merge(uniform: bool = False, timing: bool = False):
                 store_lds(smem.acc, 2, short.select(I(0), I(smem.bins.ptr[d + ((d >> 5) << 2)])))
             return d, short
 
-        def finish(keys, idxs, active, packed):
-            """The scanned bin is in ``acc``: place the keys above it, rank the keys in it, store."""
+        def finish(keys, idxs, active, packed, st, inv, offset):
+            """The scanned bin is in ``acc``: place the keys above it, rank the keys in it, store. ``st``: streamed
+            replacement keys (None: the pool is all)."""
             gt_thr, cand_val = I(smem.acc.ptr[0]), I(smem.acc.ptr[13])
             above_n, nc = I(smem.acc.ptr[1]), I(smem.acc.ptr[2])
             if nc <= NCAND:
@@ -258,6 +303,16 @@ def compile_merge(uniform: bool = False, timing: bool = False):
                             b1 = bin_of(packed, blk, k)
                             cg = cg + (b1 > gt_thr).select(I(1), I(0))
                             cn = cn + (b1 == cand_val).select(I(1), I(0))
+                if fx.const_expr(st is not None):
+                    for s_, c2 in range(0, st[0], 1, init=[cg, cn]):
+                        ks, at = stream_load(s_, st)
+                        g_, n_ = c2[0], c2[1]
+                        for k in range_constexpr(4):
+                            b1 = bin_key(ks[k], inv, offset)
+                            g_ = g_ + (b1 > gt_thr).select(I(1), I(0))
+                            n_ = n_ + (b1 == cand_val).select(I(1), I(0))
+                        c2 = yield [g_, n_]
+                    cg, cn = c2[0], c2[1]
                 pack = (cg << 16) + cn
                 inc = inclusive_scan(pack)
                 if lane == 63:
@@ -275,18 +330,32 @@ def compile_merge(uniform: bool = False, timing: bool = False):
                             is_c = b1 == cand_val
                             store_lds(smem.sidx, is_gt.select(pg, I(TOPK) + tid), idxs[blk * 4 + k])
                             store_lds(smem.sval, is_gt.select(pg, I(TOPK) + tid), keys[blk * 4 + k])
-                            if is_c:
-                                store_lds(smem.ckey, pcn, keys[blk * 4 + k])
-                                store_lds(smem.cidx, pcn, idxs[blk * 4 + k])
+                            store_lds(smem.ckey, is_c.select(pcn, I(NCAND) + tid), keys[blk * 4 + k])
+                            store_lds(smem.cidx, is_c.select(pcn, I(NCAND) + tid), idxs[blk * 4 + k])
                             pg = pg + is_gt.select(I(1), I(0))
                             pcn = pcn + is_c.select(I(1), I(0))
+                if fx.const_expr(st is not None):
+                    for s_, c2 in range(0, st[0], 1, init=[pg, pcn]):
+                        ks, at = stream_load(s_, st)
+                        g_, n_ = c2[0], c2[1]
+                        for k in range_constexpr(4):
+                            b1 = bin_key(ks[k], inv, offset)
+                            is_gt = b1 > gt_thr
+                            is_c = b1 == cand_val
+                            store_lds(smem.sidx, is_gt.select(g_, I(TOPK) + tid), at + k)
+                            store_lds(smem.sval, is_gt.select(g_, I(TOPK) + tid), ks[k])
+                            store_lds(smem.ckey, is_c.select(n_, I(NCAND) + tid), ks[k])
+                            store_lds(smem.cidx, is_c.select(n_, I(NCAND) + tid), at + k)
+                            g_ = g_ + is_gt.select(I(1), I(0))
+                            n_ = n_ + is_c.select(I(1), I(0))
+                        c2 = yield [g_, n_]
                 fx.gpu.barrier()
                 need2 = I(TOPK) - above_n
                 if wave == 0:
                     mine = (lane < nc).select(I(smem.ckey.ptr[lane]), I(INT_MIN))
-                    for jj, st in range(0, nc, 1, init=[I(0)]):
+                    for jj, st_ in range(0, nc, 1, init=[I(0)]):
                         other = readlane(mine, I(jj))
-                        rank = st[0] + ((other > mine) | ((other == mine) & (I(jj) < lane))).select(I(1), I(0))
+                        rank = st_[0] + ((other > mine) | ((other == mine) & (I(jj) < lane))).select(I(1), I(0))
                         ranks = yield [rank]
                     if (lane < nc) & (ranks < need2):
                         store_lds(smem.sidx, above_n + ranks, I(smem.cidx.ptr[lane]))
@@ -295,8 +364,8 @@ def compile_merge(uniform: bool = False, timing: bool = False):
                 store_stage()
             else:
                 radix_init()
-                kt, room = radix(keys, active)
-                emit(keys, idxs, active, kt, room)
+                kt, room = radix(keys, active, st, inv, offset)
+                emit(keys, idxs, active, kt, room, st)
 
         def serve(cb, nch, keys_raw, idx_raw, mt):
             tb = list_size_rt(nch, cb)
@@ -338,8 +407,8 @@ def compile_merge(uniform: bool = False, timing: bool = False):
                     store_lds(smem.acc, 4, m.to(I))
                     store_lds(smem.acc, 5, (m >> I64(32)).to(I))
                 if m != 0:
-                    for q, st in range(0, 32, 1, init=[m]):
-                        left = I64(st[0])
+                    for q, sq in range(0, 32, 1, init=[m]):
+                        left = I64(sq[0])
                         if left != 0:
                             if lane == 0:
                                 store_lds(smem.cof, I(q), I(fx.math.cttz(left).to(I)))
@@ -348,38 +417,34 @@ def compile_merge(uniform: bool = False, timing: bool = False):
             stamp(3)
             m_lo, m_hi = I(smem.acc.ptr[4]), I(smem.acc.ptr[5])
             if (m_lo | m_hi) == 0:
-                finish(keys, idxv, active, packed)
+                finish(keys, idxv, active, packed, None, inv, offset)
                 stamp(5)
             else:
                 msat = (I64(m_hi) << I64(32)) | (I64(m_lo) & I64(0xFFFFFFFF))
                 nsat = I(fx.math.ctpop(msat).to(I))
-                keys2, idxs2 = [], []
+                keys2 = []
                 for blk in range_constexpr(BLOCKS):
                     li = fx.min((blk * (NT * 4) + tid * 4) // slot, I(63))
                     is_sat = ((msat >> I64(li)) & I64(1)) != I64(0)
                     for k in range_constexpr(4):
                         keys2.append(is_sat.select(I(INT_MIN), keys[blk * 4 + k]))
-                        idxs2.append(idxv[blk * 4 + k])
                 full = buffer_ops.create_buffer_resource_from_addr(arg_full + I64(row) * (FULL_STRIDE * 4), num_records_bytes=FULL_STRIDE * 4)
-                for s in range_constexpr(OVERFLOW):
-                    e0 = s * (NT * 4) + tid * 4
-                    ok = e0 < nsat * cb
-                    q = fx.min(e0 // cb, I(31))
-                    at = I(smem.cof.ptr[q]) * cb + (e0 - q * cb)
-                    v4 = fx.Vector(buffer_ops.buffer_load(full, at, vec_width=4, dtype=I, mask=ok))
-                    for k in range_constexpr(4):
-                        keys2.append(ok.select(I(v4[k]), I(INT_MIN)))
-                        idxs2.append(at + k)
-                active2 = active + [I(s * (NT * 4)) < nsat * cb for s in range_constexpr(OVERFLOW)]
+                nkeys = nsat * cb
+                st = ((nkeys + (NT * 4 - 1)) // (NT * 4), cb, nkeys, full)
                 zero_bins(0, 0, NT)
                 fx.gpu.barrier()
-                packed2 = bins_of(keys2, active2, inv, offset)
-                hist_add(packed2, active2)
+                packed2 = bins_of(keys2, active, inv, offset)
+                hist_add(packed2, active)
+                for s_ in range(0, st[0], 1):
+                    ks, at = stream_load(s_, st)
+                    for k in range_constexpr(4):
+                        b1 = bin_key(ks[k], inv, offset)
+                        lds_add(smem.bins, (b1 != I(0)).select(b1 + ((b1 >> 5) << 2), I(HPAD) + tid), I(1))
                 fx.gpu.barrier()
                 if wave == 0:
                     scan_bin()
                 fx.gpu.barrier()
-                finish(keys2, idxs2, active2, packed2)
+                finish(keys2, idxv, active, packed2, st, inv, offset)
                 stamp(5)
 
         stamp(0)
@@ -399,9 +464,8 @@ def compile_merge(uniform: bool = False, timing: bool = False):
         keys_raw, idx_raw = [], []
         for blk in range_constexpr(BLOCKS):
             kv4, iv4 = zero4, zero4
-            if blk < nblk:
-                kv4 = fx.Vector(buffer_ops.buffer_load(lk, blk * (NT * 4) + tid * 4, vec_width=4, dtype=I))
-                iv4 = fx.Vector(buffer_ops.buffer_load(lx, blk * (NT * 4) + tid * 4, vec_width=4, dtype=I))
+            kv4 = fx.Vector(buffer_ops.buffer_load(lk, blk * (NT * 4) + tid * 4, vec_width=4, dtype=I))
+            iv4 = fx.Vector(buffer_ops.buffer_load(lx, blk * (NT * 4) + tid * 4, vec_width=4, dtype=I))
             keys_raw.append(kv4)
             idx_raw.append(iv4)
         mt = fx.Vector(buffer_ops.buffer_load(meta, (row * NCH_MAX + fx.min(tid, I(NCH_MAX - 1))) * 4, vec_width=4, dtype=I))

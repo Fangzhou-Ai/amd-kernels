@@ -23,8 +23,11 @@ from flydsl.expr.typing import Float4E2M1FN, T
 from ._wave import F, I, I64, INT_MIN, global_i32, permlane_swap, relu2, score_key, store_lds, vop
 
 HEADS = 32
-DEPTH = 2
+import os as _os
+DEPTH = int(_os.environ.get('KK_DEPTH', '2'))
 SPEC_SIZES = (512, 1024, 1536, 2048)
+import os
+SC = int(os.environ.get('KK_SC', '0'))
 
 
 @dataclass
@@ -80,7 +83,7 @@ def score_chunk(sc, rows, cmax, num_waves, cb, cc, field, base, hook=None):
         wl = []
         for mi in range_constexpr(2):
             w4 = fx.Vector(buffer_ops.buffer_load(w_r, row * HEADS + mi * 16 + g * 4, vec_width=4, dtype=I)).bitcast(F)
-            wl.append([w4[e] * 0.5 for e in range(4)])
+            wl.append([w4[e] for e in range(4)])
         w_l.append(wl)
     nst = (fx.max(fx.min(sc.max_end - cc * cb, cb), I(0)) + 63) // 64
     step0 = cc * (cb // 64)
@@ -102,6 +105,9 @@ def score_chunk(sc, rows, cmax, num_waves, cb, cc, field, base, hook=None):
         kvs = fx.Vector(global_i32(kvsb + I64(g * 64 + l * 4), 1))[0]
         if fx.const_expr(hook is not None and k == 0):
             hook(10)
+        if fx.const_expr(SC == 1):
+            kv = [fx.Vector.from_elements([phys, phys + nt, phys ^ nt, I(nt)], dtype=I) for nt in range(4)]
+            return kv, phys
         kv = [global_i32(kvb + I64(g * 1024 + l * 16 + nt * 256), 4, True) for nt in range(4)]
         return kv, kvs
 
@@ -109,6 +115,11 @@ def score_chunk(sc, rows, cmax, num_waves, cb, cc, field, base, hook=None):
         if fx.const_expr(hook is not None and k == 0):
             fx.rocdl.s_waitcnt(vmcnt=0)
             hook(11)
+        if fx.const_expr(SC == 2):
+            key = (wave + k * num_waves) * 64 + g * 16 + l
+            for r in range_constexpr(rows):
+                store_lds(field, base + r * cmax + key, I(kv[0][0]) ^ I(kv[1][1]) ^ I(kv[2][2]) ^ I(kv[3][3]) ^ I(kvs))
+            return
         per_tile = []
         for nt in range_constexpr(4):
             bfrag = fx.make_rmem_tensor(4, I)

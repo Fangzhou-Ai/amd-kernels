@@ -29,6 +29,8 @@ NW = 8
 HPAD = 2304  # the histogram a 32-bin group per 36 words: the scan reads a lane's group conflict-free
 HIST = HPAD + 64  # + one dummy word a lane, for keys outside the round's prefix
 NUM_REC = 0x7FFFF000
+import os
+SKIP = int(os.environ.get('KK_SKIP', '0'))
 
 
 @launcher
@@ -36,7 +38,7 @@ def compile_chunk_lists(rows: int, uniform: bool = False, timing: bool = False):
     """``rows``: query rows a workgroup scores of a sequence (1 - 6; a sequence of more rows takes several workgroups
     a chunk)."""
     assert 1 <= rows <= QMAX
-    name = f"mxfp4_paged_chunk_lists_d128_h32_r{rows}" + ("_u" if uniform else "") + ("_t" if timing else "")
+    name = f"mxfp4_paged_chunk_lists_d128_h32_r{rows}_{__import__("amd_kernels.indexer.mxfp4_paged_score_topk_d128_h32_top2048.geometry",fromlist=["x"]).TBDIV}_{__import__("amd_kernels.indexer.mxfp4_paged_score_topk_d128_h32_top2048.geometry",fromlist=["x"]).SPREAD}_s{SKIP}{__import__('os').environ.get('KK_SC','0')}d{__import__('os').environ.get('KK_DEPTH','2')}" + ("_u" if uniform else "") + ("_t" if timing else "")
 
     @fx.struct
     class Shared:
@@ -301,10 +303,14 @@ def compile_chunk_lists(rows: int, uniform: bool = False, timing: bool = False):
 
         if (tile * rows < count) & ((c * cb < max_end) | (c == 0)):
             stamp(0)
-            score_chunk(sc, rows, CHUNK_MAX, NW, cb, c, smem.keys, 0, stamp if timing else None)
+            if fx.const_expr(SKIP != 2):
+                score_chunk(sc, rows, CHUNK_MAX, NW, cb, c, smem.keys, 0, stamp if timing else None)
             fx.gpu.barrier()
             stamp(1)
-            if (wave < rows) & (tile * rows + wave < count):
+            if fx.const_expr(SKIP == 1):
+                if wave == 0:
+                    buffer_ops.buffer_store(I(smem.keys.ptr[lane]), meta, c)
+            if fx.const_expr(SKIP != 1) and (wave < rows) & (tile * rows + wave < count):
                 select_row(wave, c)
             stamp(2)
 

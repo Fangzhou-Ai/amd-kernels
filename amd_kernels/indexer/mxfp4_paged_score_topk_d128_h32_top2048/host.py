@@ -10,7 +10,8 @@ from amd_kernels.warm_up import entry
 
 from . import lists as _lists
 from . import merge as _merge
-from .geometry import CHUNK_MAX, CHUNKS_TARGET, MAX_ROWS, NCH_MAX, QMAX, TOPK, chunk_size, num_chunks, scratch_words
+from .geometry import (CHUNK_MAX, CHUNKS_TARGET, MAX_ROWS, NCH_MAX, QMAX, TOPK, chunk_size, list_size, num_chunks,
+                       scratch_words, slot_size)
 
 HEADS = 32
 _WIDE_BATCH = 16  # sequences above which a workgroup scores all rows of a sequence
@@ -75,9 +76,25 @@ def _chunk_exe(rows: int, uniform: bool = False, timing: bool = False):
     return _lists.compile_chunk_lists(rows, uniform, timing)
 
 
+BLOCK_TIERS = (3, 6, 10)  # pool blocks the merge kernel holds: its variants
+TIER_WIDTHS = (16384, 65536, 131072)  # the widest block table of each
+
+
 @functools.cache
-def _merge_exe(uniform: bool = False, timing: bool = False):
-    return _merge.compile_merge(uniform, timing)
+def merge_blocks(width: int, target: int) -> int:
+    """The merge variant (pool blocks of 2048 entries a thread holds) that takes the widest pool of up to ``width``
+    keys a sequence cut into ``target`` chunks."""
+    need = 1
+    for n in range(64, width + 1, 64):
+        cb = chunk_size(n, target)
+        nch = num_chunks(n, cb)
+        need = max(need, -(-((nch - 1) * slot_size(list_size(nch, cb)) + cb) // 2048))
+    return next(b for b in BLOCK_TIERS if b >= need)
+
+
+@functools.cache
+def _merge_exe(blocks: int, uniform: bool = False, timing: bool = False):
+    return _merge.compile_merge(blocks, uniform, timing)
 
 
 def _score_topk(
@@ -120,7 +137,7 @@ def _score_topk(
     _run_compiled(_chunk_exe(tile, uniform, dbg is not None), *common, keys.data_ptr(), pos.data_ptr(), meta.data_ptr(),
                   full.data_ptr(), *geom, nch, max_query_len, target, dbg.data_ptr() if dbg is not None else 0,
                   batch * nch * tiles, stream)
-    _run_compiled(_merge_exe(uniform, dbg is not None), query_start_loc.data_ptr(), keys.data_ptr(), pos.data_ptr(),
+    _run_compiled(_merge_exe(merge_blocks(width, target), uniform, dbg is not None), query_start_loc.data_ptr(), keys.data_ptr(), pos.data_ptr(),
                   meta.data_ptr(), full.data_ptr(), out_indices.data_ptr(), out_scores.data_ptr(), batch,
                   out_indices.stride(0), out_scores.stride(0), max_query_len,
                   dbg.data_ptr() + 4 * 4096 * 16 if dbg is not None else 0, rows, stream)
@@ -138,9 +155,12 @@ def _mode(*args, **kwargs):
 
 
 def _sizes(mode):
-    """The chunk-kernel variants (the rows a workgroup scores; the merge kernel is one variant): ``n`` > 0 are
-    ``n`` rows of each of many sequences (whole rows a workgroup), ``-n`` a few sequences (at most 2 rows)."""
-    return (*range(1, QMAX + 1), -1, -2)
+    """The kernel variants: the chunk kernel's rows a workgroup scores and the merge kernel's pool blocks. ``n`` is
+    ``+-(rows + 100 * tier)``: rows of each of many sequences (whole rows a workgroup) or a few sequences (at most 2
+    rows), at the width of the tier."""
+    wide = tuple(r + 100 * t for t in range(len(BLOCK_TIERS)) for r in range(1, QMAX + 1))
+    narrow = tuple(-(r + 100 * t) for t in range(len(BLOCK_TIERS)) for r in (1, 2))
+    return wide + narrow
 
 
 def _inputs(mode, n, q_payload, q_scales, weights, cache, block_table, query_start_loc, row_ends, max_query_len,
@@ -148,12 +168,13 @@ def _inputs(mode, n, q_payload, q_scales, weights, cache, block_table, query_sta
     """A batch of the variant ``n`` over zeros (compile-only: nothing launches)."""
     device = q_payload.device
     seqs = _WIDE_BATCH + 1 if n > 0 else 1
-    n = abs(n)
+    rows_a, tier = abs(n) % 100, abs(n) // 100
+    n = rows_a
     rows = seqs * n
     z = lambda *shape, dtype: torch.zeros(*shape, dtype=dtype, device=device)
     args = (
         z(rows, HEADS, 64, dtype=torch.uint8), z(rows, 1, 4, 16, 4, dtype=torch.uint8), z(rows, HEADS, dtype=torch.float32),
-        cache, z(seqs, block_table.shape[1], dtype=torch.int32),
+        cache, z(seqs, TIER_WIDTHS[tier] // PAGE, dtype=torch.int32),
         torch.arange(seqs + 1, dtype=torch.int32, device=device) * n, z(rows, dtype=torch.int32), n,
         z(rows, TOPK, dtype=torch.int32), z(rows, TOPK, dtype=torch.float32),
     )
