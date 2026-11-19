@@ -27,7 +27,7 @@ from flydsl.expr.typing import T, Vector as Vec
 
 from .reference import E as N, H as K
 from .aux import (EPOCH_BASE, IDS_WORDS, MASK_BYTES, MASK_WORDS, NE, aux_counts, aux_expert_blocks, aux_max_blocks, aux_pair_row, aux_prefill, aux_publish_cum,
-                  aux_zero_masks, lds_or)
+                  aux_zero_masks, lds_or, mask_words)
 from .topk import (LDS_WORDS, MAXC, NQ, RANK_UNROLL, TOPK, _ballot, _popcount, topk_fast_write, topk_new, topk_pivot, topk_q_keys,
                    topk_rank_start, topk_rank_step, topk_slow_out, topk_slow_select,
                    topk_finish, topk_tie_masks)
@@ -110,6 +110,8 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
     MR = 16 * MT
     MR_ALLOC = slab_rows(MT, WN, MS)
     IDS_VECS = (192 * TOPK + 255) // 256  # vectors of 4 ids a lane loads
+    MWORDS = mask_words(16 * MT)  # words of an expert's token mask
+    MASK_B = NE * MWORDS * 4
     SLOT_FRAGS = NF + MTP
     WF = NF  # weight positions per slot
     SLOT = SLOT_FRAGS * 2048
@@ -121,7 +123,7 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
     R = max(2, min(NBK, RING_BYTES // SLOT, 63 // PER + 1))
     LDS = R * SLOT
     assert LDS <= RING_BYTES and (R - 1) * PER <= 63, (LDS, R, PER)
-    assert not AUX or LDS >= MASK_BYTES + NE * 4, LDS  # the masks and the first rows of the sort live in the dead ring
+    assert not AUX or LDS >= MASK_B + 4096 + 256, LDS  # the masks and the first rows of the sort live in the dead ring
 
     @fx.struct
     class Shared:
@@ -246,6 +248,16 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
         def barrier():
             llvm.inline_asm(None, [], "s_barrier", "~{memory}", has_side_effects=True)
 
+        if const_expr(AUX):
+            # the sort's pads and the zeroed moe buffer, issued before the weight stream: the loop's last wait (vmcnt 0)
+            # has them acknowledged before this workgroup's slabs are stored, so a consumer wave, which goes on once every
+            # slab is in, writes its valid rows after every pad
+            pre_bytes = fx.Int64(i32_cap) * 4
+            aux_prefill(bid * (64 * NWV) + tx, GRID * 64 * NWV, i32_m, i32_cap, i32_zvecs,
+                        buffer_ops.create_buffer_resource_from_addr(arg_sti, num_records_bytes=pre_bytes),
+                        buffer_ops.create_buffer_resource_from_addr(arg_sw, num_records_bytes=pre_bytes),
+                        buffer_ops.create_buffer_resource_from_addr(arg_mi, num_records_bytes=pre_bytes),
+                        buffer_ops.create_buffer_resource_from_addr(arg_mb, num_records_bytes=fx.Int64(i32_zvecs) * 16))
         for b in range_constexpr(R):
             dma(b)
         _sb()
@@ -272,16 +284,6 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
 
         stamp(1)
         pr = buffer_ops.create_buffer_resource_from_addr(arg_p, num_records_bytes=KS * MR_ALLOC * (N * 4))
-        if const_expr(AUX):
-            # the sort's pads, zeroed masks and moe buffer land before this workgroup's slabs (a consumer wave, which
-            # goes on once every slab is in, may then write a valid row)
-            pre_bytes = fx.Int64(i32_cap) * 4
-            aux_prefill(bid * (64 * NWV) + tx, GRID * 64 * NWV, i32_m, i32_cap, i32_zvecs,
-                        buffer_ops.create_buffer_resource_from_addr(arg_sti, num_records_bytes=pre_bytes),
-                        buffer_ops.create_buffer_resource_from_addr(arg_sw, num_records_bytes=pre_bytes),
-                        buffer_ops.create_buffer_resource_from_addr(arg_mi, num_records_bytes=pre_bytes),
-                        buffer_ops.create_buffer_resource_from_addr(arg_mb, num_records_bytes=fx.Int64(i32_zvecs) * 16))
-            fx.rocdl.s_waitcnt(vmcnt=0)
         for i in range_constexpr(NRW):
             for m in range_constexpr(MW):
                 row = row0 + (wm * MW + m) * 16 + l16
@@ -390,7 +392,7 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
                             buffer_ops.buffer_store(ep, ep_res, EPOCH_BASE + tok, mask=lane == 0, cache_modifier=SC1)
                             buffer_ops.buffer_store(out_id | (par << 31), ids_res, tok * TOPK + lane, mask=lane < TOPK,
                                                     cache_modifier=SC1)
-                            aux_zero_masks(lds_base, lane)
+                            aux_zero_masks(lds_base, lane, MWORDS)
                             nwords = i32_m * TOPK
                             idw = [Vec.filled(4, 0, fx.Int32) for _ in range_constexpr(IDS_VECS)]
                             stale = fx.Int32(1)
@@ -410,20 +412,24 @@ def compile_router_e896_h7168(mt: int, ks: int, shuf: int, fused: int = 1, wn: i
                                 fx.rocdl.s_sleep(POLL_SLEEP)
                             stamp(13)
                             for it in range_constexpr(IDS_VECS):
-                                for ee in range_constexpr(4):
-                                    wi = (it * 64 + lane) * 4 + ee
-                                    inside = wi < nwords
-                                    t_ = wi >> 4
-                                    ex = inside.select(fx.Int32(idw[it][ee]) & 1023, fx.Int32(0))
-                                    lds_or(lds_base + (ex * MASK_WORDS + (t_ >> 5)) * 4,
-                                           inside.select(fx.Int32(1) << (t_ & 31), fx.Int32(0)))
+                                if it * 256 < nwords:  # a vector row with ids (uniform): the others have none to OR
+                                    for ee in range_constexpr(4):
+                                        wi = (it * 64 + lane) * 4 + ee
+                                        inside = wi < nwords
+                                        t_ = wi >> 4
+                                        ex = fx.Int32(idw[it][ee]) & 1023
+                                        # lanes past the last id OR zero into a slot of their own (one address for all of
+                                        # them would serialise the atomic)
+                                        lds_or(inside.select(lds_base + (ex * MWORDS + (t_ >> 5)) * 4,
+                                                             lds_base + MASK_B + 4096 + lane * 4),
+                                               inside.select(fx.Int32(1) << (t_ & 31), fx.Int32(0)))
                             fx.rocdl.s_waitcnt(lgkmcnt=0)
                             fx.rocdl.sched_barrier(0)
                             stamp(14)
-                            ac = aux_counts(lds_base, lane)
-                            aux_publish_cum(ac, lds_base, wave, lane)
+                            ac = aux_counts(lds_base, lane, MWORDS)
+                            aux_publish_cum(ac, lds_base, wave, lane, MWORDS)
                             stamp(15)
-                            row = aux_pair_row(lds_base, wave, out_id, tok)
+                            row = aux_pair_row(lds_base, wave, out_id, tok, MWORDS)
                             cap_bytes = fx.Int64(i32_cap) * 4
                             sti_r = buffer_ops.create_buffer_resource_from_addr(arg_sti, num_records_bytes=cap_bytes)
                             sw_r = buffer_ops.create_buffer_resource_from_addr(arg_sw, num_records_bytes=cap_bytes)

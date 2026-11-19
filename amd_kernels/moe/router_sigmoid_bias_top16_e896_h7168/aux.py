@@ -27,10 +27,10 @@ from flydsl.expr.typing import Vector as Vec
 from .topk import _dpp, _scan
 
 BM = 16
-MASK_WORDS = 8  # 32-bit words of one expert's token mask (M <= 256)
+MASK_WORDS = 8  # 32-bit words of one expert's token mask, at most (M <= 256): a launch of at most 128 tokens uses 4
 NE = 896
 EPL = 14  # experts per lane
-MASK_BYTES = NE * MASK_WORDS * 4  # the masks live in the dead GEMM ring (LDS), the cumulative rows after them
+MASK_BYTES = NE * MASK_WORDS * 4  # the masks live in the dead GEMM ring (LDS), the cumulative rows after them (``mw``: the words of a mask)
 IDS_WORDS = 256 * 16  # the workspace: every token's 16 expert ids, tagged
 EPOCH_BASE = IDS_WORDS  # and one epoch word a token (an aux workspace serves one M: all its tokens advance each call)
 WORKSPACE_WORDS = IDS_WORDS + 256
@@ -52,10 +52,15 @@ def lds_or(byte_addr, value):
                      syncscope="workgroup", alignment=4)
 
 
-def aux_zero_masks(lds_base, lane):
-    """Zero the masks (LDS ``lds_base`` ..): a wave's 28 stores of 1 KB."""
+def mask_words(max_tokens: int) -> int:
+    """Words of an expert's token mask for launches of at most ``max_tokens`` tokens (a multiple of 4: one 16-byte read)."""
+    return 4 if max_tokens <= 128 else MASK_WORDS
+
+
+def aux_zero_masks(lds_base, lane, mw):
+    """Zero the masks (LDS ``lds_base`` ..): a wave's stores of 1 KB."""
     zeros = Vec.from_elements([fx.Int32(0)] * 4, fx.Int32)
-    for i in range_constexpr(MASK_BYTES // 1024):
+    for i in range_constexpr(NE * mw * 4 // 1024):
         llvm.store(fx.as_ir_value(zeros), _lds_ptr(lds_base + i * 1024 + lane * 16), alignment=16)
 
 
@@ -75,16 +80,16 @@ def aux_prefill(gt, nthreads, i32_m, i32_cap, i32_zero_vecs, sti_res, sw_res, mi
         buffer_ops.buffer_store(zeros, mb_res, v * 4, mask=v < i32_zero_vecs)
 
 
-def aux_counts(lds_base, lane):
+def aux_counts(lds_base, lane, mw):
     """Lane ``lane``'s experts 14 lane .. 14 lane + 13: token counts, padded counts and first rows (scan over the lanes),
     from the finished masks (LDS). Also ``total``: the padded rows of all experts."""
-    words = [Vec(llvm.load(T.vec(4, T.i32), _lds_ptr(lds_base + EPL * lane * MASK_WORDS * 4 + 16 * i), alignment=16))
-             for i in range_constexpr(EPL * MASK_WORDS // 4)]
+    words = [Vec(llvm.load(T.vec(4, T.i32), _lds_ptr(lds_base + EPL * lane * mw * 4 + 16 * i), alignment=16))
+             for i in range_constexpr(EPL * mw // 4)]
     count, pad = [], []
     for e in range_constexpr(EPL):
-        c = fx.Int32(fx.math.ctpop(fx.Int32(words[2 * e][0])))
-        for j in range_constexpr(1, 8):
-            c = c + fx.Int32(fx.math.ctpop(fx.Int32(words[2 * e + j // 4][j % 4])))
+        c = fx.Int32(fx.math.ctpop(fx.Int32(words[e * (mw // 4)][0])))
+        for j in range_constexpr(1, mw):
+            c = c + fx.Int32(fx.math.ctpop(fx.Int32(words[e * (mw // 4) + j // 4][j % 4])))
         count.append(c)
         pad.append((c + (BM - 1)) & fx.Int32(-BM))
     lane_rows = pad[0]
@@ -104,24 +109,24 @@ def _lds_ptr(byte_addr):
     return llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), fx.as_ir_value(fx.Int64(byte_addr)))
 
 
-def aux_publish_cum(st, lds_base, wv, lane):
+def aux_publish_cum(st, lds_base, wv, lane, mw):
     """Every expert's first row to LDS (after the masks), for the lanes that look an expert up by id."""
     for e in range_constexpr(EPL):
-        llvm.store(fx.as_ir_value(st.cum[e]), _lds_ptr(lds_base + MASK_BYTES + (wv * NE + EPL * lane + e) * 4), alignment=4)
+        llvm.store(fx.as_ir_value(st.cum[e]), _lds_ptr(lds_base + NE * mw * 4 + (wv * NE + EPL * lane + e) * 4), alignment=4)
     fx.rocdl.s_waitcnt(lgkmcnt=0)
     fx.rocdl.sched_barrier(0)
 
 
-def aux_pair_row(lds_base, wv, expert, tok):
+def aux_pair_row(lds_base, wv, expert, tok, mw):
     """Lane r's pair (token ``tok``, slot r, routed to ``expert``): its row, the expert's first row plus the number of lower
     tokens in the expert's mask (LDS reads)."""
-    first = fx.Int32(llvm.load(T.i32, _lds_ptr(lds_base + MASK_BYTES + (wv * NE + expert) * 4), alignment=4))
-    w0 = Vec(llvm.load(T.vec(4, T.i32), _lds_ptr(lds_base + expert * (MASK_WORDS * 4)), alignment=16))
-    w1 = Vec(llvm.load(T.vec(4, T.i32), _lds_ptr(lds_base + expert * (MASK_WORDS * 4) + 16), alignment=16))
+    first = fx.Int32(llvm.load(T.i32, _lds_ptr(lds_base + NE * mw * 4 + (wv * NE + expert) * 4), alignment=4))
+    w0 = Vec(llvm.load(T.vec(4, T.i32), _lds_ptr(lds_base + expert * (mw * 4)), alignment=16))
+    w1 = Vec(llvm.load(T.vec(4, T.i32), _lds_ptr(lds_base + expert * (mw * 4) + 16), alignment=16)) if mw == 8 else None
     tw = tok >> 5
     low = (fx.Int32(1) << (tok & 31)) - fx.Int32(1)
     rank = fx.Int32(0)
-    for w in range_constexpr(MASK_WORDS):
+    for w in range_constexpr(mw):
         word = fx.Int32((w0 if w < 4 else w1)[w % 4])
         below = (tw > w).select(word, (tw == w).select(word & low, fx.Int32(0)))
         rank = rank + fx.Int32(fx.math.ctpop(below))
