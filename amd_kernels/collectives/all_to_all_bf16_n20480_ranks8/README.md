@@ -7,9 +7,8 @@ into the final `[owned rows, 163840]` layout (the batch-sharded sampler's input)
 -> `[M, 163840]`. The senders write into the receivers' buffers (push) and the receiver only waits on eight flag words in
 its own memory. Input: bf16 `[rows, 20480]`, rows <= 256, sorted stably by owner. Contract (`reference.py`): rank r
 receives rows `[sum(counts[:r]), sum(counts[:r + 1]))` of every source, concatenated along the vocabulary, every bf16
-bit kept (NaN payloads too). Protocol (module docstring of `kernel.py`): a receive buffer and a 512-byte uncached flag
-block per rank mapped into every peer over HIP IPC, system-scope stores, a two-level ticket, a device sequence counter
-(no host state in a graph). The rows are valid until the next exchange. No atomic output adds.
+bit kept (NaN payloads too). Protocol (IPC buffers and flag blocks, two-level ticket, device sequence counter, the two
+alternating buffers): module docstring of `kernel.py`. The rows are valid until the next exchange. No atomic output adds.
 
 ## Entry points
 - `RowAllToAll`: a collective; a receive buffer of `max_rows x 163840 x 2` B per rank (84 MB at 256 rows).
@@ -30,7 +29,7 @@ All ranks call every exchange in the same order, empty receivers included; one c
 MI355X, eight ranks, `benchmark_exchange.py`: hidden rows replicated, owner-sorted rows (request r on rank r % 8, 4 rows per
 request), the lm_head GEMM included in every column, graph replay of 6 distinct inputs over three weight copies (880 MB),
 minimum of nine rounds, MAX over ranks, us per call. `vLLM AG` = `rocm_unquantized_gemm_impl` +
-`tensor_model_parallel_all_gather` (served today); `vLLM A2A` = GEMM + `all_to_all_single` + permute (vLLM's batch-sharded
+`tensor_model_parallel_all_gather` (vLLM's default); `vLLM A2A` = GEMM + `all_to_all_single` + permute (vLLM's batch-sharded
 sampling); `this AG` / `this owner` = `gemm_exchange` to every rank / to the owners (rows read in place). Ceiling = the GEMM at
 its HBM or MFMA ceiling (6.5 TB/s / 1.5 PF) + 2.4 us (wait launch gap 1.6 + one flag hop 0.8) + the busiest link's bytes at
 49 GB/s (the measured 8-GPU all-to-all: 343 GB/s out over seven links), the push counted after the GEMM.
@@ -50,8 +49,8 @@ The GEMM's own push loses to a local write and one contiguous push above 96 rows
 row segments reach the receivers' HBM at a fraction of the rate of full-row streams (store-only pushes at 192 rows: 160 B segments 68 us,
 320 B 54, 640 B 49, 1280 B 43, this entry's 20 KB streams 35). Standalone push + wait: 13.3 / 18.6 / 23.7 / 32.8 us at M 12 / 80 / 128 / 192
 against link floors of 4 / 11 / 16 / 22.5 us at 49 GB/s: 80 % of the floor at 192 rows (below 4 MB per peer the xGMI ramp, not the
-link, binds). Pipelining the push with the GEMM is not possible: every output tile completes with the last K block, and
-splitting the rows into two passes re-reads the weights (+42 us); the evidence is in `analysis/kernels/bf16_n20480_k7168.md`.
+link, binds). The push cannot overlap the GEMM: every output tile completes with the last K block, and splitting the rows into
+two passes re-reads the weights (+42 us).
 
 ## Tests
 ```bash

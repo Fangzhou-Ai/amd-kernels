@@ -6,8 +6,8 @@
 One HIP graph holds ``--sets`` launches, each with its own q, output, CSR slots (scattered over the pages of a
 ``--cache-gb`` cache, a request's rows sharing ~85% of their keys) and indptr; the sets total more than the 256 MB MALL.
 Median of 20 replays in us per launch. Roofline: bytes = q read + output and LSE write + unique KV records (656 B) + slots,
-at 80% of 8 TB/s; FLOPs = 2 * rows * 96 * keys * (576 + 512) at the bf16 MFMA peak of 1.25 PF (the brief's figure; the
-q.k part runs in fp8 here, so it is conservative). The first set of each size is checked against ``reference.py``.
+at 80% of 8 TB/s; FLOPs = 2 * rows * 96 * keys * (576 + 512) at a bf16 MFMA rate of 1.25 PF (the q.k part
+runs in fp8 here, so it is conservative). The first set of each size is checked against ``reference.py``.
 """
 
 import argparse

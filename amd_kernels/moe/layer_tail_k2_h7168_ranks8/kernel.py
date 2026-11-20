@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 # Adapted from ROCm/ATOM (https://github.com/ROCm/ATOM) at a526f0d, MIT License,
 # Copyright (C) 2026, Advanced Micro Devices, Inc.: atom/mono layer_post
-"""Layer tail K2: one persistent launch (256 CTAs x 512 threads, all resident, one rank of eight) from the
+"""The layer tail: one persistent launch (256 CTAs x 512 threads, all resident, one rank of eight) from the
 attention's core output (the o_proj input) to the layer's MoE output: o_proj, its TP8 all-reduce over peer memory
 and the MLP AttnRes seam (``oproj``, ``attn_res``), then the latent MoE (``experts``).
 
@@ -107,7 +107,7 @@ REGIONS: tuple[str, ...] = (
 # past every region above
 REGIONS = REGIONS + ("ars", "latrs", "finals", "xt", "rlogp")
 
-# K2 options (``K2Build.opt``), all bit-exact vs opt=0; K2_OPT is the default.
+# ``K2Build.opt`` bits, each bit-exact against opt=0; K2_OPT is the default.
 #   1 / 16 / 32  o_proj / latent / final all-reduce via sentinel regions
 #                (plain bf16 pair words, reader re-arms; ``sync.put_sent``)
 #   2    MLP AttnRes slice loads issued before the all-reduce poll
@@ -127,7 +127,7 @@ OPT_BATCH = 512
 K2_OPT = (
     OPT_SENTS | OPT_PRELOAD | OPT_TAG_X | OPT_SDOWN_FIRST | OPT_RLOG_PARTS | OPT_BATCH
 )
-SENT_ROWS = 16  # the served widths (runtime.MAX_ROWS)
+SENT_ROWS = 16  # the widest served width (``host.SERVED_ROWS``)
 
 _STREAM = fx.Stream(None)
 
@@ -180,8 +180,8 @@ def sent_half_bytes() -> int:
 
 
 def sent_offset() -> int:
-    """(OPT_SENTS) Byte offset (from the kernels' peer base) of the sentinel regions, past K2's regions at their
-    largest. Two layer parities."""
+    """(OPT_SENTS) Byte offset (from the kernels' peer base) of the sentinel regions, past this kernel's regions at
+    their largest. Two layer parities."""
     return -(-peer_bytes(k2b.MAX_S) // 4096) * 4096
 
 
@@ -212,7 +212,7 @@ def k2_rlogp(key: K2Build) -> bool:
     return vals_words(key.tokens, key.nblocks + 1, vextra) >= k2b.R_PARTS * k2b.E
 
 
-TAG_OFFSET = 7360512  # past the scratch layouts of K2 and of the KDA kernel K1 at 64 rows, + 1 MiB
+TAG_OFFSET = 7360512  # past the scratch layouts of this kernel and of the KDA kernel at 64 rows, + 1 MiB
 
 
 def tag_layout() -> dict:
@@ -261,7 +261,7 @@ ABI = KernelAbi(
 
 
 def peer_layout(s):
-    """K2a's AR region, then K2b's: one parity's (name -> (byte offset, bytes))."""
+    """``oproj``'s AR region, then ``experts``': one parity's (name -> (byte offset, bytes))."""
     pairs = {"ar": k2a.ar_half_pairs(s), **k2b.peer_pairs(s)}
     return pair_layout(pairs.items())
 

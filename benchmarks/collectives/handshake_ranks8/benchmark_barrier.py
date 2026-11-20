@@ -17,7 +17,7 @@ ROUNDS = 21
 EMPTY_US = 1.55
 FLAG_US = 0.8
 EGRESS = 343e9
-# measured phases (analysis/kernels/handshake_ranks8.md): acknowledgement wait, landed-data read, remote-flag penalty
+# measured phases: acknowledgement wait, landed-data read, remote-flag penalty
 PHASES_US = {"ex_ll": 0.0, "ex_flag": 0.64 + 0.85, "ex_pull": 0.28 + 0.15 + 0.85}
 
 

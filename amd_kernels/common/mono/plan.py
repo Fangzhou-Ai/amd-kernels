@@ -12,8 +12,8 @@
 FlyDSL keys a compiled kernel by the scalar values (int, float, bool, str, enum,
 tuple) its launcher's closures capture; an object in a closure is not keyed, and
 a parameter used only by build-time Python (a placement table, a layout) is in no
-closure at all. Two builds differing only there would share one binary -- every
-TP rank ran rank 3's kernel once that way. So a build's parameters are one frozen
+closure at all. Two builds differing only there would share one binary (every
+TP rank would run one rank's kernel). So a build's parameters are one frozen
 dataclass of scalars, ``key_tuple`` turns it into one (name, value) tuple, and the
 launcher references that tuple: every field is keyed, whatever the body uses.
 
@@ -21,7 +21,7 @@ The tuple also carries the model's kernel sources (``source_digest``): FlyDSL
 keys a helper's source only when its walk reaches it, and it does not reach a
 helper called inside a traced function's dynamic loop or branch (the rewriter
 moves those bodies into nested functions it does not scan) nor one outside the
-kernel's directory -- an edit there kept the old binary.
+kernel's directory -- an edit there would not rebuild.
 """
 
 import enum

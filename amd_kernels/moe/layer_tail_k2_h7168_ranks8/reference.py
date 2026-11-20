@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Torch reference of the layer tail K2 for one rank of eight (TP8), the contract the kernel is tested against.
+"""Torch reference of the layer tail for one rank of eight (TP8), the contract the kernel is tested against.
 
 ``layer_tail`` takes this rank's shards and ``all_reduce(t)``: the ranks' bf16 tensors summed in fp32 in rank order
 0..7 and rounded to bf16 (the kernel's reduction; ``gather_all_reduce`` builds it from ``torch.distributed``).

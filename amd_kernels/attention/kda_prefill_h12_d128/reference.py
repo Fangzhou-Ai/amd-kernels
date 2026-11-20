@@ -4,7 +4,7 @@
 scan with a recurrent state, gated RMSNorm.
 
 Contract (what vLLM's ``causal_conv1d_split_qkv`` + ``fused_kda_prologue`` + ``fused_kda_chunk`` + ``FusedRMSNormGated``
-compute today, kda_prefill_backend=fused):
+compute, kda_prefill_backend=fused):
 
 - ``mixed`` [T, 4608] bf16 (any row stride): the in_proj q | k | v bands (channel = band * 1536 + head * 128 + d).
   ``conv_weight`` [3, 4, 1536] fp32 (band, tap, channel; tap 3 multiplies the current token). Per sequence the conv history is

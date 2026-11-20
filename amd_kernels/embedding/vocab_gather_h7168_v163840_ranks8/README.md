@@ -13,11 +13,9 @@ ids (< 0 or >= 163840) write +0; replays and eager calls are bitwise equal on ev
 
 ## Entry points
 
-- `VocabGather`: the collective load-time mapping of the eight shards, built on every rank after selecting its GPU and
-  after this rank's shard reaches its final allocation; it checks equal shard sizes, publishes the GPU-written weight
-  to peers and exchanges the IPC handles. The weights stay alive and unchanged until `close()`.
-- `VocabGather.__call__`: the `[rows, 7168]` bf16 rows of the ids, eager or inside a CUDA graph; no inter-rank
-  synchronization per call.
+- `VocabGather`: the collective load-time mapping of the eight shards, on every rank once its shard is in its final
+  allocation (publishes the GPU-written weight to peers); the weights stay alive and unchanged until `close()`.
+- `VocabGather.__call__`: the `[rows, 7168]` bf16 rows of the ids, eager or in a CUDA graph; no per-call synchronization.
 - `VocabGather.warm_up`: compiles the int32 and int64 variants (one per id dtype, any row count).
 - `VocabGather.close`: collective on every rank, after all graph use.
 

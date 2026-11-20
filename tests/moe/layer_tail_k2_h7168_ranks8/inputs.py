@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Random inputs for the layer tail K2 in the checkpoint's formats at TP8 shapes (shared by the tests and the benchmark)."""
+"""Random inputs for the layer tail in the checkpoint's formats at TP8 shapes (for the tests and the benchmark)."""
 
 import torch
 

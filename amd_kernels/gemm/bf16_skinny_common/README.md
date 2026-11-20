@@ -6,9 +6,10 @@ the 15 dense weight shapes of a Kimi-K3.1 TP8 decode step (`SHAPES`: KDA in_proj
 qkv_a / q_b / g_proj / wq_index / wk_index / wv_index, latent down_proj 3584x7168, shared gate_up / down, layer-0 MLP,
 lm_head shard 20480x7168, drafter context_proj 7168x35840 and context_kv 2880x7168). W is read from HBM in a load-time
 packed layout (`pack_weight`, a permutation: every 16-byte lane load is one piece of a 1 KB run). Contract
-(`reference.py`): the fp64 product rounded once to bf16; every element within one bf16 ulp (plus fp32 noise of cancelling sums), per-row cosine >= 0.99999, deterministic bits
-(K split across workgroups is summed in split order by the last workgroup of a tile, no output atomics). The tile
-(`wn`, `wk`, `ng`, `s`, depth, ring) comes from `config.py`, measured per (shape, M tier) by graph-replay sweeps.
+(`reference.py`): the fp64 product rounded once to bf16; every element within one bf16 ulp (plus fp32 noise of
+cancelling sums), per-row cosine >= 0.99999, deterministic bits (K split across workgroups is summed in split order by
+the last workgroup of a tile, no output atomics). The tile (`wn`, `wk`, `ng`, `s`, depth, ring) comes from
+`config.py`, measured per (shape, M tier) by graph-replay sweeps.
 
 ## Entry points
 - `pack_weight`, `unpack_weight`: the load-time layout; replace the parameter once before graph capture, free the
@@ -24,8 +25,7 @@ packed layout (`pack_weight`, a permutation: every 16-byte lane load is one piec
 ## Performance
 One MI355X, graph replay, rotated weight copies (> 768 MB, cold HBM), minimum of 7 rounds, us per call: this kernel /
 stock (vLLM `rocm_unquantized_gemm_impl`, AITER on: wvSplitKrc, hipBLASLt, AITER asm), (% of the floor). Floor =
-1.57 us (empty graph kernel) + bytes / 6.9 TB/s (measured nontemporal HBM read, `analysis/hw_ceilings.md`).
-Bytes = W + x + y.
+1.57 us (empty graph kernel) + bytes / 6.9 TB/s (measured nontemporal HBM read). Bytes = W + x + y.
 
 | N x K | op | M=12 | M=24 | M=40 | M=64 | M=80 | M=96 | M=128 | M=160 | M=192 |
 |---|---|---|---|---|---|---|---|---|---|---|

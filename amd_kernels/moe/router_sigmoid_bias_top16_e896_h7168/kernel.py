@@ -12,6 +12,11 @@ Epilogue: each workgroup stores its fp32 accumulators to the partial slab [KS, M
 top-k launch that follows sums the KS slabs in slice order, so the logits' bits do not depend on which slice ends
 last). No tickets, no atomics.
 
+Fused (the whole router in one launch): each slab word's lowest mantissa bit carries the call's parity (no arrival
+flag: the previous call's words, never an older one's, carry the other parity). Workgroup t < M takes token t: its four
+waves load the token's slab words (one 256-expert group each) until every word has this call's parity, then the
+top-16 (``topk.py``) and, with ``aux``, the sort (``aux.py``) follow.
+
 Weight layouts: ROW (the checkpoint's [896, 7168]) or SHUF ([56 groups, 112 K blocks, 16 rows, 64 K]: one DMA reads
 1 KB in one piece, a bit-exact permutation made once at load).
 """

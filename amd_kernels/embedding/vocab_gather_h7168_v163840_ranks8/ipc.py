@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Graph-input registration, adapted from the existing norm family."""
+"""HIP IPC handles of the shard allocations, their exchange over the CPU group, and the compiled-launch cache."""
 import ctypes
 import functools
 

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """KDA spec-verify decode of one rank (12 heads, head dim 128): f_b gate GEMM + conv + delta rule + gated RMSNorm.
 
-Contract (what vLLM's ``kimi_k3_kda_fb_proj`` + AITER ``kda_fused_recurrent_spec_decode`` compute today):
+Contract (what vLLM's ``kimi_k3_kda_fb_proj`` + AITER ``kda_fused_recurrent_spec_decode`` compute):
 
 - ``proj`` [M, 6288] bf16 is the fused in_proj output (row stride >= 6288): q|k|v at columns 0 / 1536 / 3072 (pre-conv),
   output gate at 4608, f_a at 6144 (128), beta logits at 6272 (12).

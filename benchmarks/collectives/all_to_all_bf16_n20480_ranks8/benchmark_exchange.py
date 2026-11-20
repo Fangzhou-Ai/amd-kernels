@@ -5,11 +5,11 @@
 Rows: M hidden rows replicated on every rank (as the model's), owner-sorted by request owner (rank i % 8, a request
 has --tokens rows). Four timings, each GEMM included, graph replay of 6 distinct inputs over three weight copies,
 minimum of nine rounds, MAX over ranks, us per call:
-  vLLM AG       rocm_unquantized_gemm_impl + tensor_model_parallel_all_gather -> [M, 163840]   (served today)
+  vLLM AG       rocm_unquantized_gemm_impl + tensor_model_parallel_all_gather -> [M, 163840]   (vLLM's default)
   vLLM A2A      GEMM + all_to_all_single + permute -> [owned rows, 163840]  (--enable-batch-sharded-sampling)
   this AG       push GEMM (all ranks) + wait -> [M, 163840] in place in the receive buffer
   this owner    push GEMM (owner-sorted row map) + wait -> [owned rows, 163840] in place
-Ceilings (analysis/hw_ceilings.md): the GEMM's HBM stream (293.6 MB at 6.5 TB/s) or its MFMA time (1.5 PFLOP/s),
+Ceilings (measured): the GEMM's HBM stream (293.6 MB at 6.5 TB/s) or its MFMA time (1.5 PFLOP/s),
 whichever is larger, plus the exchange: one launch gap and one cross-GPU flag hop (1.6 + 0.8 us) plus the bytes of the
 busiest link at 49 GB/s (the measured 8-GPU all-to-all: 343 GB/s out over seven links): AG moves M x 40 KB per
 link, owner rows (largest owner count) x 40 KB. `% ceiling` = ceiling / this.

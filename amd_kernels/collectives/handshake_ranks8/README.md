@@ -3,21 +3,22 @@
 ## What it does
 
 Every rank of an 8-GPU group must learn that every peer's data has landed. This package holds the measured minimum-latency
-protocol and the device helpers other eight-rank kernels call (`common/rank8_signal.py`, `common/rank8_comm.py`): an
-uncached block per rank mapped on all peers, atomic system-scope flag stores into the peer's block, polls of the rank's own
-block, the call number (epoch) in the flag word (nothing is reset, the counter is never rewound), kernel-argument peer
-bases, two parity slots. Ordering contract: payload stores, `s_waitcnt vmcnt(0)` (their acknowledgements), then the flag;
-or no flag at all (epoch-tagged 8-byte words that the receiver polls). Protocol and hazards: module docstring of
-`kernel.py`.
-Contract (`reference.py`): `out[s] = x_s[me]` over int32 words, bit for bit; the barrier returns once all ranks entered.
+protocol: an uncached block per rank mapped on all peers, atomic system-scope flag stores into the peer's block, polls of the
+rank's own block, the call number (epoch) in the flag word (nothing is reset, the counter is never rewound), kernel-argument
+peer bases, two parity slots. Ordering contract: payload stores, `s_waitcnt vmcnt(0)` (their acknowledgements), then the
+flag; or no flag at all (epoch-tagged 8-byte words that the receiver polls). Protocol and hazards: module docstring of
+`kernel.py`. Contract (`reference.py`): `out[s] = x_s[me]` over int32 words, bit for bit; the barrier returns once all
+ranks entered.
 
 ## Entry points
 
 - `make_comm`: the communicator (a collective: uncached IPC blocks, rotated peer bases, epoch counters), before capture.
 - `barrier`: flag hand-off only (`wave`, `lane`, `pull`).
-- `exchange`: all-to-all of an int32 [8, n] block, n in `SIZES`; `ll` (epoch-tagged words), `flag` (acknowledged data,
-  then flag), `pull` (rows stay at the sender).
-- The helpers for other kernels: `peer_lane`, `raise_flag`, `wait_flag`, `epoch_load`, `flag_store`, `spin_until`, `sel8`.
+- `exchange`: all-to-all of an int32 [8, n] block, n in `SIZES`: `ll` (epoch-tagged words), `flag` (acknowledged data,
+  then flag), `pull` (rows stay at the sender); `host.exchange` picks `ll` up to 512 words per peer, else `flag`.
+
+The device helpers other eight-rank kernels call (`peer_lane`, `raise_flag`, `wait_flag`, `epoch_load`, `flag_store`,
+`spin_until`, `sel8`) live in `common/rank8_signal.py`; the communicator in `common/rank8_comm.py`.
 
 ## Performance
 

@@ -20,7 +20,7 @@ from amd_kernels.moe.mxfp4_h3584_i3072_e896_top16 import MoeWeights, Sort, mxfp4
 from amd_kernels.moe.mxfp4_h3584_i3072_e896_top16.host import sort_capacity
 
 E, H, I, TOPK = 896, 3584, 384, 16
-HBM_CEILING = 7.0e12  # measured nontemporal read (analysis/hw_ceilings.md); 6.4-6.7 plain loads
+HBM_CEILING = 7.0e12  # measured nontemporal HBM read on MI355X; 6.4-6.7 plain loads
 EXPERT_BYTES = 2 * I * (H // 2) + 2 * I * (H // 32) + H * (I // 2) + H * 16  # weights + shuffled scales (2,193,408 B)
 SERVED_M = [12, 24, 40, 65, 80, 128, 192]
 

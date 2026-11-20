@@ -6,7 +6,7 @@ over ranks, median and min of 9 replays, us per call, and a table against the me
 
     python3 benchmarks/attention/dcp8_lse_combine_vup_mla_h12_kv512/benchmark_combine.py [--gate] [--tokens 12,24,...]
 
-Ceiling model (measured constants: analysis/hw_ceilings.md): launch 1.6 us + first-tile load (0.25 us + (W_UV + first
+Ceiling model (constants measured on MI355X): launch 1.6 us + first-tile load (0.25 us + (W_UV + first
 16-token tile) / 6.4 TB/s HBM read) + max(flag one-way 0.8 us + bytes sent / 343 GB/s all-to-all egress, remaining x /
 6.4 TB/s) + combine tail 0.6 us.
 """

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""K2a ``attn_post``: one Kimi-K3 KDA layer from the gated core output to the
-MoE's input row -- o_proj, its TP all-reduce inside the kernel, and the MLP
+"""The o_proj stages of the layer tail: from the gated attention core output to
+the MoE's input row -- o_proj, its TP all-reduce inside the kernel, and the MLP
 AttnRes seam.
 
-One launch a layer and rank, ``BLOCKS`` x ``THREADS``:
+On the layer tail's ``BLOCKS`` x ``THREADS``, one rank of eight:
 
     gemv CTAs 56 ..   o_proj (448 x 16 rows, K = 1536 local): bf16 GEMV of the
                       core rows (plain loads: the previous launch wrote them) ->
@@ -12,7 +12,7 @@ One launch a layer and rank, ``BLOCKS`` x ``THREADS``:
                       scope, this rank's slot)
     attn CTAs 0 .. 55 per 128 columns: the 8 ranks' partials summed in rank
                       order (fp32 -> bf16: the custom all-reduce's result) ->
-                      LDS delta; then K1's AttnRes stages with the MLP's weights:
+                      LDS delta; then the AttnRes stages with the MLP's weights:
                       prefix + delta -> prefix out, the sources' softmax mix,
                       post_attention_layernorm -> the MoE input x
 
@@ -95,7 +95,7 @@ _STREAM = fx.Stream(None)
 
 def sent_on(c, which="ar"):
     """(OPT_SENTS) This build's all-reduce ``which`` ("ar": o_proj's,
-    "latr", "final") goes through its sentinel region (``layer.k2_sent``; a
+    "latr", "final") goes through its sentinel region (``kernel.k2_sent``; a
     plain call: a method call on ``c`` inside a traced branch would make FlyDSL
     carry ``c`` as branch state)."""
     return c.get("sent_" + which, False)
@@ -178,7 +178,7 @@ def o_loads(c, rg):
 @traced
 def load_core(c, t0, n, cm=0):
     """Core rows t0 .. t0 + n (of S x 1536 bf16) -> LDS, rows padded; ``cm``
-    CM_DEV when this launch's own CTAs wrote them (K2's fused M1b)."""
+    CM_DEV when this launch's own CTAs wrote them."""
     tid = c["tid"]
     words = n * OK // 8
     row = OK + LDS_PAD
@@ -326,14 +326,14 @@ def reduce_two_shot(c, task, t, col):
 
 
 # ---------------------------------------------------------------- pre-AR preload
-# (``layer.OPT_PRELOAD``)
+# (``kernel.OPT_PRELOAD``)
 # The slice's block / prefix / norm / qk loads (independent of the
 # all-reduce) issued before ``stage_reduce``'s poll; ``stage_slice_pre`` is
-# ``kda.stage_slice`` on the preloaded words, same arithmetic and order.
+# ``attn_res.stage_slice`` on the preloaded words, same arithmetic and order.
 
 
 def _raw4(ptr, i):
-    """bf16 elements i .. i + 4 as two raw words (``kda.ld_bf4``'s load)."""
+    """bf16 elements i .. i + 4 as two raw words (``attn_res.ld_bf4``'s load)."""
     return fx.Vector(bo.buffer_load(rsrc(ptr), i // 2, vec_width=2, dtype=T.i32))
 
 
@@ -374,7 +374,7 @@ def slice_loads(c, task):
 
 @traced
 def stage_slice_pre(c, task, ld):
-    """``kda.stage_slice`` for K2 (delta in LDS, no block write) on the
+    """``attn_res.stage_slice`` (delta in LDS, no block write) on the
     preloaded words ``ld`` (``slice_loads``)."""
     s, ns, nb, tid, lane = c["S"], c["NS"], c["NB"], c["tid"], c["lane"]
     a = c["args"]

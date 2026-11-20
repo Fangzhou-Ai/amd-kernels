@@ -24,46 +24,31 @@ as its own signal (module docstring of `kernel.py`): nothing is registered per g
 - `AttnResComm.allreduce_attnres_rmsnorm` / `allreduce_attnres_rmsnorm`: the fused call -> (out, prefix out).
 - `AttnResComm.close`: collective, after the last call completed.
 
-One communicator per stream; every rank makes the same calls in the same order with the same row counts. The variants
-(prefix, output norm, bank, reduce, packed output) are the entry's warm-up modes (`amd_kernels.warm_up`).
+One communicator per stream; every rank makes the same calls in the same order with the same row counts. No row-count
+dispatch (one workgroup per row); the variants (prefix, output norm, bank, reduce, packed output) are the entry's
+warm-up modes (`amd_kernels.warm_up`), compiled in `host.py`.
 
 ## Performance
 
 MI355X, 8 ranks, graphs of 27-100 distinct input sets (larger than the LLC), min of 15 rounds, MAX over ranks, us per
 call; the call is a pre-MLP one (prefix + delta, bank of 4 rows, output norm). Baseline: AITER custom all-reduce, then
-vLLM's Triton AttnRes (regtile) launch.
+vLLM's Triton AttnRes (regtile) launch. Chain floor = 1.57 us empty-kernel period + 0.5 load + 2 x (0.77 flight + 0.23
+read) + 0.1 reduce + 0.6 tail + both phases' bytes at the measured 355 GB/s xGMI all-to-all (`benchmark_allreduce.py`
+prints it with the HBM, xGMI and FLOP rooflines: 3-20% of 6.4 TB/s, 9-53% of 355 GB/s, under 2% of fp32 peak).
 
-| M | stock | all-reduce alone | fused | speedup |
-|---:|---:|---:|---:|---:|
-| 12 | 11.90 | 5.91 | 9.88 | 1.20 |
-| 24 | 13.11 | 6.93 | 10.59 | 1.24 |
-| 40 | 14.98 | 8.19 | 11.82 | 1.27 |
-| 65 | 17.56 | 10.43 | 13.50 | 1.30 |
-| 80 | 19.10 | 11.10 | 14.94 | 1.28 |
-| 128 | 23.08 | 14.38 | 19.63 | 1.18 |
-| 192 | 29.30 | 19.55 | 25.39 | 1.15 |
-
-Roofline (`benchmark_allreduce.py` prints every column; ceilings are the measured ones of `analysis/hw_ceilings.md`: HBM
-read 6.4 TB/s, xGMI all-to-all 355 GB/s per GPU, fp32 vector 157 TFLOP/s spec). Per rank and call: HBM bytes = partial +
-prefix + 4 bank rows read, prefix out + output written, 2 x 7/8 row of mailbox data written and read (11.5 rows of 14 336 B per
-M); xGMI = 2 phases x 7/8 row sent; FLOPs about 31 per element. Floors: *model* = 5 us + 2 x 7/8 x bytes / 400 GB/s + 1.2 us tail
-(the all-reduce floor of hw_ceilings); *chain* = 1.57 us empty-kernel period + 0.5 load + 2 x (0.77 flight + 0.23 read) + 0.1 reduce + 0.6 tail + both phases'
-bytes at 355 GB/s; *AR + 0.6* = AITER's all-reduce of the same run plus a 0.6 us tail.
-
-| M | HBM MB | TB/s (% of 6.4) | xGMI MB | GB/s (% of 355) | MFLOP | % of fp32 peak | model floor us (%) | chain floor us (%) | AR + 0.6 us (%) |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 12 | 1.98 | 0.20 (3) | 0.30 | 30 (9) | 3.0 | 0.2 | 6.95 (70) | 5.62 (57) | 6.51 (66) |
-| 24 | 3.96 | 0.37 (6) | 0.60 | 57 (16) | 6.0 | 0.4 | 7.71 (73) | 6.47 (61) | 7.53 (71) |
-| 40 | 6.59 | 0.56 (9) | 1.00 | 85 (24) | 10.0 | 0.6 | 8.71 (74) | 7.60 (64) | 8.79 (74) |
-| 65 | 10.72 | 0.79 (12) | 1.63 | 121 (34) | 17.0 | 0.8 | 10.28 (76) | 9.36 (69) | 11.03 (82) |
-| 80 | 13.19 | 0.88 (14) | 2.01 | 134 (38) | 21.0 | 0.9 | 11.22 (75) | 10.42 (70) | 11.70 (78) |
-| 128 | 21.10 | 1.07 (17) | 3.21 | 164 (46) | 33.0 | 1.1 | 14.23 (72) | 13.82 (70) | 14.98 (76) |
-| 192 | 31.65 | 1.25 (20) | 4.82 | 190 (53) | 49.0 | 1.2 | 18.24 (72) | 18.34 (72) | 20.15 (79) |
+| M | stock | all-reduce alone | fused | speedup | chain floor (% of fused) |
+|---:|---:|---:|---:|---:|---:|
+| 12 | 11.90 | 5.91 | 9.88 | 1.20 | 5.62 (57) |
+| 24 | 13.11 | 6.93 | 10.59 | 1.24 | 6.47 (61) |
+| 40 | 14.98 | 8.19 | 11.82 | 1.27 | 7.60 (64) |
+| 65 | 17.56 | 10.43 | 13.50 | 1.30 | 9.36 (69) |
+| 80 | 19.10 | 11.10 | 14.94 | 1.28 | 10.42 (70) |
+| 128 | 23.08 | 14.38 | 19.63 | 1.18 | 13.82 (70) |
+| 192 | 29.30 | 19.55 | 25.39 | 1.15 | 18.34 (72) |
 
 The limiter is the dependent chain, not a bandwidth or compute roof: two phases of write -> flight -> poll around a
-one-wave reduce, ranks that start up to 1.3 us apart (the same skew the stock all-reduce pays), the bank statistics on the one
-CU of a row (VALU issue, 0.2-0.4 us per bank row at M=12) and a tail. The protocol is in the module docstring of `kernel.py`;
-the timeline, the attempts and the floors are in `analysis/kernels/allreduce_attnres_rmsnorm_h7168_ranks8.md`.
+one-wave reduce, ranks that start up to 1.3 us apart (the same skew the stock all-reduce pays), the bank statistics on
+the one CU of a row (VALU issue, 0.2-0.4 us per bank row at M=12) and a tail.
 
 ## Tests
 

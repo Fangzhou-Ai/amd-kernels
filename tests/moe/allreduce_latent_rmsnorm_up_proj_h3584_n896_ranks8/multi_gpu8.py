@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Run a test body on 8 GPUs, as tests/multi_gpu.py does on 4: one process per GPU, a gloo process group (a TCPStore on a free local port: AITER's
-custom all-reduce exchanges its IPC handles through a pure TCP store). The 8 rank processes start at the first call
-and serve every later call of the same pytest process (a call of its own would pay for 8 new ones: Python, torch, a
-HIP context, the group and the body's warm-up again). A failed call kills them; the next call starts new ones. A body
-sees what earlier calls of its file left in the process (as it already saw their FlyDSL disk cache). The body
-appends mismatches to ``errors`` instead of raising, so every rank reaches the same collectives; an exception is
-recorded and ends that rank."""
+"""Run a test body on 8 GPUs (``tests/multi_gpu.py`` runs 2 or 4): one process per GPU, a gloo process group (a TCPStore
+on a free local port: AITER's custom all-reduce exchanges its IPC handles through a pure TCP store). The 8 rank
+processes start at the first call and serve every later call of the same pytest process (a call of its own would pay for
+8 new ones: Python, torch, a HIP context, the group and the body's warm-up again). A failed call kills them; the next
+call starts new ones. A body sees what earlier calls of its file left in the process (as it already saw their FlyDSL
+disk cache). The body appends mismatches to ``errors`` instead of raising, so every rank reaches the same collectives;
+an exception is recorded and ends that rank."""
 
 import atexit
 import os

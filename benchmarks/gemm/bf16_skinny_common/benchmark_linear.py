@@ -3,8 +3,8 @@
 """Graph replay of bf16_linear against the stock op (vLLM's rocm_unquantized_gemm_impl when importable, else
 F.linear) per served shape and row count: one graph of calls over distinct weight copies totalling more than 768 MB
 (more than the 256 MB MALL: HBM on every call, as in serving), 8 replays x 7 rounds, minimum us per call.
-Roofline: bytes = weight + x + y; floor = empty graph kernel 1.57 us + bytes / 6.9 TB/s (nontemporal HBM read, measured:
-analysis/hw_ceilings.md); %floor = floor / measured.
+Roofline: bytes = weight + x + y; floor = empty graph kernel 1.57 us + bytes / 6.9 TB/s (measured nontemporal HBM
+read); %floor = floor / measured.
 Run: python3 benchmarks/gemm/bf16_skinny_common/benchmark_linear.py [--shapes N,K ...] [--rows M ...]
 """
 import argparse

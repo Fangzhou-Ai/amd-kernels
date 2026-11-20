@@ -10,7 +10,7 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from amd_kernels.common import buffer_ops
 
-# Eight groups per XCD, as in pull_collectives_ranks8's startup fence.
+# eight workgroups on each of the eight XCDs
 GROUPS = 64
 
 

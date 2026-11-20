@@ -1,22 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""K2b ``moe``: one Kimi-K3 latent-MoE layer, from the MoE input row x to the
+"""The latent-MoE stages of the layer tail, from the MoE input row x to the
 layer's output, every TP reduction inside the kernel.
 
-One launch a layer and rank, ``BLOCKS`` x ``THREADS``, S <= 64 rows (a
-spec-verify step). The original path (vLLM ROCm, see MOE_SPEC.md) replicates the
-router and the latent down projection on every rank; here each rank computes
-its eighth and the rows are all-gathered over the peer buffer.
+S <= 64 rows (a spec-verify step). vLLM's ROCm path replicates the router and
+the latent down projection on every rank; here each rank computes its eighth and
+the rows are all-gathered over the peer buffer. The CTA of each task is in
+``kernel.py``.
 
-    early (CTAs 0 .. 130, one task each, x from the input row; weights first):
+    early (one task a CTA, x from the input row; weights first):
       router  (7 x 16 rows of this rank's 112 experts): fp32 logits -> every
               rank's RLOG
       latent  (28 x 16 rows of this rank's 448): bf16 -> every rank's LAT
       sgu     (96 x 16 rows of the shared gate | up): bf16 -> SGU
-    route   (S, CTAs 131 ..): sigmoid (v_rcp), + bias, top-16, the pre-bias
+    route   (S tasks): sigmoid (v_rcp), + bias, top-16, the pre-bias
             sigmoids renormalized (IEEE 1 / sum) -> ROUTE (every rank alike);
             every CTA then lays out U and its pick tiles in LDS (``load_route``)
-    sdown   (448 x 16 rows, K 768, CTAs 131 ..): SiTU of SGU (vLLM's kernel) ->
+    sdown   (448 x 16 rows, K 768): SiTU of SGU (vLLM's kernel) ->
             bf16 -> GEMV -> bf16 partial; this rank's up columns -> SHP (plain,
             SHRDY flags), the rest -> every rank's FINAL
     ug      (pick tiles x 12, every CTA): the union U of the step's picks, a
@@ -233,7 +233,7 @@ def f32_of(w):
 
 
 def tag_x_on(c):
-    """``layer.OPT_TAG_X``, a plain call (see ``back.sent_on``)."""
+    """``kernel.OPT_TAG_X``, a plain call (see ``oproj.sent_on``)."""
     return c.get("tag_x", False)
 
 
@@ -486,7 +486,7 @@ def early_compute(c, kind, i, q, ops):
 
 @traced
 def stage_early(c, bid):
-    """K2b alone: CTA bid's early task (router parts, latent parts, sgu)."""
+    """CTA bid's early task (router parts, latent parts, sgu) with the early tasks from CTA 0."""
     lb = bid - R_TASKS
     gb = bid - R_TASKS - L_TASKS
     if bid < R_TASKS:

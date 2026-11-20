@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """amd_kernels.gemm.bf16_n20480_k7168 against its fp64 reference: every band and tile of the row-count dispatch, the row
-map and publish modes on one GPU (the eight-rank exchange is test_publish.py)."""
+map and publish modes on one GPU (the eight-rank exchange is test_push.py)."""
 import pytest
 import torch
 

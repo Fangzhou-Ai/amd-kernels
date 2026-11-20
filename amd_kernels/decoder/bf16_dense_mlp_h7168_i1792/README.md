@@ -2,9 +2,9 @@
 
 ## What it does
 
-One rank's shard (TP8) of the DSpark drafter's dense MLP (`KimiMLP`, `models/kimi_k3/nvidia/model.py:204`, hidden_act
-silu, `reduce_results=False`): `out = down(silu(x gate^T) * (x up^T))` for 1-192 rows, the rank's bf16 [rows, 7168]
-partial that the next all-reduce + RMSNorm sums. `gate_up` is the merged [3584, 7168] weight (gate rows, then up rows),
+One rank's shard (TP8) of the DSpark drafter's dense MLP (vLLM's `KimiMLP`, hidden_act silu, `reduce_results=False`):
+`out = down(silu(x gate^T) * (x up^T))` for 1-192 rows, the rank's bf16 [rows, 7168] partial that the next
+all-reduce + RMSNorm sums. `gate_up` is the merged [3584, 7168] weight (gate rows, then up rows),
 `down` [7168, 1792]. Two launches: gate_up with the SwiGLU epilogue (fp32 accumulators, bf16 intermediate written in the
 packed layout `down` reads) and down. Contract (`reference.py`): fp64 products, the intermediate rounded once to bf16 (gate
 and up are not rounded to bf16 first, unlike the stock `silu_and_mul` input), cosine >= 0.99999, relative L2 <= 1e-3,
@@ -12,15 +12,15 @@ bitwise repeatable (split sums in a fixed order, tickets only count).
 Weights and activations are read in the MFMA tile layout (a 16-row x 32-K tile is 1 KB in lane order): `pack_gate_up`,
 `pack_down` at load, `pack_rows` for the activations. A producer that writes its 16 B packs to the tile address
 (row r, columns 8j..8j+7 -> `(((r // 16) * 224 + j // 4) * 64 + (j % 4) * 16 + r % 16) * 16` bytes) needs no pack
-launch; `unpack_rows` is the inverse.
+launch; `pack.unpack_rows` is the inverse.
 
 ## Entry points
 
 - `pack_gate_up`, `pack_down`: the packed weights, once at load (free the row-major tensors).
 - `pack_rows`, `packed_rows_buffer`, `packed_tiles`: the packed activations of ``rows`` rows (tiles padded to the tier).
-- `MlpWorkspace(device)`: partial-sum slabs, ticket counters and the packed intermediate of one stream.
+- `MlpWorkspace`: partial-sum slabs, ticket counters and the packed intermediate of one stream.
 - `dense_mlp`: the rank's partial output; graph safe; the first call warms every row tier up (`amd_kernels.warm_up`).
-- `swiglu_gate_up`, `down_proj`: its two launches.
+- `host.swiglu_gate_up`, `host.down_proj`: its two launches.
 
 `host.TIERS` holds the tile / split / wave grid of both GEMMs per row tier; `kernel.py` the design (K split across
 workgroups of one XCD, last arrival sums, weights bypass the L2).

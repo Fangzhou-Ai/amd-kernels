@@ -14,6 +14,7 @@ fp32 math, 2 ulp against AITER's `flydsl_pa_mqa_logits_fp4_prefill`, bit-reprodu
 
 - `host.score_rows`: the scorer for one tile of rows; replaces `compute_prefill_schedule` + `flydsl_pa_mqa_logits_fp4_prefill`
   (no Triton schedule kernels, no per-width compile). Grid sizing is `host.grid_for`.
+- `available`: whether the device is gfx950 and FlyDSL imports.
 
 ## Performance
 

@@ -14,7 +14,7 @@ reduced across the lane groups together (``permlane32/16_swap``), so each lane e
 
 Whole pages are stored: positions outside a row's window ``[ks, ke)`` inside the group's page range receive unspecified values.
 
-Limit (measured on MI355X, ``benchmarks/.../benchmark_score.py`` and the probes in the README): a wave's VALU and MFMA work do
+Limit (measured on MI355X, ``benchmarks/.../benchmark_score.py``): a wave's VALU and MFMA work do
 not overlap on a SIMD (1, 2 and 4 waves per SIMD), an independent ``v_fma_f32`` costs 2.3-2.5 cycles, ``v_max_f32`` 4, a
 16x16x128 FP4 MFMA 17.8 (20 on random data). A page costs about 161 (8 MFMAs) + 245 (epilogue VALU) cycles per row plus
 467 / rows_per_cta per row for the page's loads and the pipeline fill; the kernel runs at that sum, not at the MFMA peak.

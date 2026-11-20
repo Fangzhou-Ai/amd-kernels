@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """Eight ranks, CUDA graph replay of 24 distinct weight / activation sets per graph (the 6.4 MB up-projection weights
-alone span 154 MB; the activations rotate too), median of five alternated rounds, slowest rank. Baseline = what vLLM
-runs today at the same place: AITER's custom all-reduce of the latent, then the Triton fused RMSNorm + up-projection
+alone span 154 MB; the activations rotate too), median of five alternated rounds, slowest rank. Baseline = vLLM's path at
+the same place: AITER's custom all-reduce of the latent, then the Triton fused RMSNorm + up-projection
 (two launches); the final all-reduce of the [rows, 7168] output is timed for reference and is not part of the entry.
 Prints the roofline table: the latency + xGMI + HBM floor of the fused call and the achieved fraction of it."""
 import argparse
@@ -15,7 +15,7 @@ from amd_kernels.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8 import L
 
 K, N, H = 3584, 896, 7168
 NI = 24
-LAUNCH_US = 1.57  # an empty graph kernel (analysis/hw_ceilings.md)
+LAUNCH_US = 1.57  # an empty kernel's graph period, measured on MI355X
 FLAG_US = 0.7  # one-way cross-GPU flag store + poll
 XGMI_GBS = 430.0  # one GPU reading seven peers
 HBM_GBS = 6900.0  # non-temporal reads

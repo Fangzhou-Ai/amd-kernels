@@ -6,7 +6,7 @@ Stock replicated: vLLM ``rocm_unquantized_gemm_impl`` of [R, 35840] x [7168, 358
 Stock sharded: the same GEMM on the 896-row shard (64 MB) + AITER ``custom_all_gather`` + ``rms_norm``.
 This entry: ``context_proj_gather_norm`` on the packed activations (``pack_aux`` is the eager copy that replaces the
 ``torch.cat`` into the staging buffer and is reported apart).
-Run on a quiet machine: env/gpurun all python benchmarks/gemm/bf16_linear_gather_n896_k35840_ranks8/benchmark_context_proj.py
+Run on eight otherwise idle GPUs: python3 benchmarks/gemm/bf16_linear_gather_n896_k35840_ranks8/benchmark_context_proj.py
 """
 import argparse
 import os
@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 
 CONFS = {"c16": 40, "c24": 65, "c32": 80, "c48": 192}
-CEIL_US = 11.34  # 64 MB cold HBM read (analysis/hw_ceilings.md: 5.9 TB/s incl. launch)
+CEIL_US = 11.34  # 64 MB cold HBM read, measured: 5.9 TB/s incl. launch
 
 
 def timeit(ca, fns, n, rounds, reps):

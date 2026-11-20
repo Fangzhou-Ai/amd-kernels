@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""The AttnRes stages K2 runs after the all-reduce: prefix + delta, the source weights, the softmax mix and
+"""The AttnRes stages the layer tail runs after the all-reduce: prefix + delta, the source weights, the softmax mix and
 the post-attention RMSNorm, on the 56 attn CTAs (shared ``stage_slice`` / ``stage_gates`` / ``stage_mix``)."""
 
 import math
@@ -162,7 +162,7 @@ def stage_slice(c, task):
         pre = ld_bf4(a["prefix"], t * HIDDEN + col)
         if const_expr(c["delta"]):
             if const_expr(c.get("delta_lds") is not None):
-                # the delta reduced into LDS first (K2a: the all-reduced o_proj)
+                # the delta reduced into LDS first (the all-reduced o_proj)
                 dl = [
                     fx.ptr_load(c["delta_lds"] + (t * COLS + (e % QC) * 4 + j))
                     for j in range(4)
@@ -336,7 +336,7 @@ def stage_mix(c, task):
         if mine:
             at = (t * HIDDEN + c0 + cc) // 2
             if const_expr(tag_x):
-                # K2 (``layer.OPT_TAG_X``): the rows also as tagged pairs,
+                # (``kernel.OPT_TAG_X``) the rows also as tagged pairs,
                 # which the router and latent GEMVs poll (no XRDY wait)
                 c["put_words"](c["xt"], at, [xw[0], xw[1]])
             bo.buffer_store(xw, rsrc(c["xbuf"]), at, cache_modifier=CM_DEV)

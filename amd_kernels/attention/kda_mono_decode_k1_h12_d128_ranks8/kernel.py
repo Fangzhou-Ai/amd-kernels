@@ -19,7 +19,7 @@ x is read through LDS in MFMA-block order (``xblock_col``); what does not fit LD
 from the x rows (``x_direct``). A chunk's conv-state stores wait for its head's ONRM pairs, which every chunk puts after
 reading its window: the chunks read each other's q / k channels.
 
-Rounding follows the original path where it is elementwise (the AttnRes prefix add, every bf16 hand-off); sums over the
+Rounding follows the stock vLLM path where it is elementwise (the AttnRes prefix add, every bf16 hand-off); sums over the
 hidden dimension and K differ only in their order.
 """
 

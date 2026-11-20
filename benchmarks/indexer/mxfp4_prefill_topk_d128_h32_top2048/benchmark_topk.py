@@ -5,7 +5,7 @@
     python3 benchmarks/indexer/mxfp4_prefill_topk_d128_h32_top2048/benchmark_topk.py [--cases 0,1,..] [json]
 
 The roofline is the logits window read once (4 bytes per key of every row's window) at the measured HBM read ceilings
-(analysis/hw_ceilings.md: 6.5 TB/s plain loads, 6.9 TB/s nontemporal) and against a read-only kernel streaming the same window
+(6.5 TB/s plain loads, 6.9 TB/s nontemporal) and against a read-only kernel streaming the same window
 (`read_floor`: the ceiling of this access pattern, one workgroup per row, the same loads, no compare).
 """
 

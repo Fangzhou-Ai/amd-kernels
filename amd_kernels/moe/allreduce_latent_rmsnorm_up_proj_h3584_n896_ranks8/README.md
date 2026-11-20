@@ -14,18 +14,18 @@ which only this rank's columns are ever written, so the final all-reduce, or an 
 is exact; pad with -0.0, `replicated_partial_buffer`, so even a real -0.0 survives bit for bit) use the same call.
 
 ## Entry points
-- `LatentTailComm(rank, cpu_group, device)`: collective, one per stream; mailbox and `lat` buffers allocated once.
+- `LatentTailComm`: the communicator, a collective on the eight TP ranks, one per stream; `close()` is collective too.
 - `allreduce_latent_rmsnorm_up_proj`: the call (an `amd_kernels.warm_up` entry); graph-safe, no host work.
-- `allreduce_slots_rmsnorm_up_proj`: the same with the routed experts' 16-slot sum folded in (1..64 rows; slot rows named by
-  `reverse_sorted`, fp32 slot order, one bf16 rounding): +1.4..2.6 us over the call on a summed partial, ~1 us under a separate sum.
-- `reference.latent_tail_reference`: the contract; `LatentTailComm.close()`: collective, after the work completes.
-The dispatch (row tier -> all-reduce workgroup rows, up-projection tiles) lives in `host.py`; the protocol in the
-module docstring of `tail_kernel.py`.
+- `allreduce_slots_rmsnorm_up_proj`: the same with the routed experts' 16-slot sum folded in (1..64 rows).
+- `replicated_partial_buffer`: the -0.0-padded [M, 7168] partial buffer of the replicated layout.
+- `reference.latent_tail_reference`: the contract.
+The dispatch (row tier -> all-reduce workgroup rows, up-projection tiles) lives in `tail_kernel.py` (`rb_of`,
+`nsub_of`, `groups_of`); the protocol in its module docstring.
 
 ## Performance
-Eight ranks, graph replay, 24 rotating weight sets, slowest rank, us (quiet runs under gpurun). Stock = AITER
-all-reduce + Triton norm/up-proj. Floor = launch 1.57 + 2 hops (0.7 flag + xGMI bytes at 430 GB/s) + x read + MFMA
-+ drain (model in `benchmark_tail.py`); the measured ceiling is NOT reached: fused is 47-55% of it, not within 10%.
+Eight ranks, graph replay, 24 rotating weight sets, slowest rank, us. Stock = AITER all-reduce + vLLM's Triton
+norm/up-proj. Floor = launch 1.57 + 2 hops (0.7 flag + xGMI bytes at 430 GB/s) + x read + MFMA + drain (model in
+`benchmark_tail.py`).
 
 | rows | stock AR+up | fused | speedup | floor | floor / fused |
 |---|---|---|---|---|---|
@@ -38,7 +38,8 @@ all-reduce + Triton norm/up-proj. Floor = launch 1.57 + 2 hops (0.7 flag + xGMI 
 | 128 | 20.0 | 17.3 | 1.16x | 9.4 | 55% |
 | 192 | 25.2 | 21.4 | 1.18x | 11.3 | 53% |
 
-Each hop costs 1.5-2x its isolated primitive (flag RTT, 7-destination store acks, poll after barrier); see the report.
+Each hop costs 1.5-2x its isolated primitive (flag round trip, 7-destination store acks, poll after barrier). The
+slot-sum entry adds 1.4..2.6 us over the call on a summed partial, about 1 us less than a separate sum.
 
 ## Tests
 ```bash

@@ -1,4 +1,4 @@
-# attention/kda_decode_fb_gate_spec_h12_d128
+# KDA spec-verify decode: f_b gate, conv, delta rule, gated norm in one launch (12 heads, head dim 128)
 
 ## What it does
 
@@ -21,15 +21,16 @@ states within 2e-3 of the reference in the tests, identical conv state, two runs
 
 ## Entry points
 
-- `kda_decode_fb_gate_spec`: the layer call (`uniform=True` when every sequence has exactly `state_indices.shape[1]`
-  rows, which skips the `cu_seqlens` loads; `snapshot_token` [N] keeps only that token's state snapshot).
+- `kda_decode_fb_gate_spec`: the KDA core of one layer in a spec-verify step (an `amd_kernels.warm_up` entry).
 - `blocker`: why a call does not fit (None: it fits); the caller falls back to the stock chain otherwise.
-- The wave count and row split per batch live in `host.py` (`waves_for`, `split_for`); kernels in `kernel.py`.
+
+`host.py` compiles one kernel per mode (tokens per sequence, norm weight dtype, snapshot mode, uniform lengths); the
+grid is one workgroup per (sequence, head).
 
 ## Performance
 
-Graph replay, 1 MI355X, inputs > 700 MB (cold), median of 15 rounds, us per layer call. `floor` = skeleton kernel (same grid, table
-lookups, state read, snapshot writes, no math). Ceiling = 6.2 TB/s (measured blend of 6.5 read / 6.0 write, hw_ceilings.md).
+Graph replay, 1 MI355X, inputs > 700 MB (cold), median of 15 rounds, us per layer call. Skeleton: the same grid, table
+lookups, state read and snapshot writes, no math. Ceiling: 6.2 TB/s (measured blend of 6.5 read / 6.0 write).
 
 | M (rows x tok) | MB | fused us | TB/s | % ceiling | skeleton us | fused/skeleton | stock f_b + AITER us | speedup |
 |---|---|---|---|---|---|---|---|---|
@@ -41,9 +42,8 @@ lookups, state read, snapshot writes, no math). Ceiling = 6.2 TB/s (measured ble
 | 128 (32 x 4) | 130.9 | 25.2 | 5.20 | 84 | 23.3 | 1.08 | 34.0 | 1.35x |
 | 192 (48 x 4) | 196.1 | 34.7 | 5.66 | 91 | 31.0 | 1.12 | 48.2 | 1.39x |
 
-Small M is a latency chain, not bandwidth (no-store ablation: 9.2 us at M=12): launch 1.6 us + loads 2.2 + gate/conv 1.3 + VALU-bound
-token loop ~0.45 us/token + tail 1.3. M >= 65 is within 10-15% of launch + bytes / 6.2 TB/s. Row-splitting the head over
-workgroups bounds at -20% (M=12) before a ~1 us cross-workgroup norm exchange; not built. Details and attempts log: analysis/kernels/kda_decode_fb_gate_spec_h12_d128.md.
+Small M is a latency chain, not bandwidth (without the snapshot stores still 9.2 us at M=12): launch 1.6 us + loads 2.2
++ gate / conv 1.3 + VALU-bound token loop ~0.45 us a token + tail 1.3. M >= 65 is within 10-15% of launch + bytes / 6.2 TB/s.
 
 ## Tests
 

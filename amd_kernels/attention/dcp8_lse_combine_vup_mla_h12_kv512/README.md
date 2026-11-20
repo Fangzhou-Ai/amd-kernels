@@ -27,8 +27,7 @@ The tile count follows `ceil(T / 16)` in `host.py`; the protocol and the layout 
 
 8 x MI355X, CUDA-graph replay, inputs rotating over > 300 MB, MAX over ranks, us per call (median / min of 9),
 baseline: vLLM's `dcp_vup_rs_combine` with the AITER comm on the same inputs. Ceiling: launch 1.6 us + first-tile load +
-max(flag 0.8 us + bytes sent / 343 GB/s, rest of x / 6.4 TB/s) + 0.6 us tail (measured constants,
-`analysis/hw_ceilings.md`).
+max(flag 0.8 us + bytes sent / 343 GB/s, rest of x / 6.4 TB/s) + 0.6 us tail (constants measured on MI355X).
 
 | T | sent MB | ceiling us | stock us | fused us | speedup | % of ceiling | stock + gate us | fused gated us |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|

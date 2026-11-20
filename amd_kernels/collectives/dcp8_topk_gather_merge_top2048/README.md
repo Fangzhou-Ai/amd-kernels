@@ -11,16 +11,11 @@ plus `merge_dcp_scores` (AITER top-k values, a Triton owned-slot select, a Trito
 `reference.py` is the contract: integer-exact against vLLM's `merge_dcp_scores` (the global top-2048 by score, ties at
 the 2048th score in rank-major position order, NaN below -inf, only live candidates emitted, local index `j` mapped to
 `block_table[row, j // page_size] * block_stride + j % page_size`). Every other element of `slots` is unspecified.
-Tests: `test_reference_vs_vllm.py` pins the reference to vLLM's op, `test_topk_gather_merge.py` pins the kernel to the
-reference on eight GPUs (served row counts 1-256, random ties, all-equal rows, graph replay, bit-identical reruns).
 
-Protocol (details in `kernel.py`): one workgroup per row, flag-free in-band exchange (receivers poll the pushed words
-with atomic loads and zero them at the end of the call). One all-to-all round: each rank pushes to the seven peers a
-fixed 2 KB block of its keys in the highest bins of a 10-bit histogram of the order key (at most 512, padded) plus an
-8-byte header. Every rank sums a histogram of the received keys above the highest cut, finds the bin of the 2048th
-key and picks the exact threshold with two LDS radix passes. Rows whose planes are too skewed for the band take a
-deterministic second round (full histograms) and, if needed, a third (the bin's keys), chosen identically on all ranks.
-The rank then compacts its own plane in position order and prefix-sums the row counts across rows.
+One workgroup per row and one all-to-all round in the common case: each rank pushes its keys in the highest bins of a
+histogram (a fixed 2 KB block per peer), every rank finds the exact threshold from the received keys, and rows whose
+planes are too skewed take a second round (and, if needed, a third), chosen identically on all ranks. No flags: receivers poll the
+pushed words. Protocol and hazards: module docstring of `kernel.py`.
 
 ## Entry points
 
@@ -48,11 +43,12 @@ floor 6.7 us (1.57 launch + 2 xGMI hops + selection, measured ceilings) and byte
 | 192 | 61.1 | 24.3 | 2.51 | 2.76 | 8.1 | 33 |
 
 Not within 10% of the floor: one hop (1.8 us), two LDS radix passes (2.4 us), the cut and push (3 us) and the row-count
-chain (1.5 us) are serial. See the analysis report for the phase timeline and attempts log.
+chain (1.5 us) are serial.
 
 ## Tests
 
 ```bash
 python3 -m pytest tests/collectives/dcp8_topk_gather_merge_top2048 -q     # 1 GPU (reference vs vLLM) + 8 GPUs
+# served row counts 1-256, random ties, all-equal rows, graph replay, bit-identical reruns
 python3 benchmarks/collectives/dcp8_topk_gather_merge_top2048/benchmark_gather_merge.py   # 8 GPUs, needs vLLM
 ```

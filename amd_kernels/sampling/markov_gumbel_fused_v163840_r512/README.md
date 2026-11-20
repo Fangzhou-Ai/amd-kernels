@@ -27,8 +27,9 @@ from the GEMV's (a few logits one bf16 ulp); inputs finite.
 ## Performance
 
 One MI355X, graph replay, 3 rotated `markov_w2` copies, 8 input sets (HBM-cold), T 1.0, median of alternated rounds, us per
-chain. Ceiling A = k launches of the pure `markov_w2` stream (the previous per-step design's floor); ceiling B = one
-persistent launch of k stream passes without step synchronisation; both plus the base read / cache write at 6.1 TB/s.
+chain. Ceiling A = k launches of the pure `markov_w2` stream (the floor of one launch per step); ceiling B = one
+persistent launch of k stream passes without step synchronisation; both plus the base read / cache write at 6.1 TB/s
+(`skeleton.py`).
 
 | requests / steps (conf) | 8 / 4 (c16) | 13 / 4 (c24) | 20 / 3 (c32) | 48 / 3 (c48) |
 |---|---|---|---|---|
@@ -38,10 +39,10 @@ persistent launch of k stream passes without step synchronisation; both plus the
 | % of ceiling A (115.1 / 117.1 / 89.6 / 98.6 us) | 105% | 104% | 94% | 86% |
 | % of ceiling B (100.3 / 102.3 / 77.7 / 86.6 us) | 92% | 91% | 81% | 75% |
 
-T 0.7: 111.3 / 114.4 / 96.4 / 120.2 us; T 0 (no noise): 105.9 / 108.4 / 90.9 / 105.9 us. Per step (timestamps, `timeline.py`): 0.8 us prologue (tokens, `w1` rows, operand), the tile
-loop (20.8 us median at 8 rows), 2-5 us between the first and the last workgroup finishing, 2.7-3.8 us for the two
-cross-XCD hops of the argmax (0.54 us a hop measured) and the broadcast. Limits, ceilings and the attempts log:
-`analysis/kernels/markov_gumbel_fused_v163840_r512.md`.
+T 0.7: 111.3 / 114.4 / 96.4 / 120.2 us; T 0 (no noise): 105.9 / 108.4 / 90.9 / 105.9 us. Per step (timestamps,
+`timeline.py`): 0.8 us prologue (tokens, `w1` rows, operand), the tile loop (20.8 us median at 8 rows), 2-5 us
+between the first and the last workgroup finishing, 2.7-3.8 us for the two cross-XCD hops of the argmax (0.54 us a
+hop measured) and the broadcast.
 
 ## Tests
 

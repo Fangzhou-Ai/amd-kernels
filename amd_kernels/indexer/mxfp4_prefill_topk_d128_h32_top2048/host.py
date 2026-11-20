@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Entry point of the prefill indexer's top-2048 select: workspace and the three launches (kernel.py, contract in reference.py)."""
+"""Entry point of the prefill indexer's top-2048 select: workspace and the four launches (kernel.py, contract in reference.py)."""
 
 import functools
 

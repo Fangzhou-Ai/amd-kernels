@@ -6,8 +6,8 @@ ranks, us per call (min and median of the rounds), and the roofline columns.
 Baseline: AITER's custom all-reduce, then vLLM's Triton AttnRes kernel (regtile, the served default) on the reduced
 tensor; the all-reduce and the AttnRes kernel alone are timed too. The call is the pre-MLP one of a layer (prefix +
 delta, a bank of ``--blocks`` rows, output norm); ``--write`` adds the bank write of a block-write layer. Ceilings
-(analysis/hw_ceilings.md, measured): HBM 6.4 TB/s, all-to-all xGMI 355 GB/s per GPU; the floor is the all-reduce floor
-5 us + 2 * 7/8 * bytes / 400 GB/s plus 1.2 us of tail (prefix add, norm, store).
+(measured on MI355X; xGMI by ``ceilings.py``): HBM 6.4 TB/s, all-to-all xGMI 355 GB/s per GPU; the floor is the
+all-reduce floor 5 us + 2 * 7/8 * bytes / 400 GB/s plus 1.2 us of tail (prefix add, norm, store).
 """
 import argparse
 import contextlib
@@ -18,7 +18,7 @@ import torch
 import torch.distributed as dist
 
 H = 7168
-HBM_TBPS = 6.4  # measured read bandwidth of cold buffers (analysis/hw_ceilings.md), not the spec sheet
+HBM_TBPS = 6.4  # measured read bandwidth of cold buffers, not the spec sheet
 XGMI_GBPS = 355.0  # measured all-to-all push bandwidth per GPU (ceilings.py --mode bw)
 ROW = H * 2
 
@@ -35,12 +35,13 @@ def traffic(m, blocks, write):
 
 
 def floor_us(m):
-    """Model floor: the AR floor of hw_ceilings.md (5 us + 2 * 7/8 * bytes / 400 GB/s) plus the tail after the exchange."""
+    """Model floor: the measured all-reduce floor (5 us + 2 * 7/8 * bytes / 400 GB/s) plus the tail after the
+    exchange."""
     return 5.0 + 1.75 * m * ROW / 400e3 + 1.2
 
 
 def chain_floor_us(m):
-    """Primitive-chain floor from measured pieces: the empty-kernel graph period 1.57 us (hw_ceilings.md section 3),
+    """Primitive-chain floor from measured pieces: the empty-kernel graph period 1.57 us,
     the partial load 0.5, a flight 0.77 + a mailbox read 0.23 twice, the reduction 0.1, the tail (prefix, norm, store)
     0.6, plus the two phases' bytes at the measured all-to-all push ceiling (they cannot overlap the flights)."""
     return 1.57 + 0.5 + 2 * (0.77 + 0.23) + 0.1 + 0.6 + m * 2 * 7 * ROW / 8 / (XGMI_GBPS * 1e3)

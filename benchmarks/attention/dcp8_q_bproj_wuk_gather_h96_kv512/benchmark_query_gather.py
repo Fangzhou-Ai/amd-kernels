@@ -5,7 +5,7 @@ last-level cache), us per call: the minimum over rounds (5 replays each) of the 
 sequence (skinny / hipBLASLt q_b GEMM, ``torch.bmm`` with W_UK, ``torch.cat``, AITER IPC all-gather); this entry's bf16
 output (``q``), its fp8 hi/lo record alone (``q8``) and both (``both``); ``gather``: the same call with the consumers only
 waiting for the data (no W_UK, no output); ``P0``: the push + flag protocol alone (producers push without loads or math,
-consumers wait). ``floor`` is the chain model of the push all-gather from the measured ceilings (analysis/hw_ceilings.md):
+consumers wait). ``floor`` is the chain model of the push all-gather from the ceilings measured on MI355X:
 launch gap, q_b weight load, the push at the 8-GPU all-to-all egress rate, remote write ack, flag, the last tile's
 consumer chain."""
 

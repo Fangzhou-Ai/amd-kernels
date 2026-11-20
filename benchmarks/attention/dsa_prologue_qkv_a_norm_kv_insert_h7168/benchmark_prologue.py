@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """Graph-replay timing of ``qkv_a_norm_kv_insert`` and ``indexer_prep`` against their skeletons (the same memory
-dependence chain without arithmetic, ``skeleton.py``: the empirical floor) and against the unfused ops vLLM runs today
+dependence chain without arithmetic, ``skeleton.py``: the empirical floor) and against the unfused ops vLLM runs
 (the multi-stream DSA wrapper's chain: AITER ``rms_norm`` x2 + ``concat_and_cache_mla``; ``layer_norm``, Triton
 ``store_keys``, ``fill_``, the fp32 weight product, the starts clamp and ``quantize_queries``; also the two-launch
 Triton ``store_keys_and_reset`` + ``quantize_queries_and_weights`` of ``VLLM_K3_FUSED_INDEXER_PREP``).

@@ -27,7 +27,8 @@ partials.
 
 ## Performance
 
-MI355X, 15000 local keys per request, min of 15 graph replays, quiet GPU (`benchmark_decode.py`):
+MI355X, 15000 local keys per request, min of 15 graph replays, us per call. Stock: AITER's `mla_decode_fwd` as vLLM runs
+it (`benchmark_decode.py`).
 
 | case | reqs x rows | stock us | kernel us | speedup | % of 4.07 PF MFMA |
 |---|---|---|---|---|---|
@@ -35,8 +36,6 @@ MI355X, 15000 local keys per request, min of 15 graph replays, quiet GPU (`bench
 | c24 | 13 x 4 | 249.3 | 90.4 | 2.76x | 44.3 |
 | c32 | 20 x 3 | 179.6 | 132.6 | 1.35x | 34.8 |
 | c48 | 48 x 3 | 422.9 | 286.6 | 1.48x | 38.7 |
-
-Well short of the 90% bar; see `analysis/kernels/drafter_mla_decode.md` for the per-tile breakdown.
 
 ## Tests
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""bf16 GEMV pieces the K3 mono kernels share: 16 weight rows a task against up
+"""bf16 GEMV pieces of the layer tail's stages: 16 weight rows a task against up
 to 16 token rows in LDS, one ``mfma_f32_16x16x32_bf16`` per 32 K.
 
 K is walked in 128-wide chunks, wave w taking chunks w, w + 8, ...; a lane reads

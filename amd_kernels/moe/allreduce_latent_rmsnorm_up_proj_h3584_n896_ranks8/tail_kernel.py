@@ -17,9 +17,10 @@ part once for everyone: hop 2 pushes ``xn = bf16(latent * w_norm)`` into the ``l
 included) and the row's sum of squares of its slice into ``lat``'s side array ``ssq[row][me]``; after the workgroup's
 wave has had its stores acknowledged it raises F2 (row, me) at every rank. An up-projection workgroup leaves its wait
 when F2 (row, o) of its rows and every owner shows the epoch, so a finished kernel has the whole reduced, scaled latent
-in its own ``lat`` and every owner has finished reading its inbox, which a peer's next call writes. Epochs are private per workgroup (one word each, read at the start and written at the end by the same
-workgroup): every workgroup of the fixed grid runs once per call and every rank makes the same calls, so all epochs equal
-the call count. No input address is exchanged: eager and graph calls are the same.
+in its own ``lat`` and every owner has finished reading its inbox, which a peer's next call writes. Epochs are private
+per workgroup (one word each, read at the start and written at the end by the same workgroup): every workgroup of the
+fixed grid runs once per call and every rank makes the same calls, so all epochs equal the call count. No input address
+is exchanged: eager and graph calls are the same.
 
 Up projection. A workgroup owns 16 x NSUB output columns (n tile ``nt``; NSUB is 1 up to 64 rows, else 2) and ``MPG`` 16-token
 tiles (m group ``g``; groups_of(rows) groups, so 224 workgroups at most) over the whole K; wave w of its 8 takes the 448 K

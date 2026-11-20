@@ -3,9 +3,9 @@
 """One GPU, cold rotated weights (6 copies of the 77 MB MLP), CUDA-graph replay, min / median us per call.
 
 Stock: vLLM ``rocm_unquantized_gemm_impl`` (gate_up, down) and ``silu_and_mul``, the ops the drafter runs.
-New: ``dense_mlp`` (two launches) on packed activations; roofline = the weights at the measured cold-read ceiling of
-analysis/hw_ceilings.md (6.5 TB/s) plus two launch floors of 1.6 us.
-Run: env/gpurun <gpu> python benchmarks/decoder/bf16_dense_mlp_h7168_i1792/benchmark_mlp.py
+This entry: ``dense_mlp`` (two launches) on packed activations; roofline = the weights at the measured cold-read
+ceiling (6.5 TB/s) plus two launch floors of 1.6 us.
+Run: python3 benchmarks/decoder/bf16_dense_mlp_h7168_i1792/benchmark_mlp.py
 """
 import argparse
 import statistics

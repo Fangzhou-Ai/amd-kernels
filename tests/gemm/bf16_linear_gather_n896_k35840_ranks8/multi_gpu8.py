@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Run a test body on 8 GPUs, as tests/multi_gpu.py does on 4: one process per GPU and a gloo process group (a TCPStore
+"""Run a test body on 8 GPUs, as tests/multi_gpu.py does on 2 or 4: one process per GPU and a gloo process group (a TCPStore
 on a random local port; a port taken by another job starts the group again). The 8 rank processes start at the first
 call and serve every later call of the same pytest process. A failed call kills them; the next call starts new ones. The
 body appends mismatches to ``errors`` instead of raising, so every rank reaches the same collectives; an exception is

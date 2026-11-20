@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""The contract: the Kimi MoE router, GEMM through top-16, as vLLM's AITER path computes it today.
+"""The contract: the Kimi MoE router, GEMM through top-16, as vLLM's AITER path computes it.
 
 logits = fp32 sum of the bf16 products x [M, 7168] @ W [896, 7168]^T (fp64 here, fp32 in the kernel: its split-K
 sum order differs, so logits agree to ~1e-6 relative). Then AITER's ``biased_grouped_topk`` with one group

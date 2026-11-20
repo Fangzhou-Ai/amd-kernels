@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Graph replay of the MoE router (GEMM + sigmoid + bias + top-16, one launch) against vLLM's path today: GateLinear's
+"""Graph replay of the MoE router (GEMM + sigmoid + bias + top-16, one launch) against vLLM's path: GateLinear's
 fp32-out bf16 GEMM (hipBLASLt) followed by AITER's biased_grouped_topk (one group, topk_reg_kernel). One graph of 24 calls
 over 24 weight copies (24 x 12.8 MB > the 256 MB MALL: HBM on every call, as in serving) and 24 activation sets, 5 replays
 x 15 rounds, minimum us (min of 15). Floors measured on the same kernel (the ``skel`` bits of ``compile_router_e896_h7168``):
 ``stream`` = the weight stream alone (grid, DMAs and launch of the real kernel; no activations, MFMAs, stores, consumers),
 ``prod`` = every workgroup's GEMM and slab stores, no consumers, ``skel`` = the whole hand-off (slab stores, the token
 gather, the exchange) with no MFMAs and no top-16. The % columns are fused against ``skel`` (the measured ceiling of
-this design's critical path before the top-16 chain) and against the HBM roofline of hw_ceilings.md (7.0 TB/s
+this design's critical path before the top-16 chain) and against the HBM roofline (7.0 TB/s measured
 nontemporal reads + one launch). Peak: 1.98 PF measured bf16 MFMA.
 Run: python3 benchmarks/moe/router_sigmoid_bias_top16_e896_h7168/benchmark_router.py [M ...]
 """

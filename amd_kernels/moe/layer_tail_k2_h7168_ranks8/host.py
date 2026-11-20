@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Host side of the layer tail K2: the launch, and the per-rank state (scratch, epoch, health words, peer memory)."""
+"""Host side of the layer tail: the launch, and the per-rank state (scratch, epoch, health words, peer memory)."""
 
 from dataclasses import dataclass
 

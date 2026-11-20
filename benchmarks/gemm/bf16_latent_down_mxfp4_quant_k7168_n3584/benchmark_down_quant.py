@@ -16,7 +16,7 @@ from amd_kernels.gemm.bf16_latent_down_mxfp4_quant_k7168_n3584 import (bf16_late
                                                                        shuffle_weight)
 from amd_kernels.gemm.bf16_latent_down_mxfp4_quant_k7168_n3584.reference import K, N
 
-HBM_NT_TBPS = 6.95  # measured nontemporal HBM read (analysis/hw_ceilings.md)
+HBM_NT_TBPS = 6.95  # measured nontemporal HBM read
 GRAPH_NODE_US = 1.57  # measured empty kernel in a graph
 PEAK_BF16_TFLOPS = 1980.0  # measured register-resident MFMA
 COPIES = 12

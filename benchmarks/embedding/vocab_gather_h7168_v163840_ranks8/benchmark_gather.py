@@ -3,7 +3,7 @@
 """Eight-rank embedding latency vs vLLM's VocabParallelEmbedding (mask / gather / fill + AITER all-reduce).
 
 Graph replay of 20 distinct token batches per M, nine rounds (minimum), MAX over ranks, us. Ceilings
-(analysis/hw_ceilings.md): the balanced floor is one launch gap (1.6 us), one remote read round trip (1.0 us) and 7/8 of the
+(measured): the balanced floor is one launch gap (1.6 us), one remote read round trip (1.0 us) and 7/8 of the
 rows (M x 14336 B) over the measured 365 GB/s per-GPU ingress of an 8-GPU all-read; the critical-path model adds what the
 data fixes: the local part (the kernel on rows of its own shard), one remote latency of 1.5 us and the busiest owner's rows
 (every rank reads the same ids, so the link of the owner holding the most rows of the batch is the longest) at the 52 GB/s

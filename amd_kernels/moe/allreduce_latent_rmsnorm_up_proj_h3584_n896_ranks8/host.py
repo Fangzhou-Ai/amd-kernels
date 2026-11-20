@@ -117,7 +117,7 @@ class LatentTailComm:
         self.buf_table = torch.tensor(self.bufs + lats, dtype=torch.int64, device=device)
         self.counts = torch.zeros(T.CNT_WORDS, dtype=torch.int32, device=device)
         self.groups_override = 0
-        self.rb_override = 0  # experiments: rows per all-reduce workgroup (2, 4 or 8) instead of ``tail_kernel.rb_of``
+        self.rb_override = 0  # rows per all-reduce workgroup (2, 4 or 8) for a sweep; 0: ``tail_kernel.rb_of``
         self.ts = None  # a [workgroup, wave, 8] int32 tensor of phase stamps (a profiling build), set by the caller
         torch.cuda.synchronize(device)
         dist.barrier(group=group)

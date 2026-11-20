@@ -4,10 +4,10 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.:
 # atom/mono/device/stamps.py
 # atom/mono/runtime/debug.py
-"""A timeline build's per-CTA phase stamps (debug only; ``ATOM_MONO_TIMELINE``,
-saved by ``atom.mono.runtime.timeline``): the s_memrealtime (100 MHz) at which
-the CTA passes point k, kept in LDS until the kernel ends -- a global store per
-stamp would sit on every later ``s_waitcnt vmcnt(0)``.
+"""A timeline build's per-CTA phase stamps (debug only; the caller passes the
+``timeline`` buffer): the s_memrealtime (100 MHz) at which the CTA passes point
+k, kept in LDS until the kernel ends -- a global store per stamp would sit on
+every later ``s_waitcnt vmcnt(0)``.
 
 ``on`` is the build's compile-time switch: off, every call traces to nothing.
 """

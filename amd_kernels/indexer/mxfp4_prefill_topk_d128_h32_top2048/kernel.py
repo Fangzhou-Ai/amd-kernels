@@ -2,14 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """Per-row top-2048 of the prefill indexer's logits over each row's window ``[ks, ke)`` (gfx950, FlyDSL): threshold and stream.
 
-``threshold``: one workgroup per row estimates the value above which about 3.6K of the window's keys lie from a weighted sample
-(the window's last 4096 and first 512 keys exactly, plus ~1% stratified 64-key blocks of the middle) and writes it as a float.
+``threshold``: one workgroup per row estimates the value above which about 4.6K (``TMID``) of the window's keys lie from
+a weighted sample (the window's last 4096 and first 512 keys exactly, plus ~1% stratified 64-key blocks of the middle) and
+writes it as a float.
 ``stream``: one workgroup per row streams its window once (nontemporal 16-byte loads, one chunk prefetched) and keeps every value
 >= the threshold in an LDS list that is ascending in position by construction (each wave owns a contiguous slice of every chunk,
 the waves' counts are exchanged through LDS once per chunk), then copies the list out with the count.
 ``retry``: a row whose count is outside [2048, CAP] is streamed again, up to twice, with a threshold re-ranked from the sample by
 the observed ratio and the counts of two more thresholds, which let a second failure continue with a threshold whose exact count
-lies in range.
+lies in range. None of 9600 random rows retries; clustered data does more often.
 ``select.py`` takes the exact 2048th largest of each list and writes the positions; rows that all passes failed on are selected by
 an exact radix over the window.
 

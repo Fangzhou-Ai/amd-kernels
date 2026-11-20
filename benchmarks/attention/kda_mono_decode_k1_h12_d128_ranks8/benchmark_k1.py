@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """K1 under CUDA graph replay: one graph of ``SETS`` launches over distinct weight sets (together larger than the
 LLC, so every launch streams in_proj from HBM as a layer of the model does), median us a launch [min-max over
-rounds], with its roofline: bytes read and written against the measured HBM ceilings (analysis/hw_ceilings.md: 6.5 TB/s
-read, 6.0 TB/s write, 1.57 us graph launch gap), and the vLLM K1 when vllm is importable.
+rounds], with its roofline: bytes read and written against the HBM ceilings measured on MI355X (6.5 TB/s
+read, 6.0 TB/s write, 1.57 us graph launch gap).
 
     python benchmarks/attention/kda_mono_decode_k1_h12_d128_ranks8/benchmark_k1.py [--shapes 12x6 6x6 ...] [--nb 4]
 """

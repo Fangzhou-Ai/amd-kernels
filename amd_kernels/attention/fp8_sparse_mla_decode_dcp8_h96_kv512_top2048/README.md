@@ -1,4 +1,4 @@
-# fp8_sparse_mla_decode_dcp8_h96_kv512_top2048
+# Sparse MLA decode at DCP8, fp8_ds_mla cache (96 latent heads, kv_lora 512, top-2048)
 
 ## What it does
 
@@ -17,37 +17,33 @@ fp32: cosine > 0.99999 against the Triton kernel, LSE within 1e-2. Two runs are 
 are bit for bit equal; no atomics. Preconditions: per-128 scales are powers of two <= 2^7 (vLLM's fp8_ds_mla writer),
 every slot is inside the cache.
 
-Two kernels, picked by row count. Rows <= 42 (`kernel_row.py`): one workgroup of 8 waves per (row, 16-head group) holds
-the row's 288 keys in LDS, splits QK over tokens and PV over dims, and loops a second pass for longer rows. Rows >= 43
-(`kernel_tile.py`): one workgroup per (row, 3 head groups) streams 64-key tiles through a 3-deep LDS ring, one DMA wave
-feeding QK and PV waves a tile apart, with a lazy online-softmax rescale.
-
 ## Entry points
 
-- `fp8_sparse_mla_decode(q, kv_cache, indptr, slots, sm_scale, out=None, q8=None)`: the decode call of a DSA layer;
-  replaces vLLM's `triton_sparse_mla_fwd` call at DCP (`rocm_aiter_mla_sparse.py:1664-1684`), same `(out, lse)`.
+- `fp8_sparse_mla_decode`: the decode attention of a DSA layer at DCP, in place of vLLM's `triton_sparse_mla_fwd`
+  call; returns the same `(out, lse)`.
 - `supports_fp8_sparse_mla_decode`: the shape / dtype / alignment check (gfx950, 96 heads, 656 B flat records, int32 CSR).
-- Dispatch: rows <= 42 whole-row kernel, otherwise tile kernel; both registered with `amd_kernels.warm_up`.
+
+`host.py` picks the kernel by row count: the whole-row `kernel_row.py` up to 42 rows, the tile loop `kernel_tile.py`
+above; both are registered with `amd_kernels.warm_up`.
 
 ## Performance
 
-Graph replay, inputs cold, min of 15 replays, us per launch, ~256 keys per row, 4 rows per request, MI355X. Triton is
-AITER's `sparse_mla_fwd` (vLLM's path), measured in the same harness. "skeleton" is the same launch grid doing only the
-index + KV gather DMA with its barriers (no math); roofline is bytes at 6.4 TB/s.
+Graph replay, inputs cold, min of 15 replays, us per launch, ~256 keys per row, 4 rows per request, MI355X. Baseline:
+AITER's Triton `sparse_mla_fwd` (vLLM's path) in the same harness. Skeleton: the same launch grid doing only the
+index + KV gather DMA with its barriers (no math); roofline: bytes at 6.4 TB/s.
 
-| rows | Triton | v1 | v2 bf16 q | v2 q8 | skeleton | v2 bf16 / skeleton | roofline |
+| rows | Triton | bf16 q | q8 | speedup (bf16 q) | skeleton | skeleton / bf16 q | roofline |
 |---|---|---|---|---|---|---|---|
-| 12 | 17.6 | 16.3 | 11.8 | 11.6 | 7.1 | 60% | 0.7 |
-| 24 | 22.4 | 16.7 | 12.7 | 12.5 | 7.1 | 56% | 1.4 |
-| 40 | 25.4 | 17.3 | 13.6 | 13.5 | 7.3 | 54% | 2.4 |
-| 65 | 28.9 | 24.1 | 19.5 | 18.6 | 12.2 | 62% | 3.8 |
-| 80 | 29.7 | 24.8 | 19.8 | 19.2 | 11.9 | 60% | 4.7 |
-| 128 | 49.8 | 38.5 | 22.0 | 21.4 | 17.1 | 78% | 7.6 |
-| 192 | 66.7 | 54.3 | 37.8 | 36.4 | 24.0 | 63% | 11.3 |
+| 12 | 17.6 | 11.8 | 11.6 | 1.49x | 7.1 | 60% | 0.7 |
+| 24 | 22.4 | 12.7 | 12.5 | 1.76x | 7.1 | 56% | 1.4 |
+| 40 | 25.4 | 13.6 | 13.5 | 1.87x | 7.3 | 54% | 2.4 |
+| 65 | 28.9 | 19.5 | 18.6 | 1.48x | 12.2 | 62% | 3.8 |
+| 80 | 29.7 | 19.8 | 19.2 | 1.50x | 11.9 | 60% | 4.7 |
+| 128 | 49.8 | 22.0 | 21.4 | 2.26x | 17.1 | 78% | 7.6 |
+| 192 | 66.7 | 37.8 | 36.4 | 1.76x | 24.0 | 63% | 11.3 |
 
-The 90%-of-skeleton bar is not met at any row count (54-78%); `analysis/kernels/sparse_mla_v2.md` has the stamps, PMC
-counters, ablations and attempts. q8 saves 0.1-1.6 us here but costs the q-gather kernel more than that to emit
-(+0.7 us at 12 rows, +8 us at 192), so bf16 q is the default. Persistent CTAs and a cross-workgroup token split were not built.
+q8 saves 0.1-1.6 us here but costs the q-gather kernel more than that to emit (+0.7 us at 12 rows, +8 us at 192), so
+bf16 q is the default.
 
 ## Tests
 

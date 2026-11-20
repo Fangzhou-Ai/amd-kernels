@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Layer tail K2 graph latency on 8 ranks (torchrun --nproc_per_node 8), with the roofline table.
+"""Layer tail graph latency on 8 ranks (torchrun --nproc_per_node 8), with the roofline table.
 
 Each graph replays NSET launches over distinct weights (the working set exceeds the LLC); the time is the median of
 ROUNDS x REPL replays, per launch, the slowest rank. ``P`` limits the experts the routing can pick (896: uniform,
@@ -16,7 +16,7 @@ from amd_kernels.moe.layer_tail_k2_h7168_ranks8 import kernel as K
 from amd_kernels.moe.layer_tail_k2_h7168_ranks8 import reference as ref
 from tests.moe.layer_tail_k2_h7168_ranks8.inputs import layer_inputs, moe_weights
 
-HBM_READ_TBS = 6.4  # measured achievable HBM read (analysis/hw_ceilings.md)
+HBM_READ_TBS = 6.4  # measured achievable HBM read on MI355X
 NSET, REPL, ROUNDS = 4, 20, 12
 bf = torch.bfloat16
 DENSE_MB = (7168 * 1536 + 112 * 7168 + 448 * 7168 + 1536 * 7168 + 7168 * 768 + 896 * 3584) * 2 / 1e6
