@@ -194,3 +194,24 @@ def test_zero_dim_scales():
     o0, l0 = fp8_dense_mla_decode(q, pool, ip, idx, gip, qs.reshape(()), ks.reshape(()), SM_SCALE, 4, 0, 8)
     torch.cuda.synchronize()
     assert torch.equal(o0, o1) and torch.equal(l0, l1)
+
+
+@pytest.mark.parametrize("qlen,n", [(3, 64), (3, 16), (4, 48)])
+@torch.inference_mode()
+def test_all_empty_capture_dummies(qlen, n):
+    """CUDA-graph capture dummies: every request has 0 keys (kv_indptr all 0) and kv_indices holds whatever the buffer
+    held. The kernel must read neither kv_indices[-1] nor a KV row through a stale index (the served drafter faulted at
+    c48 capture, q3), and every row is empty (output 0, LSE -inf)."""
+    require_gfx950()
+    n = min(n, 63)
+    pool = torch.zeros(256, QK_DIM, dtype=FP8, device="cuda")
+    big = torch.full((4096,), 0x7FFFFFF0, dtype=torch.int32, device="cuda")
+    idx = big[1:]  # idx[-1] and every entry: an index far outside the pool
+    ip = torch.zeros(n + 1, dtype=torch.int32, device="cuda")
+    gip = torch.zeros(n + 1, dtype=torch.int32, device="cuda")
+    q = torch.randn(n * qlen, HEADS, QK_DIM, device="cuda").to(FP8)
+    qs, ks = scales()
+    out, lse = fp8_dense_mla_decode(q, pool, ip, idx, gip, qs, ks, SM_SCALE, qlen, 0, 8)
+    torch.cuda.synchronize()
+    assert not torch.isfinite(lse).any()
+    assert (out.float() == 0).all()

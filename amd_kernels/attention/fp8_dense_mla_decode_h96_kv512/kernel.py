@@ -330,13 +330,15 @@ def compile_partials(qlen: int, cp_world: int = 8):
 
         def idx_dma(seg_s, seg_e, tile):
             pos = seg_s + tile * TT + lane
-            posc = _imin((pos < seg_e).select(pos, seg_s), last_tok)
+            # all requests empty (CUDA-graph capture dummies): last_tok is -1; never read kv_indices[-1]
+            posc = _imax(_imin((pos < seg_e).select(pos, seg_s), last_tok), fx.Int32(0))
             _dma4(idx_base + fx.Int64(posc) * 4, _lds_llvm_ptr(base + IB + w * 1024 + (tile % NIB) * 256))
 
         def idx_read(tile):
             return fx.Int32(_lds_load_na_scalar(base + IB + w * 1024 + (tile % NIB) * 256 + 4 * (16 * w + (lane >> 2))))
 
         def dma_rows(ix, stage):
+            ix = (last_tok >= 0).select(ix, fx.Int32(0))  # no key at all: row 0 (always mapped), results are masked
             gbase = kv_base + fx.Int64(ix) * ROW + fx.Int64(dma_off)
             for k in range_constexpr(9):
                 _dma(_global_llvm_ptr(gbase + 64 * k), _lds_llvm_ptr(base + stage * STAGE + (w * 9 + k) * 1024))
@@ -418,7 +420,7 @@ def compile_partials(qlen: int, cp_world: int = 8):
                 ii = fx.Int32(i)
                 rocdl.s_waitcnt(vmcnt=11)
                 rocdl.s_barrier()
-                ix = idx_read(ii + 3)
+                ix = (last_tok >= 0).select(idx_read(ii + 3), fx.Int32(0))
                 gbase = kv_base + fx.Int64(ix) * ROW + fx.Int64(dma_off)
                 dst_stage = base + ((ii + (NBUF - 1)) % NBUF) * STAGE
 
