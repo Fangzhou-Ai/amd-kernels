@@ -126,6 +126,9 @@ def fp8_dense_mla_decode(q, kv_cache, kv_indptr, kv_indices, g_kv_indptr, q_scal
         return out, lse
     po, pml = _workspace(dev, query_len)
     stream = torch.cuda.current_stream(dev)
+    # vLLM's layer._q_scale / _k_scale are 0-d buffers: the compiled launcher takes 1-d tensors (a 0-d one fails its
+    # argument fill with "tuple index out of range")
+    q_scale, kv_scale = q_scale.reshape(1), kv_scale.reshape(1)
     _run_compiled(
         _partials(query_len, cp_world),
         q,

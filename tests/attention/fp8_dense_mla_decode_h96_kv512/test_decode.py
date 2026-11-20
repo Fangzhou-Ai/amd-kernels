@@ -182,3 +182,15 @@ def test_supports():
     assert not supports_fp8_dense_mla_decode(q.view(torch.uint8), pool, ip, idx, gip, qs, ks, 4)
     assert not supports_fp8_dense_mla_decode(q[:, :64], pool, ip, idx, gip, qs, ks, 4)
     assert not supports_fp8_dense_mla_decode(q, pool, ip.long(), idx, gip, qs, ks, 4)
+
+
+@torch.inference_mode()
+def test_zero_dim_scales():
+    """vLLM passes the layer's 0-d ``_q_scale`` / ``_k_scale`` buffers: same result as the 1-element tensors."""
+    require_gfx950()
+    q, pool, ip, idx, gip = make_batch(4, [1500, 900], 0, seed=11)
+    qs, ks = scales()
+    o1, l1 = fp8_dense_mla_decode(q, pool, ip, idx, gip, qs, ks, SM_SCALE, 4, 0, 8)
+    o0, l0 = fp8_dense_mla_decode(q, pool, ip, idx, gip, qs.reshape(()), ks.reshape(()), SM_SCALE, 4, 0, 8)
+    torch.cuda.synchronize()
+    assert torch.equal(o0, o1) and torch.equal(l0, l1)
