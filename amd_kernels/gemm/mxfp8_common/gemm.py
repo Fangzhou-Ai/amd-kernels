@@ -74,8 +74,9 @@ _SHUFFLED_A_KERNELS = (*_DECODE_KERNELS, _DECODE_SPLITK_KERNEL)
 _FOURWAVE_KERNEL = "4wave"
 _FOURWAVE_NT_KERNEL = "4wave_nt"
 _FOURWAVE_KERNELS = (_FOURWAVE_KERNEL, _FOURWAVE_NT_KERNEL)
-# Shapes with kernels of their own (gemm/mxfp8_n<N>_k<K>/host.py): ``select`` (their rows
-# ahead of the table), ``LAUNCHERS`` (kernel name -> launch), and optionally
+# Shapes with kernels or rows of their own (gemm/mxfp8_n<N>_k<K>/host.py): ``select`` (their rows
+# ahead of the table), ``LAUNCHERS`` (kernel name -> launch), and optionally ``ROWS`` (the
+# folder's own table, ``parse_rows``; it lists the shape in ``tuned_shapes``),
 # ``select_prequant``, ``select_deferred``, ``decode_launcher``. The dispatcher imports a
 # host on first use.
 _SHAPE_HOSTS = {
@@ -83,6 +84,7 @@ _SHAPE_HOSTS = {
     (4992, 6144): "amd_kernels.gemm.mxfp8_n4992_k6144.host",
     (6144, 2048): "amd_kernels.gemm.mxfp8_n6144_k2048.host",
     (6144, 4096): "amd_kernels.gemm.mxfp8_n6144_k4096.host",
+    (6144, 6144): "amd_kernels.gemm.mxfp8_n6144_k6144.host",
     (6144, 8192): "amd_kernels.gemm.mxfp8_n6144_k8192.host",
 }
 
@@ -120,9 +122,15 @@ _PRELOAD_HINTS = {
 def _load_tuned_configs() -> dict[
     tuple[int, int, str], tuple[tuple[int, _Config], ...]
 ]:
+    return parse_rows(TUNED_CSV)
+
+
+@functools.cache
+def parse_rows(text: str) -> dict[tuple[int, int, str], tuple[tuple[int, _Config], ...]]:
+    """The rows of a tuned-table CSV text (the columns of mxfp8_gemm_tuned.py), checked, by (N, K, out dtype): the
+    table's, or a shape folder's ``ROWS`` (read with ``select_from_rows``)."""
     configs: dict[tuple[int, int, str], list[tuple[int, _Config]]] = {}
-    # the CSV text of the tuned table (mxfp8_gemm_tuned.py)
-    for row in csv.DictReader(io.StringIO(TUNED_CSV)):
+    for row in csv.DictReader(io.StringIO(text)):
         shape = (int(row["N"]), int(row["K"]), row["out_dtype"])
         config = _Config(
             tile_m=int(row["tile_m"]),
@@ -255,12 +263,47 @@ def splitk_rows(
 
 
 def tuned_shapes(out_dtype: torch.dtype = torch.bfloat16) -> frozenset[tuple[int, int]]:
-    """The (N, K) weight shapes whose table has rows tuned for ``out_dtype`` (bf16 or
-    fp16 output). A caller that switches its linears to this entry by shape switches
-    these: any other shape runs only the AITER default rows or the generic fallback
-    tiles, which were never measured against other kernels."""
+    """The (N, K) weight shapes whose table (or shape folder's ``ROWS``) has rows tuned for
+    ``out_dtype`` (bf16 or fp16 output). A caller that switches its linears to this entry by
+    shape switches these: any other shape runs only the AITER default rows or the generic
+    fallback tiles, which were never measured against other kernels."""
     name = {torch.bfloat16: "bf16", torch.float16: "fp16"}[out_dtype]
-    return frozenset((n, k) for n, k, d in _load_tuned_configs() if d == name)
+    shapes = {(n, k) for n, k, d in _load_tuned_configs() if d == name}
+    for n, k in _SHAPE_HOSTS:
+        if (n, k, name) in getattr(_shape_host(n, k), "ROWS", {}):
+            shapes.add((n, k))
+    return frozenset(shapes)
+
+
+def select_from_rows(
+    rows: dict,
+    m: int,
+    n: int,
+    k: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+    allow_decode: bool = True,
+) -> _Config | None:
+    """The row of ``rows`` (``parse_rows``) for an M x N x K call: the dtype's row within its
+    measured range, else the ``any`` (AITER default) row, the last one past their bounds;
+    None when ``rows`` has neither for (N, K)."""
+    dtype_name = "bf16" if out_dtype == torch.bfloat16 else "fp16"
+    tuned_configs = rows.get((n, k, dtype_name))
+    if tuned_configs is not None and m <= tuned_configs[-1][0]:
+        for tuned_m, config in tuned_configs:
+            if m <= tuned_m:
+                if m >= config.min_m and (
+                    allow_decode or config.kernel not in _SHUFFLED_A_KERNELS
+                ):
+                    return config
+                break
+    # Preserve the AITER defaults outside the dtype-specific measured ranges.
+    tuned_configs = rows.get((n, k, "any"))
+    if tuned_configs is not None:
+        for tuned_m, config in tuned_configs:
+            if m <= tuned_m:
+                return config
+        return tuned_configs[-1][1]
+    return None
 
 
 def _select_config(
@@ -281,24 +324,9 @@ def _select_config(
         config = host.select(m, out_dtype, allow_decode)
         if config is not None:
             return config
-    configs = _load_tuned_configs()
-    dtype_name = "bf16" if out_dtype == torch.bfloat16 else "fp16"
-    tuned_configs = configs.get((n, k, dtype_name))
-    if tuned_configs is not None and m <= tuned_configs[-1][0]:
-        for tuned_m, config in tuned_configs:
-            if m <= tuned_m:
-                if m >= config.min_m and (
-                    allow_decode or config.kernel not in _SHUFFLED_A_KERNELS
-                ):
-                    return config
-                break
-    # Preserve the AITER defaults outside the dtype-specific measured ranges.
-    tuned_configs = configs.get((n, k, "any"))
-    if tuned_configs is not None:
-        for tuned_m, config in tuned_configs:
-            if m <= tuned_m:
-                return config
-        return tuned_configs[-1][1]
+    config = select_from_rows(_load_tuned_configs(), m, n, k, out_dtype, allow_decode)
+    if config is not None:
+        return config
 
     # Fallback configs for untuned (N, K) shapes.
     if m <= 16:
