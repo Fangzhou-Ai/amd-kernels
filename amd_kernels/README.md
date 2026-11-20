@@ -28,6 +28,8 @@ One line per kernel package. Each package's README has what it does, its entry p
   gate_up + SwiGLU at 1-8 rows (TP4).
 - [`gemm/mxfp8_gateup_swiglu_n12288_k6144_i6144`](gemm/mxfp8_gateup_swiglu_n12288_k6144_i6144/README.md): dense MLP
   gate_up + SwiGLU at 1-16 rows (TP2).
+- [`gemm/mxfp8_bmm_mxfp8_out_n1024_k4096`](gemm/mxfp8_bmm_mxfp8_out_n1024_k4096/README.md): DeepSeek-V4.1's grouped
+  `wo_a` with its bf16 output quantized to MXFP8 for `wo_b`, in one launch.
 - [`gemm/bf16_n50016_k6144`](gemm/bf16_n50016_k6144/README.md): the TP4 lm_head vocabulary shard, with an optional row
   map.
 - [`gemm/bf16_n100032_k6144`](gemm/bf16_n100032_k6144/README.md): the TP2 lm_head vocabulary shard, with an optional
