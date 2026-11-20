@@ -142,3 +142,44 @@ def test_dispatch():
     assert host.uses_mega([19, 19, 10]) and host.uses_mega([2] * 8)
     assert not host.uses_mega([64]) and not host.uses_mega([11] * 4) and not host.uses_mega([4] * 8) and not host.uses_mega([30, 31])
     assert not host.uses_mega(None) and not host.uses_mega([2] * 9)
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+@torch.inference_mode()
+def test_conv_state_slots_past_2gb(impl):
+    """vLLM's hybrid cache lays every conv-state slot inside a ~21 MB page (slot stride ~10M bf16, dim-first view of a
+    [slot, pos, dim] block). Slots whose byte offset passes 2 GB (and 4 GB, where a 32-bit offset wraps) must read and
+    roll their own row: the served model rolled the wrong (or no) row for high slots before the 64-bit slot base."""
+    require_gfx950()
+    seq = [150, 70, 200, 64]
+    c = make_case(seq, init=[True, False, True, True], slots=4)
+    stride = 1 << 24  # elements: slot 65+ is past 2 GB, slot 128+ past 4 GB
+    slots = [3, 66, 129, 140]
+    pool = torch.zeros(141 * stride, dtype=torch.bfloat16, device="cuda")
+    cs = pool.as_strided((141, 3 * R.LP, 3), (stride, 1, 3 * R.LP))  # dim-first view of [slot, pos, dim] rows
+    small = c["conv_state"]
+    for k, s in enumerate(slots):
+        cs[s].copy_(small[int(c["state_indices"][k])])
+    sentinel = (torch.randn(3 * R.LP, 3, device="cuda") * 0.5).bfloat16()
+    for s in (2, 65, 128):
+        cs[s].copy_(sentinel)
+    st = torch.zeros(141, R.NH, R.D, R.D, dtype=torch.float32, device="cuda")
+    for k, s in enumerate(slots):
+        st[s].copy_(c["state_cache"][int(c["state_indices"][k])])
+    sidx = torch.tensor(slots, dtype=torch.int32, device="cuda")
+    cu = c["cu_seqlens"]
+    ref_cs, ref_st = cs.clone(), st.clone()
+    o_ref = R.kda_prefill_reference(c["mixed"], c["raw_g"], c["beta_logit"], c["gate"], c["A_log"], c["dt_bias"], c["lower_bound"],
+                                    c["conv_weight"], ref_cs, ref_st, sidx, c["has_initial_state"], cu, c["norm_weight"], c["norm_eps"])
+    out = torch.zeros(int(cu[-1]), R.NH, R.D, dtype=torch.bfloat16, device="cuda")
+    host.prefill(c["mixed"], c["raw_g"], c["beta_logit"], c["gate"], c["A_log"], c["dt_bias"], c["conv_weight"], cs, st, sidx,
+                 c["has_initial_state"], cu, chunk_indices(cu), offsets(cu), c["norm_weight"], c["norm_eps"], out, c["lower_bound"],
+                 chunk_counts=counts(cu), impl=impl)
+    torch.cuda.synchronize()
+    assert rel(out, o_ref) < OUT_TOL
+    for s in slots:
+        assert torch.equal(cs[s], ref_cs[s]), f"conv state of slot {s} not rolled like the reference"
+        assert rel(st[s], ref_st[s]) < STATE_TOL
+    for s in (2, 65, 128):
+        assert torch.equal(cs[s], sentinel), f"slot {s} (no sequence) was written"
+    del pool

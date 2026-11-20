@@ -284,7 +284,11 @@ def prologue_body(
     gr = buffer_ops.create_buffer_resource_from_addr(arg_rawg, num_records_bytes=fx.Int32(0x7FFFFFF0))
     br = buffer_ops.create_buffer_resource_from_addr(arg_beta, num_records_bytes=fx.Int32(0x7FFFFFF0))
     cwr = buffer_ops.create_buffer_resource_from_addr(arg_cw, num_records_bytes=3 * 4 * LP * 4)
-    csr = buffer_ops.create_buffer_resource_from_addr(arg_cs, num_records_bytes=fx.Int32(0x7FFFFFF0))
+    # the sequence's conv-state slot as its own resource, based with a 64-bit address: vLLM's hybrid cache pages give a
+    # slot stride of ~10M bf16 (one ~21 MB page), so a 32-bit `slot * stride` offset overflows past slot ~100
+    csr = buffer_ops.create_buffer_resource_from_addr(
+        arg_cs + fx.Int64(slot) * fx.Int64(i32_cs_slot) * fx.Int64(2), num_records_bytes=fx.Int32(0x7FFFFFF0)
+    )
     wsr = buffer_ops.create_buffer_resource_from_addr(
         arg_ws + fx.Int64(h * i32_nc + cid) * fx.Int64(RECORD_BYTES), num_records_bytes=RECORD_BYTES
     )
@@ -297,7 +301,7 @@ def prologue_body(
     hv = []
     for e in range_constexpr(8):
         ch = hb_i * LP + h * D + hc * 8 + e
-        off = slot * i32_cs_slot + ch * i32_cs_dim + hp_i * i32_cs_pos
+        off = ch * i32_cs_dim + hp_i * i32_cs_pos
         v = buffer_ops.buffer_load(csr, off, vec_width=1, dtype=fx.Int16, mask=hit & first & has_init)
         hv.append(fx.Int32(v) & 0xFFFF)
     if hit:
@@ -700,7 +704,7 @@ def prologue_body(
                 hvv = fx.Int32(fx.Int16(lds_ld(base + R_HIST + ((band * 3 + hp) * 128 + cc) * 2, T.i16, 2)))
                 val = (s >= 0).select(fx.Int32(rv) & 0xFFFF, hvv & 0xFFFF)
                 buffer_ops.buffer_store(
-                    raw(val.to(fx.Int16)), csr, slot * i32_cs_slot + dim * i32_cs_dim + p * i32_cs_pos, mask=okc
+                    raw(val.to(fx.Int16)), csr, dim * i32_cs_dim + p * i32_cs_pos, mask=okc
                 )
 
 
