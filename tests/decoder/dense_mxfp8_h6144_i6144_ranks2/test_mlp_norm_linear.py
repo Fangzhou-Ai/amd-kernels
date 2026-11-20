@@ -13,7 +13,6 @@ import pytest
 import torch
 
 from amd_kernels.decoder.dense_mxfp8_h6144_i6144_ranks2 import gemma_rmsnorm_mxfp8_linear, mxfp8_swiglu_oai_mlp
-from amd_kernels.decoder.dense_mxfp8_h6144_i6144_ranks2.gemm_rows import DOWN_ROWS
 from amd_kernels.decoder.dense_mxfp8_h6144_i6144_ranks2.reference import mlp_reference, norm_linear_reference
 from amd_kernels.gemm.mxfp8_common import gemm as G
 from amd_kernels.gemm.mxfp8_gateup_swiglu_n12288_k6144_i6144 import host as GUS
@@ -46,7 +45,7 @@ def _codes(x, nw, m, n, k):
 
 
 def _per_kernel_mlp(q, s, m, gu, gus, dw, dws, form):
-    """The per-kernel chain (the MXFP8 GEMM picks of the linear integration, the block's down rows)."""
+    """The per-kernel chain (the MXFP8 GEMM picks of the linear integration)."""
     from amd_kernels.activation.swiglu_oai_mxfp8_i6144 import swiglu_oai_mxfp8
 
     def gemm(q, s, w, ws):
@@ -55,14 +54,13 @@ def _per_kernel_mlp(q, s, m, gu, gus, dw, dws, form):
             return G.mxfp8_gemm_shuffled(q, s, w, ws, torch.bfloat16, m).reshape(m, n)
         return G.mxfp8_gemm(q, s, w, ws, torch.bfloat16, activation_scale_preshuffled=True).reshape(m, n)
 
-    with G.tuned_rows(DOWN_ROWS):
-        if m <= 16 and q.shape[0] == 16:
-            act = GUS.mxfp8_gateup_swiglu_bf16(q, s, gu, gus, m, ALPHA, BETA, LIMIT, form=form)
-            return G.mxfp8_linear(act.reshape(-1, I), dw, dws, torch.bfloat16).reshape(m, H)
-        h = gemm(q, s, gu, gus)
-        tile = G.prequant_code_tile_rows(m, H, I, torch.bfloat16)
-        qd, sd = swiglu_oai_mxfp8(h, ALPHA, BETA, LIMIT, tile, form=form)
-        return gemm(qd, sd, dw, dws)
+    if m <= 16 and q.shape[0] == 16:
+        act = GUS.mxfp8_gateup_swiglu_bf16(q, s, gu, gus, m, ALPHA, BETA, LIMIT, form=form)
+        return G.mxfp8_linear(act.reshape(-1, I), dw, dws, torch.bfloat16).reshape(m, H)
+    h = gemm(q, s, gu, gus)
+    tile = G.prequant_code_tile_rows(m, H, I, torch.bfloat16)
+    qd, sd = swiglu_oai_mxfp8(h, ALPHA, BETA, LIMIT, tile, form=form)
+    return gemm(qd, sd, dw, dws)
 
 
 @pytest.mark.parametrize("m", ROWS)

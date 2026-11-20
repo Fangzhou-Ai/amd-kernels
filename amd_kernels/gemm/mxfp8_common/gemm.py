@@ -14,8 +14,6 @@ benchmarks). ``_select_config`` picks the table row. The kernels and rows of
 one shape live in that shape's folder (``_SHAPE_HOSTS``: gemm/mxfp8_n<N>_k<K>).
 """
 
-import contextlib
-import contextvars
 import csv
 import dataclasses
 import functools
@@ -122,14 +120,9 @@ _PRELOAD_HINTS = {
 def _load_tuned_configs() -> dict[
     tuple[int, int, str], tuple[tuple[int, _Config], ...]
 ]:
-    return _parse_tuned(TUNED_CSV)
-
-
-@functools.cache
-def _parse_tuned(text: str) -> dict[tuple[int, int, str], tuple[tuple[int, _Config], ...]]:
-    """Rows of a tuned-table CSV text (the columns of mxfp8_gemm_tuned.py), checked, by (N, K, out dtype)."""
     configs: dict[tuple[int, int, str], list[tuple[int, _Config]]] = {}
-    for row in csv.DictReader(io.StringIO(text)):
+    # the CSV text of the tuned table (mxfp8_gemm_tuned.py)
+    for row in csv.DictReader(io.StringIO(TUNED_CSV)):
         shape = (int(row["N"]), int(row["K"]), row["out_dtype"])
         config = _Config(
             tile_m=int(row["tile_m"]),
@@ -226,22 +219,6 @@ def _parse_tuned(text: str) -> dict[tuple[int, int, str], tuple[tuple[int, _Conf
     }
 
 
-# the rows a caller's ``tuned_rows`` block reads ahead of the table: {(N, K, out dtype): rows}
-_CALLER_ROWS: contextvars.ContextVar = contextvars.ContextVar("mxfp8_caller_rows", default=None)
-
-
-@contextlib.contextmanager
-def tuned_rows(text: str):
-    """Within the block, the rows of ``text`` (CSV with the table's columns) replace the table's rows of their
-    (N, K, out dtype): every config choice the block makes reads them (the GEMM entries, ``prequant_code_tile_rows``
-    for the producer's code layout, the warm-ups). For a caller whose (N, K) another caller runs with other rows."""
-    token = _CALLER_ROWS.set(_parse_tuned(text))
-    try:
-        yield
-    finally:
-        _CALLER_ROWS.reset(token)
-
-
 def _splitk_config_ok(n: int, k: int, config: _Config) -> bool:
     steps = k // 128
     return (
@@ -305,9 +282,8 @@ def _select_config(
         if config is not None:
             return config
     configs = _load_tuned_configs()
-    caller = _CALLER_ROWS.get() or {}
     dtype_name = "bf16" if out_dtype == torch.bfloat16 else "fp16"
-    tuned_configs = caller.get((n, k, dtype_name)) or configs.get((n, k, dtype_name))
+    tuned_configs = configs.get((n, k, dtype_name))
     if tuned_configs is not None and m <= tuned_configs[-1][0]:
         for tuned_m, config in tuned_configs:
             if m <= tuned_m:
@@ -317,7 +293,7 @@ def _select_config(
                     return config
                 break
     # Preserve the AITER defaults outside the dtype-specific measured ranges.
-    tuned_configs = caller.get((n, k, "any")) or configs.get((n, k, "any"))
+    tuned_configs = configs.get((n, k, "any"))
     if tuned_configs is not None:
         for tuned_m, config in tuned_configs:
             if m <= tuned_m:
@@ -1081,7 +1057,7 @@ def warmup_mxfp8_gemm_weight(
     shape, not on the weight's values, so one call per shape is enough: later calls with
     the same key and no larger budget return at once. Frees the warm-up's buffers."""
     n, k = weight.shape
-    key = (n, k, weight.device, out_dtype, id(_CALLER_ROWS.get()))
+    key = (n, k, weight.device, out_dtype)
     if _warmed_weights.get(key, 0) >= max_num_tokens:
         return
     _warmup_weight(weight, weight_scale, max_num_tokens, out_dtype)
