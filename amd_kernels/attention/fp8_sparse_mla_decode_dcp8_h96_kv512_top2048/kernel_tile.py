@@ -368,6 +368,9 @@ def compile_decode_tile(pre_quantized: bool = False, timing: bool = False):
             r_beg, r_len, nt = row_bounds()
             raw0 = fx.Int32(idx_t[r_beg + lane])
             first_slot = _readfirstlane(raw0)
+            # an empty row (CUDA-graph padding, or a rank with no keys) still issues its first DMA pass: slots[r_beg]
+            # is then past the CSR end (stale / uninitialized), so read the always-valid record 0 instead
+            first_slot = (r_len > 0).select(first_slot, fx.Int32(0))
 
             def ld_idx(p):
                 ix = fx.Int32(idx_t[r_beg + p])

@@ -124,3 +124,21 @@ def test_extreme_scales_and_logits(rows):
     require_gfx950()
     gen = torch.Generator().manual_seed(rows + 21)
     run_case(served_counts(rows, gen), rows + 21, q_scale=8.0, exp_range=(-20, 8))
+
+
+@pytest.mark.parametrize("rows,pad", [(40, 40), (40, 8), (12, 3), (65, 65), (80, 15), (192, 63)])
+@torch.inference_mode()
+def test_garbage_past_csr_end(rows, pad):
+    """vLLM's slot buffer is ``rows * 2048`` long and only ``[0, nnz)`` is written: the entries past the CSR end are
+    stale or uninitialized. Empty rows (CUDA-graph padding, or every row of a rank that holds none of the keys) must
+    not read a record through them (the served model faulted on an all-empty rank before the first-slot guard)."""
+    require_gfx950()
+    gen = torch.Generator().manual_seed(1000 + rows + pad)
+    counts = served_counts(rows, gen, pad=pad)
+    q, cache, indptr, slots = make_batch(counts, gen)
+    ref_out, ref_lse = reference(q, cache, indptr, slots, SM_SCALE)
+    big = torch.full((rows * 2048,), 0x7FFFFFF0, dtype=torch.int32, device=slots.device)
+    big[: slots.numel()] = slots
+    o, l = fp8_sparse_mla_decode(q, cache, indptr, big, SM_SCALE)
+    torch.cuda.synchronize()
+    check_close(o.cpu(), l.cpu(), ref_out.cpu(), ref_lse.cpu())
