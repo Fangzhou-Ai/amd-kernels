@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Entry and support check of the DCP sparse MLA decode (see ``kernel_row.py`` and ``kernel_tile.py``)."""
+"""Entry and support check of the DCP sparse MLA decode (see ``kernel_row.py``, ``kernel_tile.py`` and ``kernel_pair.py``)."""
 
 import functools
 

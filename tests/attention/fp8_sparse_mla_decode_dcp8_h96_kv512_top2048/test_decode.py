@@ -6,15 +6,18 @@ Served shapes: rows 12 / 24 / 40 / 65 / 80 / 128 / 192 / 240 of 4-row requests w
 sizes, the CUDA-graph padding rows (empty slices), key counts around every tile edge and up to 2048, a strided q and out,
 extreme per-block scales and logits. Unreferenced cache slots are NaN. Every case: against the fp32 reference, two
 launches bit for bit equal, the pre-quantized path bit for bit equal to the bf16 path, a CUDA graph replayed into
-NaN-filled outputs.
+NaN-filled outputs. The two-unit kernel (129..256 rows) is bit for bit the tile loop's on the same inputs.
 """
 
 import pytest
 import torch
 from amd_kernels.attention.fp8_sparse_mla_decode_dcp8_h96_kv512_top2048 import (
     fp8_sparse_mla_decode,
+    host,
     supports_fp8_sparse_mla_decode,
 )
+from amd_kernels.attention.fp8_sparse_mla_decode_dcp8_h96_kv512_top2048._primitives import XCDS
+from amd_kernels.attention.fp8_sparse_mla_decode_dcp8_h96_kv512_top2048.kernel_pair import WGS_PER_XCD
 from amd_kernels.attention.fp8_sparse_mla_decode_dcp8_h96_kv512_top2048.reference import (
     H,
     L,
@@ -22,6 +25,8 @@ from amd_kernels.attention.fp8_sparse_mla_decode_dcp8_h96_kv512_top2048.referenc
     quantize_q,
     reference,
 )
+
+from amd_kernels.common.tensor_shim import _run_compiled
 
 from .cases import GRAPH_ROWS, SERVED_ROWS, SM_SCALE, make_batch, require_gfx950, served_counts
 
@@ -142,3 +147,31 @@ def test_garbage_past_csr_end(rows, pad):
     o, l = fp8_sparse_mla_decode(q, cache, indptr, big, SM_SCALE)
     torch.cuda.synchronize()
     check_close(o.cpu(), l.cpu(), ref_out.cpu(), ref_lse.cpu())
+
+
+def _first_unit_rows(rows):
+    """Per row: True if its units are the first of a two-unit workgroup (``kernel_pair.py``'s grid)."""
+    per_xcd = -(-2 * rows // XCDS)
+    return [(2 * r) % per_xcd < WGS_PER_XCD for r in range(rows)]
+
+
+@pytest.mark.parametrize("rows", [129, 200, 256])
+@pytest.mark.parametrize("first,second", [(0, 1000), (1000, 0), (1, 300), (65, 300), (129, 300), (193, 0)])
+@torch.inference_mode()
+def test_two_units_per_workgroup(rows, first, second):
+    """129..256 rows: the LDS ring continues from a workgroup's first unit (``first`` keys) into its second: every ring
+    offset, an empty first or second unit. Against the reference and bit for bit against the tile loop."""
+    require_gfx950()
+    assert host._kernel(rows) == "pair"
+    gen = torch.Generator().manual_seed(rows + first)
+    q, cache, indptr, slots = make_batch([first if f else second for f in _first_unit_rows(rows)], gen)
+    ref_out, ref_lse = reference(q, cache, indptr, slots, SM_SCALE)
+    o, l = fp8_sparse_mla_decode(q, cache, indptr, slots, SM_SCALE)
+    to, tl = torch.full_like(o, float("nan")), torch.full_like(l, float("nan"))
+    _run_compiled(
+        host._launcher("tile", False), q, host._kv_rows(cache), slots, indptr, to, tl, rows, q.stride(0), q.stride(1),
+        to.stride(0), to.stride(1), float(SM_SCALE * host.LOG2E), slots.numel() * 4, torch.cuda.current_stream(),
+    )
+    torch.cuda.synchronize()
+    check_close(o.cpu(), l.cpu(), ref_out.cpu(), ref_lse.cpu())
+    assert torch.equal(o, to) and torch.equal(l, tl)

@@ -31,7 +31,7 @@ with `amd_kernels.warm_up`.
 Graph replay, min of 20 replays, us per launch, ~256 keys per row, 4 rows per request, MI355X. Inputs cold (each launch
 its own q, slots and output, > 600 MB); hot q: one q for every launch (as served: the q-gather kernel just wrote it).
 Baselines in the same harness: AITER's Triton `sparse_mla_fwd` and vLLM's FlyDSL 96-head kernel
-(`VLLM_ROCM_USE_AITER_FLYDSL_SPARSE_MLA=1`, vLLM 712d9eb). Roofline: q + output + LSE + unique records + slots at 6.4 TB/s
+(`VLLM_ROCM_USE_AITER_FLYDSL_SPARSE_MLA=1`). Roofline: q + output + LSE + unique records + slots at 6.4 TB/s
 (the MFMA floor is below it: 5.2 us at 240 rows).
 
 | rows | Triton | FlyDSL | this | vs Triton | vs FlyDSL | FlyDSL, hot q | this, hot q | roofline | % roofline |
