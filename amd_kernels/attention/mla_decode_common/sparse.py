@@ -59,6 +59,9 @@ def fp8_sparse_mla_decode_unsupported_reason(q, kv_cache, indptr, slots, sm_scal
         return no_kernel(_OP, _KEY, key, _SHAPE_HOSTS)
     if not available():
         return f"{_OP}: needs gfx950 with FlyDSL"
+    cap = _shape_host(key).host.MAX_ROWS
+    if t.shape[0] > cap:
+        return f"{_OP}: {t.shape[0]} rows (the kernel takes 0..{cap})"
     if not _shape_host(key).supports_fp8_sparse_mla_decode(q, kv_cache, indptr, slots, out, q8):
         return f"{_OP}: operand layout (supports_fp8_sparse_mla_decode)"
     return None

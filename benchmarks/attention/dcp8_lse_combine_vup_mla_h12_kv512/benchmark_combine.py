@@ -116,7 +116,7 @@ def _worker(rank, port, tokens, gate, out_q):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tokens", default="12,24,40,65,80,128,192")
+    ap.add_argument("--tokens", default="12,24,40,65,80,128,192,240,256")
     ap.add_argument("--gate", action="store_true")
     a = ap.parse_args()
     tokens = [int(t) for t in a.tokens.split(",")]

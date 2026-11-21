@@ -2,13 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """Contract against reference.py on 8 GPUs: every token tier, eager and graph replay, changed inputs, empty shards,
 graph padding rows, head-padded inputs, the gated output, two runs bit for bit."""
+import pytest
 import torch
 import torch.distributed as dist
 
 from .harness import run_on_8_gpus
 
 W = 8
-TOKENS = [1, 12, 16, 17, 24, 33, 40, 65, 80, 128, 129, 192]
+TOKENS = ([1, 12, 16, 17, 24, 33, 40], [65, 80, 128, 129, 192], [193, 200, 240, 256])
 
 
 def make_inputs(t, step, dev, empty_ranks=(), pad_heads=96):
@@ -83,5 +84,6 @@ def _worker(rank, errors, tokens):
         del graph
 
 
-def test_combine_contract():
-    run_on_8_gpus(_worker, TOKENS)
+@pytest.mark.parametrize("tokens", TOKENS, ids=lambda t: f"{t[0]}-{t[-1]}")
+def test_combine_contract(tokens):
+    run_on_8_gpus(_worker, tokens)

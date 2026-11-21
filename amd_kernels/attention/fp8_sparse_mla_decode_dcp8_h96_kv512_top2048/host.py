@@ -9,24 +9,31 @@ from amd_kernels.common.tensor_shim import _run_compiled
 from amd_kernels.warm_up import entry
 
 from ._primitives import HEADS, KV_LORA_RANK, QK_ROPE_HEAD_DIM, RECORD_BYTES
+from .kernel_pair import MAX_UNITS, WGS, compile_decode_pair
 from .kernel_row import compile_decode_row
-from .kernel_tile import compile_decode_tile
+from .kernel_tile import SPLIT, compile_decode_tile
 from .reference import Q_RECORD_BYTES
 
 LOG2E = 1.4426950408889634
 D_QK = KV_LORA_RANK + QK_ROPE_HEAD_DIM
 _MAX_SLOTS = 1 << 29
 
-_ROW_MAX = 42  # rows up to this run the whole-row kernel, larger counts the tile-loop kernel
+_ROW_MAX = 42  # rows up to this run the whole-row kernel
+_TILE_MAX = WGS // SPLIT  # then the tile loop while its units fit one round of workgroups
+_TWO_UNIT_MAX = MAX_UNITS // SPLIT  # then two units a workgroup; the tile loop again above
+MAX_ROWS = 256  # the row counts the tests cover (the DCP combine's cap)
+_COMPILE = {"row": compile_decode_row, "tile": compile_decode_tile, "pair": compile_decode_pair}
 
 
 def _kernel(rows):
-    return "row" if rows <= _ROW_MAX else "tile"
+    if rows <= _ROW_MAX:
+        return "row"
+    return "pair" if _TILE_MAX < rows <= _TWO_UNIT_MAX else "tile"
 
 
 @functools.cache
 def _launcher(kind, pre_quantized):
-    return (compile_decode_row if kind == "row" else compile_decode_tile)(pre_quantized)
+    return _COMPILE[kind](pre_quantized)
 
 
 @functools.lru_cache(maxsize=16)
@@ -104,7 +111,7 @@ def _mode(q, kv_cache, indptr, slots, sm_scale, out=None, q8=None):
 
 
 def _sizes(mode):
-    return [1, _ROW_MAX + 1]
+    return [1, _ROW_MAX + 1, _TILE_MAX + 1]
 
 
 def _inputs(mode, n, q, kv_cache, indptr, slots, sm_scale, out=None, q8=None):

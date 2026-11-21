@@ -110,7 +110,7 @@ def single(args):
         a = prep_args(m)
         cases.append((f"indexer_prep, M {m}", lambda a=a: E.indexer_prep(*a), lambda a=a: pkg_prep.indexer_prep(*a),
                       pkg_prep, "indexer_prep", a, E.indexer_prep, E.indexer_prep_unsupported_reason))
-    for m in (12, 192):
+    for m in (12, 256):
         a = sparse_args(m)
         cases.append((f"fp8_sparse_mla_decode, M {m}", lambda a=a: E.fp8_sparse_mla_decode(*a),
                       lambda a=a: pkg_sparse.fp8_sparse_mla_decode(*a), pkg_sparse, "fp8_sparse_mla_decode", a,
@@ -148,7 +148,7 @@ def host_comm(args):
     ):
         pkg = mod._shape_host(next(iter(mod._SHAPE_HOSTS)))
         comm = object.__new__(getattr(pkg, cls))
-        comm.mode, comm.max_tokens = "q", 192
+        comm.mode, comm.max_tokens = "q", 256
         operands = a(comm, 12)
         real = getattr(pkg, attr)
         noop = lambda *x, **k: None  # noqa: E731
@@ -175,7 +175,7 @@ def _rank_main(rank, port, args, results):
     wq, wu = E.pack_q_b(r(2304, 1536, scale=0.03)), E.pack_w_uk(r(96, 128, 512, scale=0.05))
     wt = E.prepare_w_uv(r(96, 512, 128, scale=0.05))
     rows = []
-    for m in (12, 192):
+    for m in (12, 256):
         q_a, out = r(m, 1536), z(m, 96, 576)
         x, lse, o = r(m, 96, 512, scale=0.5), r(m, 96, dtype=torch.float32), z(m, 12, 128)
         for name, entry, direct in (

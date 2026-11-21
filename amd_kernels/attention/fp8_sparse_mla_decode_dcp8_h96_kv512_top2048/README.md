@@ -23,31 +23,37 @@ every slot is inside the cache.
   call; returns the same `(out, lse)`.
 - `supports_fp8_sparse_mla_decode`: the shape / dtype / alignment check (gfx950, 96 heads, 656 B flat records, int32 CSR).
 
-`host.py` picks the kernel by row count: the whole-row `kernel_row.py` up to 42 rows, the tile loop `kernel_tile.py`
-above; both are registered with `amd_kernels.warm_up`.
+`host.py` picks the kernel by row count (whole row, tile loop, two tile-loop units per workgroup); all are registered
+with `amd_kernels.warm_up`.
 
 ## Performance
 
-Graph replay, inputs cold, min of 15 replays, us per launch, ~256 keys per row, 4 rows per request, MI355X. Baseline:
-AITER's Triton `sparse_mla_fwd` (vLLM's path) in the same harness. Skeleton: the same launch grid doing only the
-index + KV gather DMA with its barriers (no math); roofline: bytes at 6.4 TB/s.
+Graph replay, min of 20 replays, us per launch, ~256 keys per row, 4 rows per request, MI355X. Inputs cold (each launch
+its own q, slots and output, > 600 MB); hot q: one q for every launch (as served: the q-gather kernel just wrote it).
+Baselines in the same harness: AITER's Triton `sparse_mla_fwd` and vLLM's FlyDSL 96-head kernel
+(`VLLM_ROCM_USE_AITER_FLYDSL_SPARSE_MLA=1`, vLLM 712d9eb). Roofline: q + output + LSE + unique records + slots at 6.4 TB/s
+(the MFMA floor is below it: 5.2 us at 240 rows).
 
-| rows | Triton | bf16 q | q8 | speedup (bf16 q) | skeleton | skeleton / bf16 q | roofline |
-|---|---|---|---|---|---|---|---|
-| 12 | 17.6 | 11.8 | 11.6 | 1.49x | 7.1 | 60% | 0.7 |
-| 24 | 22.4 | 12.7 | 12.5 | 1.76x | 7.1 | 56% | 1.4 |
-| 40 | 25.4 | 13.6 | 13.5 | 1.87x | 7.3 | 54% | 2.4 |
-| 65 | 28.9 | 19.5 | 18.6 | 1.48x | 12.2 | 62% | 3.8 |
-| 80 | 29.7 | 19.8 | 19.2 | 1.50x | 11.9 | 60% | 4.7 |
-| 128 | 49.8 | 22.0 | 21.4 | 2.26x | 17.1 | 78% | 7.6 |
-| 192 | 66.7 | 37.8 | 36.4 | 1.76x | 24.0 | 63% | 11.3 |
+| rows | Triton | FlyDSL | this | vs Triton | vs FlyDSL | FlyDSL, hot q | this, hot q | roofline | % roofline |
+|---|---|---|---|---|---|---|---|---|---|
+| 12 | 18.3 | 16.9 | 12.7 | 1.44x | 1.34x | 16.5 | 11.4 | 0.5 | 4% |
+| 24 | 23.2 | 17.2 | 13.6 | 1.71x | 1.26x | 16.9 | 12.6 | 1.0 | 8% |
+| 40 | 25.7 | 17.7 | 14.8 | 1.73x | 1.19x | 17.3 | 13.8 | 1.7 | 12% |
+| 65 | 29.8 | 18.5 | 18.9 | 1.57x | 0.98x | 18.0 | 18.2 | 2.8 | 15% |
+| 80 | 30.6 | 19.2 | 19.4 | 1.58x | 0.99x | 18.6 | 18.6 | 3.4 | 17% |
+| 128 | 51.4 | 26.6 | 22.4 | 2.30x | 1.19x | 25.5 | 20.3 | 5.5 | 24% |
+| 129 | 51.8 | 26.8 | 32.5 | 1.59x | 0.82x | 25.4 | 31.0 | 5.5 | 17% |
+| 192 | 69.0 | 34.8 | 35.6 | 1.94x | 0.98x | 33.0 | 34.0 | 8.2 | 23% |
+| 240 | 79.3 | 38.1 | 37.4 | 2.12x | 1.02x | 35.2 | 35.9 | 10.2 | 27% |
+| 256 | 81.8 | 39.0 | 38.6 | 2.12x | 1.01x | 36.2 | 36.3 | 10.9 | 28% |
 
-q8 saves 0.1-1.6 us here but costs the q-gather kernel more than that to emit (+0.7 us at 12 rows, +8 us at 192), so
-bf16 q is the default.
+At 129-256 rows the two-unit kernel is 1.4-4 us faster than the tile loop on the same inputs; against FlyDSL at 192-256
+rows the difference is within the run-to-run spread (about 1 us). The pre-quantized `q8` saves 0.1-1.6 us here but costs
+the q-gather kernel more than that to emit (+0.7 us at 12 rows, +8 us at 192), so bf16 q is the default.
 
 ## Tests
 
 ```bash
 python3 -m pytest tests/attention/fp8_sparse_mla_decode_dcp8_h96_kv512_top2048 -q
-python3 benchmarks/attention/fp8_sparse_mla_decode_dcp8_h96_kv512_top2048/benchmark_decode.py
+python3 benchmarks/attention/fp8_sparse_mla_decode_dcp8_h96_kv512_top2048/benchmark_decode.py [--hot-q]   # FlyDSL column: vLLM on PYTHONPATH
 ```

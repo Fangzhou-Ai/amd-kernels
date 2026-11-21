@@ -29,7 +29,7 @@ def scenario():
 
     MlirCompiler.compile = spy
     gen = torch.Generator().manual_seed(3)
-    q, cache, indptr, slots = make_batch(served_counts(192, gen), gen)
+    q, cache, indptr, slots = make_batch(served_counts(256, gen), gen)
     bad = []
     for rows in sorted(set(SERVED_ROWS) | set(GRAPH_ROWS)):
         before = len(late)

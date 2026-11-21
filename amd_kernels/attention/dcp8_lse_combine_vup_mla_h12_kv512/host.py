@@ -15,10 +15,10 @@ from amd_kernels.common import hip_runtime as ops
 from amd_kernels.common.tensor_shim import _run_compiled
 from amd_kernels.warm_up import entry
 
-from .kernel import CTL_BYTES, compile_combine
+from .kernel import CTL_BYTES, MAX_TILES, compile_combine
 from .reference import H, HPR, L, V, WORLD
 
-MAX_TOKENS = 192
+MAX_TOKENS = 16 * MAX_TILES
 
 
 @functools.cache
@@ -48,7 +48,7 @@ class DcpVupCombine:
     """
 
     def __init__(self, rank, group, device, max_tokens=MAX_TOKENS, is_lse_base_on_e=True):
-        assert 1 <= max_tokens <= 256 and dist.get_world_size(group) == WORLD
+        assert 1 <= max_tokens <= MAX_TOKENS and dist.get_world_size(group) == WORLD
         self.rank, self.device, self.max_tokens = rank, torch.device(device), max_tokens
         self.base_e = is_lse_base_on_e
         self.slot_bytes = -(-WORLD * max_tokens * HPR * (256 + 4) // 256) * 256

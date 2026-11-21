@@ -40,13 +40,13 @@ over ranks). Host: Python the entry adds per eager call (the routed function rep
 
 | op, shape | direct us | entry us | added us | host: dispatch added us | host: reason us |
 |---|---|---|---|---|---|
-| qkv_a_norm_kv_insert + index, M 12 | 2.44 | 2.43 | -0.01 | 0.56 | 5.60 |
-| qkv_a_norm_kv_insert + index, M 192 | 2.64 | 2.58 | -0.06 | 0.55 | 5.61 |
-| indexer_prep, M 12 / 192 | 2.38 / 2.49 | 2.38 / 2.48 | 0.00 / -0.01 | 0.32 | 2.91 |
-| fp8_sparse_mla_decode, M 12 / 192 | 9.41 / 29.53 | 9.34 / 29.57 | -0.06 / +0.04 | 0.37 | 4.50 |
-| fp8_dense_mla_decode, 13 x 4 / 48 x 3 rows | 33.73 / 58.22 | 33.77 / 58.18 | +0.04 / -0.04 | 0.28 | 4.42 |
-| q_bproj_wuk_gather (8 ranks), M 12 / 192 | 9.37 / 35.41 | 9.42 / 35.43 | +0.05 / +0.02 | 0.11 | 1.73 |
-| lse_combine_vup (8 ranks), M 12 / 192 | 9.25 / 24.34 | 9.21 / 24.27 | -0.04 / -0.07 | 0.09 | 2.06 |
+| qkv_a_norm_kv_insert + index, M 12 | 2.48 | 2.45 | -0.03 | 0.56 | 5.72 |
+| qkv_a_norm_kv_insert + index, M 192 | 2.58 | 2.60 | +0.03 | 0.57 | 5.70 |
+| indexer_prep, M 12 / 192 | 2.37 / 2.47 | 2.36 / 2.45 | -0.01 / -0.02 | 0.33 | 2.94 |
+| fp8_sparse_mla_decode, M 12 / 256 | 9.39 / 29.27 | 9.47 / 29.35 | +0.08 / +0.08 | 0.37 | 4.64 |
+| fp8_dense_mla_decode, 13 x 4 / 48 x 3 rows | 33.62 / 57.92 | 33.57 / 57.96 | -0.05 / +0.03 | 0.28 | 4.30 |
+| q_bproj_wuk_gather (8 ranks), M 12 / 256 | 9.35 / 44.30 | 9.33 / 44.40 | -0.02 / +0.09 | 0.11 | 1.77 |
+| lse_combine_vup (8 ranks), M 12 / 256 | 9.09 / 29.43 | 9.03 / 29.38 | -0.07 / -0.05 | 0.10 | 2.08 |
 
 ## Tests
 

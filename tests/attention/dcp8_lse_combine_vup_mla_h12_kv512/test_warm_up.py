@@ -6,7 +6,7 @@ import torch.distributed as dist
 
 from .harness import run_on_8_gpus
 
-PROBES = (1, 12, 16, 17, 24, 33, 40, 48, 65, 80, 96, 128, 129, 160, 192)
+PROBES = (1, 12, 16, 17, 24, 33, 40, 48, 65, 80, 96, 128, 129, 160, 192, 193, 200, 240, 256)
 
 
 def _worker(rank, errors):

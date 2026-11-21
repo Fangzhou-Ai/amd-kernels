@@ -134,7 +134,7 @@ def comm_of(table, cls, mode=None):
     obj = object.__new__(getattr(importlib.import_module(next(iter(table.values()))), cls))
     if mode is not None:
         obj.mode = mode
-    obj.max_tokens = 192
+    obj.max_tokens = 256
     return obj
 
 
@@ -248,8 +248,8 @@ def test_factory_reasons_past_the_key(monkeypatch, gpu_ok):
     assert "mode 'x'" in E.q_gather_comm_unsupported_reason(0, None, "cpu", "x", **ok)
     ok = dict(heads=96, v_head=128, kv_lora=512)
     assert E.lse_combine_comm_unsupported_reason(0, None, "cpu", **ok) is None
-    assert "max_tokens 193 (the kernel takes 1..192)" in E.lse_combine_comm_unsupported_reason(
-        0, None, "cpu", **ok, max_tokens=193)
+    assert "max_tokens 257 (the kernel takes 1..256)" in E.lse_combine_comm_unsupported_reason(
+        0, None, "cpu", **ok, max_tokens=257)
     monkeypatch.setattr(combine, "available", lambda: False)
     assert E.lse_combine_comm_unsupported_reason(0, None, "cpu", **ok) == "lse_combine_comm: needs gfx950 with FlyDSL"
 
@@ -308,8 +308,8 @@ COMBINE_BRANCHES = [
     (None, None, None),
     (3, meta(64, 128, 512), "communicator built for heads=96, v_head=128, kv_lora=512, world=8, call is heads=64"),
     (1, meta(4, 96 * 512), "operand layout (attn_out [rows"),
-    (1, meta(0, 96, 512), "0 rows (the kernel takes 1..192)"),
-    (1, meta(193, 96, 512), "193 rows (the kernel takes 1..192)"),
+    (1, meta(0, 96, 512), "0 rows (the kernel takes 1..256)"),
+    (1, meta(257, 96, 512), "257 rows (the kernel takes 1..256)"),
     (1, meta(4, 95, 512), "operand layout (attn_out bf16"),
     (1, meta(4, 96, 576)[:, :, :512], None),
     (1, meta(4, 96, 1024)[:, :, ::2], "operand layout (attn_out bf16"),
@@ -364,3 +364,6 @@ def test_shape_reasons_before_the_package(gpu_ok):
     assert "cp_rank 8 of cp_world 8" in E.fp8_dense_mla_decode_unsupported_reason(*d, cp_rank=8)
     sa, skw = sparse_args(4)
     assert "operand layout (q or q8" in E.fp8_sparse_mla_decode_unsupported_reason(None, *sa[1:])
+    for q8 in (False, True):
+        sa, skw = sparse_args(257, q8=q8)
+        assert "257 rows (the kernel takes 0..256)" in E.fp8_sparse_mla_decode_unsupported_reason(*sa, **skw)

@@ -10,8 +10,8 @@ import torch.distributed as dist
 
 from tests.multi_gpu8 import run_on_8_gpus
 
-ROWS = (1, 192)
-PROBES = (1, 12, 16, 17, 33, 48, 65, 80, 128, 129, 160, 192)
+ROWS = (1, 256)
+PROBES = (1, 12, 16, 17, 33, 48, 65, 80, 128, 129, 160, 192, 193, 240, 256)
 DIMS = dict(heads=96, v_head=128, kv_lora=512)
 
 
@@ -33,7 +33,7 @@ def _worker(rank, errors):
     if why is not None:
         errors.append(f"rank {rank}: factory reason {why}")
     comm = E.lse_combine_comm(rank, group, dev, **DIMS)
-    if comm.max_tokens != 192:
+    if comm.max_tokens != 256:
         errors.append(f"rank {rank}: max_tokens {comm.max_tokens}")
     for t in ROWS:
         xs, lses, w_uv, sls, qsls = make_inputs(t, 0, dev)

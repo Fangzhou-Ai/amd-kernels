@@ -14,7 +14,7 @@ from tests.attention.fp8_sparse_mla_decode_dcp8_h96_kv512_top2048.cases import S
 
 from .cases import assert_same, clone, require_gfx950
 
-ROWS = (5, 192)
+ROWS = (5, 256)
 
 
 def case(rows, q8, given_out, seed):

@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """Nothing compiles after warm-up (root README, rule 4).
 
-Rows, strides, the key counts and the scale are runtime arguments; the row count picks one of two kernels. Warm up both q
-modes (bf16 q, pre-quantized q8), then walk every served row count (the 7 critical sizes and the CUDA-graph sizes up
-to 192) and assert nothing compiles.
+Rows, strides, the key counts and the scale are runtime arguments; the row count picks one of three kernels. Warm up both q
+modes (bf16 q, pre-quantized q8), then walk every served row count (the 8 critical sizes and the CUDA-graph sizes up
+to 256) and assert nothing compiles.
 """
 
 import flydsl.compiler as flyc
@@ -19,9 +19,9 @@ from .cases import GRAPH_ROWS, SERVED_ROWS, SM_SCALE, make_batch, require_gfx950
 def test_no_compile_after_warmup(monkeypatch):
     require_gfx950()
     gen = torch.Generator().manual_seed(3)
-    q, cache, indptr, slots = make_batch(served_counts(192, gen), gen)
+    q, cache, indptr, slots = make_batch(served_counts(256, gen), gen)
     q8 = quantize_q(q)
-    for rows in (1, 49):  # one call per kernel (the row count picks it)
+    for rows in (1, 49, 200):  # one call per kernel (the row count picks it)
         fp8_sparse_mla_decode(q[:rows], cache, indptr[: rows + 1], slots[: int(indptr[rows])], SM_SCALE)
         fp8_sparse_mla_decode(None, cache, indptr[: rows + 1], slots[: int(indptr[rows])], SM_SCALE, q8=q8[:rows])
     torch.cuda.synchronize()

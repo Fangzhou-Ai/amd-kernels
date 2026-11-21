@@ -3,7 +3,7 @@
 ## What it does
 
 Decode with DCP8 on 8 GPUs: every rank holds the partial latent attention output `x_r [T, >=96, 512]` (bf16) and the
-partial LSE `lse_r [T, >=96]` (fp32) of its KV shard for all 96 heads (T <= 192). One launch replaces vLLM's v_up-first
+partial LSE `lse_r [T, >=96]` (fp32) of its KV shard for all 96 heads (T <= 256). One launch replaces vLLM's v_up-first
 sequence (`dcp_vup_rs_combine`: Triton LSE mask, AITER LSE all-gather, batched `x @ W_UV` GEMM, Triton scale, AITER
 reduce-scatter) and returns this rank's heads 12 d .. 12 d + 11 as `out [T, 12, 128]` bf16, optionally multiplied by
 `sigmoid(gate)` (the DSA output gate, replacing `_gate_mul_kernel`).
@@ -20,7 +20,7 @@ in source order in fp32, rounded once. `reference.py` is the contract (docstring
 - `prepare_w_uv`: the one-time weight layout for the entry (replaces the replicated `W_UV_dcp`).
 - `dcp8_lse_combine_vup`: the entry (`amd_kernels.warm_up`): one call per DSA layer on every rank in the same order;
   `seq_lens` / `query_start_loc` are optional, `gate` selects the gated output. The first call of each mode compiles
-  the 12 token tiers (16 rows each).
+  the 16 token tiers (16 rows each).
 The tile count follows `ceil(T / 16)` in `host.py`; the protocol and the layout are in the module docstring of `kernel.py`.
 
 ## Performance
@@ -31,13 +31,15 @@ max(flag 0.8 us + bytes sent / 343 GB/s, rest of x / 6.4 TB/s) + 0.6 us tail (co
 
 | T | sent MB | ceiling us | stock us | fused us | speedup | % of ceiling | stock + gate us | fused gated us |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 12 | 0.26 | 6.2 | 28.7 / 24.9 | 15.7 / 12.8 | 1.83x | 48% | 28.3 / 25.9 | 14.1 / 11.2 |
-| 24 | 0.52 | 7.0 | 26.9 / 25.0 | 14.4 / 13.7 | 1.87x | 51% | | |
-| 40 | 0.87 | 8.0 | 31.0 / 28.9 | 17.4 / 15.3 | 1.78x | 52% | | |
-| 65 | 1.42 | 9.6 | 31.8 / 31.2 | 19.2 / 17.5 | 1.66x | 55% | | |
-| 80 | 1.75 | 10.6 | 33.5 / 31.9 | 18.9 / 18.1 | 1.77x | 58% | 35.3 / 32.7 | 21.3 / 17.9 |
-| 128 | 2.80 | 13.6 | 39.2 / 38.4 | 23.8 / 22.4 | 1.64x | 61% | | |
-| 192 | 4.19 | 17.7 | 45.8 / 44.1 | 27.6 / 25.9 | 1.66x | 68% | 48.9 / 46.9 | 28.3 / 27.2 |
+| 12 | 0.26 | 6.2 | 24.5 / 23.4 | 12.5 / 11.0 | 1.97x | 56% | 26.8 / 25.9 | 13.8 / 12.3 |
+| 24 | 0.52 | 7.0 | 25.9 / 25.0 | 14.6 / 12.5 | 1.77x | 56% | | |
+| 40 | 0.87 | 8.0 | 28.7 / 27.8 | 17.6 / 15.9 | 1.63x | 50% | | |
+| 65 | 1.42 | 9.6 | 31.1 / 29.5 | 17.9 / 16.9 | 1.74x | 57% | | |
+| 80 | 1.75 | 10.6 | 32.8 / 31.1 | 17.7 / 17.2 | 1.85x | 61% | 36.0 / 34.5 | 21.0 / 19.2 |
+| 128 | 2.80 | 13.6 | 41.7 / 39.3 | 22.9 / 21.2 | 1.82x | 64% | | |
+| 192 | 4.19 | 17.7 | 45.9 / 44.7 | 28.4 / 26.3 | 1.62x | 67% | 48.8 / 46.0 | 28.3 / 27.3 |
+| 240 | 5.24 | 20.7 | 53.3 / 51.9 | 33.0 / 31.5 | 1.62x | 66% | 55.6 / 54.5 | 32.9 / 30.6 |
+| 256 | 5.59 | 21.8 | 52.7 / 51.5 | 32.5 / 31.4 | 1.62x | 69% | 57.7 / 55.7 | 34.7 / 33.5 |
 
 Speedup is median / median, the ceiling share is ceiling / min. Output vs the stock sequence: cosine 1.000000.
 

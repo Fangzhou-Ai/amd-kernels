@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """``fp8_sparse_mla_decode`` against ``reference.py``, with bf16 q and with the pre-quantized q (``q8``).
 
-Served shapes: rows 12 / 24 / 40 / 65 / 80 / 128 / 192 of 4-row requests with ~256 keys per row, the CUDA-graph padding
+Served shapes: rows 12 / 24 / 40 / 65 / 80 / 128 / 192 / 240 of 4-row requests with ~256 keys per row, the CUDA-graph padding
 sizes, the CUDA-graph padding rows (empty slices), key counts around every tile edge and up to 2048, a strided q and out,
 extreme per-block scales and logits. Unreferenced cache slots are NaN. Every case: against the fp32 reference, two
 launches bit for bit equal, the pre-quantized path bit for bit equal to the bf16 path, a CUDA graph replayed into
@@ -70,7 +70,7 @@ def test_served_rows(rows):
     run_case(served_counts(rows, gen), rows)
 
 
-@pytest.mark.parametrize("rows,pad", [(12, 3), (40, 15), (80, 15), (192, 63)])
+@pytest.mark.parametrize("rows,pad", [(12, 3), (40, 15), (80, 15), (192, 63), (200, 7), (240, 48), (256, 16)])
 @torch.inference_mode()
 def test_padding_rows(rows, pad):
     require_gfx950()
@@ -101,7 +101,7 @@ def test_key_counts(counts):
     run_case(counts, sum(counts) + 5)
 
 
-@pytest.mark.parametrize("rows", [24, 42, 43, 80])
+@pytest.mark.parametrize("rows", [24, 42, 43, 80, 240])
 @torch.inference_mode()
 def test_key_counts_across_tiers(rows):
     require_gfx950()
@@ -117,7 +117,7 @@ def test_strided_q_and_out():
     run_case(served_counts(24, gen), 7, q_pad=64, out_pad=64)
 
 
-@pytest.mark.parametrize("rows", [12, 80])
+@pytest.mark.parametrize("rows", [12, 80, 200])
 @torch.inference_mode()
 def test_extreme_scales_and_logits(rows):
     """Per-block scales from 2^-20 to 2^7 and logits spanning tens of units (the running max moves between tiles)."""
@@ -126,7 +126,7 @@ def test_extreme_scales_and_logits(rows):
     run_case(served_counts(rows, gen), rows + 21, q_scale=8.0, exp_range=(-20, 8))
 
 
-@pytest.mark.parametrize("rows,pad", [(40, 40), (40, 8), (12, 3), (65, 65), (80, 15), (192, 63)])
+@pytest.mark.parametrize("rows,pad", [(40, 40), (40, 8), (12, 3), (65, 65), (80, 15), (192, 63), (240, 240), (256, 56)])
 @torch.inference_mode()
 def test_garbage_past_csr_end(rows, pad):
     """vLLM's slot buffer is ``rows * 2048`` long and only ``[0, nnz)`` is written: the entries past the CSR end are

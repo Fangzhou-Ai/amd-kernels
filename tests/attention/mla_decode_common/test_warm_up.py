@@ -17,7 +17,7 @@ import torch
 from .cases import require_gfx950
 
 SERVED_M = (1, 6, 12, 24, 40, 65, 80, 128, 192)
-SPARSE_ROWS = (5, 10, 12, 20, 24, 40, 42, 43, 65, 80, 128, 192)
+SPARSE_ROWS = (5, 10, 12, 20, 24, 40, 42, 43, 65, 80, 128, 192, 193, 240, 256)
 DENSE_REQS = (1, 2, 5, 13, 33, 48, 63)
 
 
@@ -71,7 +71,7 @@ def scenario():
         E.qkv_a_norm_kv_insert(*insert_args(1, form, gen))
     prewarm(E.indexer_prep_kernel(*prep_args(1, False, gen)), *prep_args(1, False, gen))
     E.indexer_prep(*prep_args(1, True, gen))
-    q, cache, indptr, slots = sparse_batch(served_counts(192, gen), gen)
+    q, cache, indptr, slots = sparse_batch(served_counts(256, gen), gen)
     E.fp8_sparse_mla_decode(q[:1], cache, indptr[:2], slots[: int(indptr[1])], 0.1)
     prewarm(E.fp8_sparse_mla_decode_kernel(None, cache, indptr[:2], slots, 0.1, q8=quantize_q(q[:1])),
             None, cache, indptr[:2], slots, 0.1, q8=quantize_q(q[:1]))

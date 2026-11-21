@@ -44,6 +44,7 @@ CTL_BYTES = 8192
 FLAG_WORD, SEQ_WORD, START_WORD = 0, 700, 1024
 ROWS_PER_WG = 16
 PREFETCH = 2
+MAX_TILES = NT // 16  # the row mask holds one word per thread
 LOG2E = 1.4426950408889634
 
 
@@ -70,7 +71,7 @@ def grid_of(m_tiles):
 def compile_combine(m_tiles: int, base_e: bool, gated: bool = False):
     """``m_tiles``: 16-token tiles of the padded token count. ``gated``: the output is ``bf16(bf16(combine) *
     sigmoid(gate))`` with a bf16 ``gate`` [T, 12 * 128]."""
-    assert 1 <= m_tiles <= 12
+    assert 1 <= m_tiles <= MAX_TILES
     base = grid_of(m_tiles) - 1
     name = f"dcp8_lse_combine_vup_mla_h12_kv512_m{m_tiles}" + ("_e" if base_e else "_2") + ("_gate" if gated else "")
 
