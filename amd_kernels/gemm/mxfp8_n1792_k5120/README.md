@@ -9,6 +9,8 @@ rounding (`reference.py`: cosine >= 0.99999, L2 <= 1e-3, bitwise repeats; no ato
 fixed-order). Producer: the mHC attention seam (bf16 hidden [M, 5120]). Consumer: `norm/rmsnorm_dual_mxfp8_q1280_kv512` (bf16 [M, 1792]).
 
 ## Entry points
+- Callers use the common entries: `gemm.mxfp8_common.gemm.mxfp8_linear` / `mxfp8_gemm` with `mxfp8_linear_blocker`;
+  this folder is registered in `gemm._SHAPE_HOSTS` (`linear`, `covers`).
 - `gemm.mxfp8_n1792_k5120.mxfp8_linear`: the GEMM from a bf16 activation; fresh bf16 output, graph-capture safe, `serves(m)` tells where it beat the served path.
 - `gemm.mxfp8_n1792_k5120.preshuffle_weight`: the load-time weight and scale preshuffle (32 x 32 block scales accepted).
 - `gemm.mxfp8_n1792_k5120.warmup_mxfp8_linear`: compiles every row and creates the split-K counters before graph capture.

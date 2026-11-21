@@ -107,3 +107,41 @@ def warmup_mxfp8_linear(weight: torch.Tensor, weight_scale: torch.Tensor) -> Non
         mxfp8_linear_prequant(torch.zeros(row[1], K, dtype=torch.float8_e4m3fn, device=dev),
                               torch.full((row[1], K // 32), 127, dtype=torch.uint8, device=dev), weight, weight_scale)
     torch.cuda.synchronize(dev)
+
+
+# The folder's protocol with ``gemm.mxfp8_common`` (``gemm._SHAPE_HOSTS``): its common-kernel rows, and its own
+# entries for the row counts its table covers.
+ROWS = {
+    (N, K, "bf16"): tuple(
+        (rows, _kernel.common_config(cfg)) for kind, rows, _, cfg in _kernel.LINEAR if kind == "common"
+    )
+}
+LAUNCHERS = {}
+
+
+def select(m: int, out_dtype: torch.dtype, allow_decode: bool):
+    return _common.select_from_rows(ROWS, m, N, K, out_dtype, allow_decode)
+
+
+def linear(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, out_dtype: torch.dtype):
+    """``mxfp8_linear``'s call where ``kernel.LINEAR`` has a row, else None (the common dispatcher)."""
+    if out_dtype != torch.bfloat16 or not x.is_contiguous() or _kernel.row(_kernel.LINEAR, x.shape[0]) is None:
+        return None
+    return mxfp8_linear(x, weight, weight_scale)
+
+
+def covers(m: int, prequant: bool = False) -> bool:
+    """Whether the folder's row for ``m`` rows (bf16, or row-major codes with ``prequant``) beat the served path."""
+    return serves(m, table=_kernel.PREQUANT if prequant else None)
+
+
+def gemm(codes: torch.Tensor, scale: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+         out_dtype: torch.dtype):  # fmt: skip
+    """``mxfp8_gemm``'s call on row-major codes and scales where ``kernel.PREQUANT`` has a row, else None."""
+    if out_dtype != torch.bfloat16 or _kernel.row(_kernel.PREQUANT, codes.shape[0]) is None:
+        return None
+    return mxfp8_linear_prequant(codes, scale, weight, weight_scale)
+
+
+def warmup(weight: torch.Tensor, weight_scale: torch.Tensor) -> None:
+    warmup_mxfp8_linear(weight, weight_scale)

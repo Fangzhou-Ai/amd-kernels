@@ -9,6 +9,8 @@ rounding (`reference.py`: cosine >= 0.99999, L2 <= 1e-3, bitwise repeats; no ato
 fixed-order). Producer: `activation/clamp_silu_mul_mxfp8_i2304` or the gate_up epilogue (codes [M, 2304], scales [M, 72]). Consumer: the shared-expert add into the MoE output (bf16 [M, 5120]).
 
 ## Entry points
+- Callers use the common entries: `gemm.mxfp8_common.gemm.mxfp8_linear` / `mxfp8_gemm` with `mxfp8_linear_blocker`;
+  this folder is registered in `gemm._SHAPE_HOSTS` (`linear`, `gemm` (codes), `covers`).
 - `gemm.mxfp8_n5120_k2304.mxfp8_linear`: the GEMM from a bf16 activation; fresh bf16 output, graph-capture safe, `serves(m)` tells where it beat the served path.
 - `gemm.mxfp8_n5120_k2304.preshuffle_weight`: the load-time weight and scale preshuffle (32 x 32 block scales accepted).
 - `gemm.mxfp8_n5120_k2304.warmup_mxfp8_linear`: compiles every row and creates the split-K counters before graph capture.

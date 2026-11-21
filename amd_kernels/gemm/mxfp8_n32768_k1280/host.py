@@ -78,3 +78,33 @@ def warmup_mxfp8_linear(weight: torch.Tensor, weight_scale: torch.Tensor) -> Non
     for m in _sizes(()):
         mxfp8_linear(torch.zeros(m, K, dtype=torch.bfloat16, device=dev), weight, weight_scale)
     torch.cuda.synchronize(dev)
+
+
+# The folder's protocol with ``gemm.mxfp8_common`` (``gemm._SHAPE_HOSTS``): its common-kernel rows, and its own
+# entries for the row counts its table covers.
+ROWS = {
+    (N, K, "bf16"): tuple(
+        (rows, _kernel.common_config(cfg)) for kind, rows, _, cfg in _kernel.LINEAR if kind == "common"
+    )
+}
+LAUNCHERS = {}
+
+
+def select(m: int, out_dtype: torch.dtype, allow_decode: bool):
+    return _common.select_from_rows(ROWS, m, N, K, out_dtype, allow_decode)
+
+
+def linear(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, out_dtype: torch.dtype):
+    """``mxfp8_linear``'s call where ``kernel.LINEAR`` has a row, else None (the common dispatcher)."""
+    if out_dtype != torch.bfloat16 or not x.is_contiguous() or _kernel.row(_kernel.LINEAR, x.shape[0]) is None:
+        return None
+    return mxfp8_linear(x, weight, weight_scale)
+
+
+def covers(m: int, prequant: bool = False) -> bool:
+    """Whether the folder's row for ``m`` bf16 rows beat the served path (no row-major-codes rows)."""
+    return not prequant and serves(m)
+
+
+def warmup(weight: torch.Tensor, weight_scale: torch.Tensor) -> None:
+    warmup_mxfp8_linear(weight, weight_scale)

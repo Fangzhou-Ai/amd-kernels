@@ -2,6 +2,26 @@
 
 One line per kernel package. Each package's README has what it does, its entry points, performance and tests.
 
+## Op entries
+
+Callers use one shape-agnostic entry per op ([`routes.py`](routes.py), issue #11): it reads the shape from its
+tensors and calls the shape package; `<op>_blocker(...)` returns None or the reason a call is not covered (the caller
+falls back), `<op>_shapes()` the covered shape keys.
+
+- `gemm.mxfp8_common.gemm`: `mxfp8_linear`, `mxfp8_gemm` (+ `mxfp8_linear_blocker`, `tuned_shapes`) over the
+  `gemm/mxfp8_n<N>_k<K>` folders in `gemm._SHAPE_HOSTS`.
+- `gemm`: `mxfp8_gate_up_swiglu_mxfp8[_prequant]` (gate_up + clamped SwiGLU + MXFP8).
+- `gemm`: `mxfp8_postmix_gemm`, `mxfp8_postmix_gates_gemm` (MXFP8 GEMM + mHC post-mix epilogue).
+- `gemm`: `mxfp8_grouped_gemm`, `mxfp8_grouped_gemm_mxfp8` (grouped MXFP8 GEMM, bf16 or MXFP8 out).
+- `gemm`: `bf16_gemm` (lm_head), `bf16_gemm_f32_bf16` (fp32 + bf16 columns in one GEMM).
+- `attention`: `sparse_mla_decode`, `rope_fp8_kv_insert`, `compressor_insert`.
+- `indexer`: `mxfp4_indexer_topk`, `mxfp4_indexer_candidate_topk`, `q_rope_mxfp4_quant`.
+- `moe`: `router_topk`, `mxfp4_experts` (+ `mxfp4_expert_weights`), `expert_parallel` (fused EP, a collective).
+- `norm`: `rmsnorm_mxfp8`, `rmsnorm_dual_mxfp8`, `mhc_post_pre_rmsnorm`, `mhc_post_collapse_rmsnorm`, `mhc_gate_finish`.
+- `activation`: `clamp_silu_mul_mxfp8`.
+- `sampling`: `markov_chain`, `rejection_sample`.
+- `engram`: `ngram_rows`, `gated_post`.
+
 ## GEMM
 
 - [`gemm/mxfp8_common`](gemm/mxfp8_common/README.md): MXFP8 dense GEMM entries (`mxfp8_linear`, `mxfp8_gemm`, ...),

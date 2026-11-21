@@ -78,3 +78,58 @@ def warmup_mxfp8_linear(weight: torch.Tensor, weight_scale: torch.Tensor) -> Non
     for m in _sizes(()):
         mxfp8_linear(torch.zeros(m, K, dtype=torch.bfloat16, device=dev), weight, weight_scale)
     torch.cuda.synchronize(dev)
+
+
+# The folder's protocol with ``gemm.mxfp8_common`` (``gemm._SHAPE_HOSTS``): its common-kernel rows, and its own
+# entries for the row counts its table covers.
+ROWS = {
+    (N, K, "bf16"): tuple(
+        (rows, _kernel.common_config(cfg)) for kind, rows, _, cfg in _kernel.LINEAR if kind == "common"
+    )
+}
+LAUNCHERS = {}
+
+
+def select(m: int, out_dtype: torch.dtype, allow_decode: bool):
+    return _common.select_from_rows(ROWS, m, N, K, out_dtype, allow_decode)
+
+
+def linear(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, out_dtype: torch.dtype):
+    """``mxfp8_linear``'s call where ``kernel.LINEAR`` has a row, else None (the common dispatcher)."""
+    if out_dtype != torch.bfloat16 or not x.is_contiguous() or _kernel.row(_kernel.LINEAR, x.shape[0]) is None:
+        return None
+    return mxfp8_linear(x, weight, weight_scale)
+
+
+def _codes_row(m: int):
+    """The ``kernel.LINEAR`` row that runs on row-major codes (the decode-prequant kernel's ``fq`` / ``rm`` kinds)."""
+    r = _kernel.row(_kernel.LINEAR, m)
+    return r if r is not None and r[0] in ("fq", "rm") else None
+
+
+def covers(m: int, prequant: bool = False) -> bool:
+    """Whether the folder's row for ``m`` rows (bf16, or row-major codes with ``prequant``) beat the served path."""
+    if prequant:
+        r = _codes_row(m)
+        return r is not None and r[2]
+    return serves(m)
+
+
+def gemm(codes: torch.Tensor, scale: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+         out_dtype: torch.dtype):  # fmt: skip
+    """``mxfp8_gemm``'s call on row-major codes and scales where a decode-prequant row serves it, else None."""
+    r = _codes_row(codes.shape[0])
+    if out_dtype != torch.bfloat16 or r is None:
+        return None
+    return _decode(codes, scale, weight, weight_scale, r[3], key=KEY)
+
+
+def warmup(weight: torch.Tensor, weight_scale: torch.Tensor) -> None:
+    warmup_mxfp8_linear(weight, weight_scale)
+    dev = weight.device
+    for kind, m, _, cfg in _kernel.LINEAR:
+        if kind in ("fq", "rm"):
+            codes = torch.zeros(m, K, dtype=torch.float8_e4m3fn, device=dev)
+            _decode(codes, torch.full((m, K // 32), 127, dtype=torch.uint8, device=dev), weight, weight_scale, cfg,
+                    key=KEY)
+    torch.cuda.synchronize(dev)

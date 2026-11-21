@@ -80,3 +80,17 @@ def warmup_main_proj(w: MainProjWeights) -> None:
     for rows in WARM_UP_ROWS:
         main_proj(torch.zeros((rows, K), dtype=torch.bfloat16, device=w.weight.device), w)
     torch.cuda.synchronize(w.weight.device)
+
+
+# The folder's protocol with ``gemm.mxfp8_common`` (``gemm._SHAPE_HOSTS``): ``mxfp8_linear`` runs ``DISPATCH``'s rows.
+ROWS = {(N, K, "bf16"): DISPATCH}
+LAUNCHERS = {}
+SERVES_FROM = 640  # rows: below, the rows are correct but not faster than the served path (README)
+
+
+def select(m: int, out_dtype: torch.dtype, allow_decode: bool):
+    return _gemm.select_from_rows(ROWS, m, N, K, out_dtype, allow_decode)
+
+
+def covers(m: int, prequant: bool = False) -> bool:
+    return not prequant and SERVES_FROM <= m <= MAX_ROWS

@@ -9,6 +9,8 @@ rounding (`reference.py`: cosine >= 0.99999, L2 <= 1e-3, bitwise repeats; no ato
 fixed-order). Producer: `norm/rmsnorm_dual_mxfp8_q1280_kv512` (q codes + scales, or bf16). Consumer: `indexer/q_rope_mxfp4_quant_h32_d128_rot64` (bf16 [M, 4096]).
 
 ## Entry points
+- Callers use the common entries: `gemm.mxfp8_common.gemm.mxfp8_linear` / `mxfp8_gemm` with `mxfp8_linear_blocker`;
+  this folder is registered in `gemm._SHAPE_HOSTS` (`linear`, `gemm` (codes), `covers`).
 - `gemm.mxfp8_n4096_k1280.mxfp8_linear`: the GEMM from a bf16 activation; fresh bf16 output, graph-capture safe, `serves(m)` tells where it beat the served path.
 - `gemm.mxfp8_n4096_k1280.mxfp8_linear_prequant`: the same from E4M3 codes + row-major E8M0 scales (`QuantizedActivation`).
 - `gemm.mxfp8_n4096_k1280.preshuffle_weight`: the load-time weight and scale preshuffle (32 x 32 block scales accepted).

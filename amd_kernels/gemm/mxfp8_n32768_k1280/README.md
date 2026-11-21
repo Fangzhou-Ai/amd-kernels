@@ -9,6 +9,8 @@ rounding (`reference.py`: cosine >= 0.99999, L2 <= 1e-3, bitwise repeats; no ato
 fixed-order). Producer: `norm/rmsnorm_dual_mxfp8_q1280_kv512` (q codes + scales, or bf16). Consumer: the q norm / RoPE / fp8 insert (bf16 [M, 32768]).
 
 ## Entry points
+- Callers use the common entries: `gemm.mxfp8_common.gemm.mxfp8_linear` / `mxfp8_gemm` with `mxfp8_linear_blocker`;
+  this folder is registered in `gemm._SHAPE_HOSTS` (`linear`, `covers`).
 - `gemm.mxfp8_n32768_k1280.mxfp8_linear`: the GEMM from a bf16 activation; fresh bf16 output, graph-capture safe, `serves(m)` tells where it beat the served path.
 - `gemm.mxfp8_n32768_k1280.preshuffle_weight`: the load-time weight and scale preshuffle (32 x 32 block scales accepted).
 - `gemm.mxfp8_n32768_k1280.warmup_mxfp8_linear`: compiles every row and creates the split-K counters before graph capture.
