@@ -23,7 +23,8 @@ with the same text off the table. `<op>_shapes` lists the covered keys for load-
 - `latent_tail_comm`: the latent tail communicator; `allreduce_latent_rmsnorm_up_proj`,
   `allreduce_slots_rmsnorm_up_proj`: the tail on a summed partial or on the experts' slot buffer.
 - `layer_tail_runner`: the layer tail's per-rank state; `layer_tail_launch`: one layer's tail from a build mapping
-  (keys the package's build does not have are ignored) and the operands; the runner supplies its own arguments.
+  and the operands; the runner supplies its own arguments. Keys the package's build lacks are ignored, but a build
+  asking for a fused MLA / DSA part (`m1b_qlen`, `m1c`, `dsa`) gets a reason.
 
 Dispatch: `_SHAPE_HOSTS` (key -> shape package module) and `_shape_host` in `router.py`, `experts.py`,
 `latent_tail.py`, `layer_tail.py`.
