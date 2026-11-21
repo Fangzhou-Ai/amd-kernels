@@ -42,6 +42,8 @@ One line per kernel package. Each package's README has what it does, its entry p
 - [`gemm/bf16_skinny_common`](gemm/bf16_skinny_common/README.md): the dense bf16 linears of a 1-192 row decode step
   (attention in/out projections, shared experts, latent down, lm_head, drafter context projection) on a load-time
   packed weight, one tuned tile table.
+- [`gemm/bf16_common`](gemm/bf16_common/README.md): bf16 GEMM entries (`bf16_latent_down_mxfp4_quant`,
+  `bf16_linear_gather`): the shape -> package routing and the reason a call has no kernel.
 - [`gemm/bf16_n20480_k7168`](gemm/bf16_n20480_k7168/README.md): the TP8 lm_head vocabulary shard, with a row map and a
   publish epilogue into the logits exchange.
 - [`gemm/bf16_latent_down_mxfp4_quant_k7168_n3584`](gemm/bf16_latent_down_mxfp4_quant_k7168_n3584/README.md): the
@@ -56,6 +58,9 @@ One line per kernel package. Each package's README has what it does, its entry p
 - [`moe/mxfp4_h6144_i1536_e128_top4`](moe/mxfp4_h6144_i1536_e128_top4/README.md): the TP2 MoE block (I 1536 per rank):
   routed MXFP4 experts (A4W4) with the MXFP8 shared expert (a TP shard, or the full copy: its shard read in place,
   the whole expert on a sequence-parallel rank's own rows).
+- [`moe/latent_moe_common`](moe/latent_moe_common/README.md): latent MoE decode entries (`router_sigmoid_bias_topk`,
+  `mxfp4_moe_experts`, `allreduce_latent_rmsnorm_up_proj`, `layer_tail_launch`, ...): the shape -> package routing and
+  the reason a call has no kernel.
 - [`moe/mxfp4_h3584_i3072_e896_top16`](moe/mxfp4_h3584_i3072_e896_top16/README.md): routed MXFP4 experts (A4W4, SiTUv2)
   of one TP8 rank: activation quant, GEMM1 + GEMM2 in one launch, deterministic top-16 sum.
 - [`moe/router_sigmoid_bias_top16_e896_h7168`](moe/router_sigmoid_bias_top16_e896_h7168/README.md): the MoE router,
@@ -84,6 +89,9 @@ One line per kernel package. Each package's README has what it does, its entry p
   sliding-window decode attention over an fp8 KV cache, 1 or 2 KV heads per GPU (TP4 / TP2).
 - [`attention/norm_rope_fp8_insert_d128_rot64`](attention/norm_rope_fp8_insert_d128_rot64/README.md): the draft's
   norm + RoPE + fp8 KV insert, 1 or 2 KV heads per GPU (TP4 / TP2).
+- [`attention/mla_decode_common`](attention/mla_decode_common/README.md): DSA / MLA decode entries
+  (`qkv_a_norm_kv_insert`, `indexer_prep`, `q_bproj_wuk_gather`, `fp8_sparse_mla_decode`, `lse_combine_vup`,
+  `fp8_dense_mla_decode`): the shape -> package routing and the reason a call has no kernel.
 - [`attention/dsa_prologue_qkv_a_norm_kv_insert_h7168`](attention/dsa_prologue_qkv_a_norm_kv_insert_h7168/README.md):
   the DSA decode prologue around the qkv_a GEMM: q_a / kv_a norms + fp8_ds_mla KV insert, and the indexer's key
   LayerNorm + MXFP4 insert, query MXFP4 quant and head weights.
@@ -97,6 +105,8 @@ One line per kernel package. Each package's README has what it does, its entry p
   MLA decode combine: W_UV up-projection, owner-rank push and LSE-weighted combine in one launch.
 - [`attention/fp8_dense_mla_decode_h96_kv512`](attention/fp8_dense_mla_decode_h96_kv512/README.md): the DSpark draft's
   dense MLA decode (96 latent heads, e4m3 q and latent KV, causal round-robin DCP shard).
+- [`attention/kda_common`](attention/kda_common/README.md): KDA entries (`kda_decode_fb_gate_spec`, `kda_prefill`,
+  `kda_mono_decode`): the shape -> package routing and the reason a call has no kernel.
 - [`attention/kda_decode_fb_gate_spec_h12_d128`](attention/kda_decode_fb_gate_spec_h12_d128/README.md): the
   linear-attention (KDA) spec-verify decode: f_b gate GEMM, conv + SiLU, delta rule with per-token state snapshots and
   the gated RMSNorm in one launch.
@@ -112,6 +122,9 @@ One line per kernel package. Each package's README has what it does, its entry p
 - [`indexer/indexer_nvfp4_d128_p128_top16`](indexer/indexer_nvfp4_d128_p128_top16/README.md): the sparse-attention
   indexer: block scores over NVFP4 index pages and the top-16 blocks, decode and prefill, one GPU at 1 / 2 index heads
   (TP4 / TP2), or two or four GPUs at decode.
+- [`indexer/mxfp4_indexer_common`](indexer/mxfp4_indexer_common/README.md): MXFP4 DSA indexer entries
+  (`mxfp4_paged_score_topk`, `mxfp4_prefill_score`, `mxfp4_prefill_topk`): the shape -> package routing and the reason a
+  call has no kernel.
 - [`indexer/mxfp4_paged_score_topk_d128_h32_top2048`](indexer/mxfp4_paged_score_topk_d128_h32_top2048/README.md):
   the DSA decode indexer: MXFP4 paged MQA scores of 32 heads and each row's top-2048 keys, the logits never stored.
 - [`indexer/mxfp4_prefill_score_d128_h32`](indexer/mxfp4_prefill_score_d128_h32/README.md): the DSA prefill indexer's
@@ -122,6 +135,8 @@ One line per kernel package. Each package's README has what it does, its entry p
 
 ## Embedding and activation
 
+- [`embedding/vocab_gather_common`](embedding/vocab_gather_common/README.md): the vocabulary gather entry
+  (`vocab_gather_comm`): (hidden, world size) -> package, two, four or eight shards.
 - [`embedding/vocab_gather_h6144`](embedding/vocab_gather_h6144/README.md): vocabulary lookup over two or four shards
   without an all-reduce.
 - [`embedding/vocab_gather_h7168_v163840_ranks8`](embedding/vocab_gather_h7168_v163840_ranks8/README.md): vocabulary
@@ -144,6 +159,8 @@ One line per kernel package. Each package's README has what it does, its entry p
   all-reduce + Gemma norm with bf16-rounded MXFP8.
 - [`norm/gemma_rmsnorm_bf16_mxfp8_h6144`](norm/gemma_rmsnorm_bf16_mxfp8_h6144/README.md): Gemma RMSNorm to
   bf16-rounded MXFP8.
+- [`norm/attnres_rmsnorm_common`](norm/attnres_rmsnorm_common/README.md): the all-reduce + AttnRes + RMSNorm entry
+  (`attnres_comm`): (hidden, world size) -> package and the reason a call has no kernel.
 - [`norm/allreduce_attnres_rmsnorm_h7168_ranks8`](norm/allreduce_attnres_rmsnorm_h7168_ranks8/README.md): eight-rank
   all-reduce + AttnRes block mix + RMSNorm of a decode step (hidden 7168, bf16).
 
@@ -151,8 +168,12 @@ One line per kernel package. Each package's README has what it does, its entry p
 
 - [`collectives/handshake_ranks8`](collectives/handshake_ranks8/README.md): the eight-rank flag barrier and small
   payload exchanges (epoch-tagged words, flag after data, pull) on the shared helpers in `common/`.
+- [`collectives/logits_exchange_common`](collectives/logits_exchange_common/README.md): the lm_head shard GEMM + logits
+  exchange entry (`logits_exchange_comm`): (N shard, K, world size) -> package and the reason a call has no kernel.
 - [`collectives/all_to_all_bf16_n20480_ranks8`](collectives/all_to_all_bf16_n20480_ranks8/README.md): logits rows into
   the owner's `[rows, 163840]` layout (or an all-gather).
+- [`collectives/topk_gather_merge_common`](collectives/topk_gather_merge_common/README.md): the DCP top-k gather + merge
+  entry (`topk_gather_merge_comm`): (top-k, world size) -> package and the reason a call has no kernel.
 - [`collectives/dcp8_topk_gather_merge_top2048`](collectives/dcp8_topk_gather_merge_top2048/README.md): the DSA score
   all-gather, global top-2048 merge and this rank's CSR KV slots in one launch.
 
@@ -198,8 +219,12 @@ One line per kernel package. Each package's README has what it does, its entry p
   and block partials of one Markov draft step.
 - [`sampling/gumbel_combine_markov_embed_v200064_r256`](sampling/gumbel_combine_markov_embed_v200064_r256/README.md):
   the end of one Markov draft step: combine, draft id, next row.
+- [`sampling/markov_gumbel_common`](sampling/markov_gumbel_common/README.md): the fused Markov draft chain entry
+  (`markov_gumbel_fused`): (vocabulary, rank) -> package and the reason a call has no kernel.
 - [`sampling/markov_gumbel_fused_v163840_r512`](sampling/markov_gumbel_fused_v163840_r512/README.md): the DSpark
   draft's Markov chain in one persistent launch: bias GEMV, logits cache, Gumbel draw, argmax, k steps.
+- [`sampling/top_p_mask_common`](sampling/top_p_mask_common/README.md): the top-p mask entry (`top_p_mask`):
+  vocabulary (163840, 200064) -> package and the reason a call has no kernel.
 - [`sampling/top_p_mask_f32_v200064`](sampling/top_p_mask_f32_v200064/README.md): vLLM's top-p without top-k on fp32
   logits rows, bit for bit: the split chain (<= 64 rows) in one launch, the one-program-per-row kernel above.
 - [`sampling/top_p_mask_f32_v163840`](sampling/top_p_mask_f32_v163840/README.md): top-p mask of <= 64 fp32 logits rows,
@@ -211,6 +236,8 @@ One line per kernel package. Each package's README has what it does, its entry p
   decoder layers around their attention, four ranks.
 - [`decoder/dense_mxfp8_h6144_i6144_ranks2`](decoder/dense_mxfp8_h6144_i6144_ranks2/README.md): the draft's dense
   decoder layers around their attention, two ranks (and the TP2 target's dense MLP).
+- [`decoder/bf16_dense_mlp_common`](decoder/bf16_dense_mlp_common/README.md): the dense bf16 MLP shard entry
+  (`bf16_dense_mlp`): (hidden, inter) -> package and the reason a call has no kernel.
 - [`decoder/bf16_dense_mlp_h7168_i1792`](decoder/bf16_dense_mlp_h7168_i1792/README.md): the DSpark drafter's dense
   MLP shard (gate_up + SwiGLU, down) on packed bf16 operands.
 

@@ -15,11 +15,17 @@ attention/dcp8_lse_combine_vup_mla_h12_kv512/test_combine.py	8
 attention/dcp8_lse_combine_vup_mla_h12_kv512/test_warm_up.py	8
 attention/dcp8_q_bproj_wuk_gather_h96_kv512/test_compile.py	8
 attention/dcp8_q_bproj_wuk_gather_h96_kv512/test_query_gather.py	8
+attention/mla_decode_common/test_combine_ranks8.py	8
+attention/mla_decode_common/test_query_ranks8.py	8
 collectives/all_to_all_bf16_n20480_ranks8/test_exchange.py	8
 collectives/dcp8_topk_gather_merge_top2048/test_topk_gather_merge.py	8
 collectives/handshake_ranks8/test_handshake.py	8
 collectives/handshake_ranks8/test_warm_up.py	8
+collectives/logits_exchange_common/test_entry_ranks8.py	8
+collectives/topk_gather_merge_common/test_entry_ranks8.py	8
+embedding/vocab_gather_common/test_entry_ranks8.py	8
 embedding/vocab_gather_h7168_v163840_ranks8	8
+gemm/bf16_common/test_linear_gather_ranks8.py	8
 gemm/bf16_linear_gather_n896_k35840_ranks8/test_context_proj.py	8
 gemm/bf16_linear_gather_n896_k35840_ranks8/test_reduce_gather.py	8
 gemm/bf16_linear_gather_n896_k35840_ranks8/test_warm_up.py	8
@@ -27,8 +33,11 @@ gemm/bf16_n20480_k7168/test_push.py	8
 moe/allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8/test_latent_tail.py	8
 moe/allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8/test_slots.py	8
 moe/allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8/test_warm_up.py	8
+moe/latent_moe_common/test_latent_tail_ranks8.py	8
+moe/latent_moe_common/test_layer_tail_ranks8.py	8
 moe/layer_tail_k2_h7168_ranks8/test_layer_tail.py	8
 norm/allreduce_attnres_rmsnorm_h7168_ranks8	8
+norm/attnres_rmsnorm_common/test_entry_ranks8.py	8
 
 indexer/indexer_nvfp4_d128_p128_top16/test_split4_rank_owned_ranks4.py	4
 
