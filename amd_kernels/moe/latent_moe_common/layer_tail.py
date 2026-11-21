@@ -35,9 +35,21 @@ def _runner_host(cls):
     return host, frozenset(f.name for f in dataclasses.fields(host.K2Build))
 
 
+# build keys that put another kernel's work into the launch (an MLA / DSA layer's M1b, M1c, DSA attention); the
+# package fuses none of them, so a build that sets one is declined. Their other keys only parameterise these parts.
+_FUSED_PARTS = ("m1b_qlen", "m1c", "dsa")
+
+
+def _unbuilt(fields, items):
+    return sorted(k for k, v in items if k in _FUSED_PARTS and k not in fields and v)
+
+
 @functools.cache
 def _k2_build(cls, items):
     host, fields = _runner_host(cls)
+    extra = _unbuilt(fields, items)
+    if extra:
+        raise ValueError(f"{_OP}: the kernel does not fuse {extra}")
     return host.K2Build(**{k: v for k, v in items if k in fields})
 
 
@@ -66,7 +78,7 @@ def layer_tail_launch(runner, build: Mapping, *, core, w_o, prefix, blocks, ares
                       w_ld, w_sgu, w_sd, w13, w13s, w2, w2s, ln_w, w_up, out, layer, tl=None):
     """One layer's tail: ``core`` [S, K] (o_proj's input) -> ``out`` [S, hidden]; ``prefix`` [S, hidden] updated in
     place. ``build`` maps the package's build fields (tokens, nblocks, eps, reset, ...) to hashable values; other keys
-    are ignored."""
+    are ignored, except that a build asking for a fused MLA / DSA part (``m1b_qlen``, ``m1c``, ``dsa``) is declined."""
     cls = type(runner)
     key = _k2_build(cls, tuple(build.items()))
     _runner_host(cls)[0].k2_launch(
@@ -98,6 +110,9 @@ def layer_tail_launch_unsupported_reason(runner, build: Mapping, *, core, w_o, p
         hash(tuple(build.items()))
     except TypeError:
         return f"{_OP}: build values must be hashable"
+    extra = _unbuilt(_runner_host(type(runner))[1], build.items())
+    if extra:
+        return f"{_OP}: the kernel does not fuse {extra}"
     tokens, nblocks = build["tokens"], build["nblocks"]
     if not isinstance(tokens, int) or not isinstance(nblocks, int):
         return f"{_OP}: build tokens and nblocks must be int"

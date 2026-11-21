@@ -324,6 +324,10 @@ def test_layer_tail_reasons(gfx950, runner):
     assert "prefix and out" in r(runner, build, **{**launch_kw(), "out": meta(16, 7168)})
     assert "hashable" in r(runner, {**build, "extra": [1]}, **launch_kw())
     assert "must be int" in r(runner, {"tokens": 12.0, "nblocks": 4}, **launch_kw())
+    assert "does not fuse ['dsa', 'm1b_qlen']" in r(runner, {**build, "m1b_qlen": 2, "dsa": 2}, **launch_kw())
+    assert "does not fuse ['m1c']" in r(runner, {**build, "m1c": True}, **launch_kw())
+    stock_off = {"m1b_qlen": 0, "m1b_ranks": 1, "m1c": False, "dsa": 0, "dsa_tile": 128, "uv_bf16": False}
+    assert r(runner, {**build, **stock_off}, **launch_kw()) is None
     assert "contiguous bf16" in r(runner, build, **{**launch_kw(), "core": meta(12, 1536, dtype=f32)})
     assert "contiguous bf16" in r(runner, build, **{**launch_kw(), "out": meta(12, 7168, dtype=f32)})
     assert "contiguous bf16" in r(runner, build, **{**launch_kw(), "prefix": meta(12, 7170)[:, :7168]})
