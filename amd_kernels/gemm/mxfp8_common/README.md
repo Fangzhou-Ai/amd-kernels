@@ -6,7 +6,7 @@ scales [N, K / 32], preshuffled at load ((16, 16) codes, AITER `shuffle_scale_a1
 K % 256 == 0, quantized per 1 x 32 block. Shapes (N x K) of the TP4 / TP2 shards: QKV 2560 / 4992 x 6144, o_proj
 6144 x 2048 / 4096, `o_proj_full` 6144 x 8192, dense gate_up 6144 / 12288 x 6144, dense down 6144 x 3072 / 6144,
 shared-expert gate_up 1536 / 3072 x 6144 and down 6144 x 768 / 1536, draft QKV 2304 / 4608 x 6144, draft context K / V
-1280 / 2560 x 6144. Callers: vLLM's MXFP8 linears, the norm + quant producers, the QKV chain, SP hand-offs.
+1280 / 2560 x 6144; DeepSeek-V4.1-Flash's Engram `wkv` 25600 x 6144. Callers: vLLM's MXFP8 linears, the norm + quant producers, the QKV chain, SP hand-offs.
 `reference.py`: exact dequant, fp32 sums, one rounding; cos >= 0.99999, L2 <= 1e-3, bitwise repeats.
 
 ## Entry points

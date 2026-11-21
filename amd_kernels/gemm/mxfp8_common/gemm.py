@@ -95,6 +95,7 @@ _SHAPE_HOSTS = {
     (6144, 6144): "amd_kernels.gemm.mxfp8_n6144_k6144.host",
     (6144, 8192): "amd_kernels.gemm.mxfp8_n6144_k8192.host",
     (12288, 6144): "amd_kernels.gemm.mxfp8_n12288_k6144.host",
+    (25600, 6144): "amd_kernels.gemm.mxfp8_n25600_k6144.host",
 }
 
 
