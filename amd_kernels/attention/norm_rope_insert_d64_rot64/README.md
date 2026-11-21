@@ -24,6 +24,8 @@ of its row maximum, at least `EXACT_MIN` (99.9%) bit-equal; cache elements outsi
 - `kv_norm_rope_insert_multilayer.kv_norm_rope_insert_multilayer`: K norm + RoPE and the K / V inserts of the
   context rows' fused K / V row into every layer's cache (one slot mapping, or one a layer).
 - `kv_norm_rope_insert_multilayer.supports_multilayer`: whether it takes these caches and scales.
+- `kv_norm_rope_insert_multilayer.capture_blocker`: why a call cannot run in the CUDA graph being captured (the
+  first call of a cache set builds its pointer table and must be eager).
 
 Both are entries (`amd_kernels.warm_up`): the first call of each mode (heads, cache dtype or no insert, page size;
 layers, KV heads, page size, cache dtype) compiles its kernel with slot -1 calls that write nothing. No row-count
@@ -36,7 +38,9 @@ One MI355X; one graph of 20 calls with their own inputs and disjoint slots, min 
 the compiled draft layer's norm + RoPE (4 Inductor launches) + `triton_reshape_and_cache_flash`; the context store
 after its GEMM (copy, grouped `rms_norm`, repeat, `rotary_embedding`, 5 inserts: 9 launches), and for bf16 caches
 the one-launch Triton store of `VLLM_K31_BEAT_CTXKV`. Floor: one copy launch moving the same bytes (1.95-2.09 us; an
-empty graph launch is 1.57 us). Every row's q and cache bytes are bit-equal to the stock chain.
+empty graph launch is 1.57 us). Multi-layer: cache bytes bit-equal to the stock chain at every row. qkv: q and cache
+bytes bit-equal when Inductor's variance reduction runs 8 rows a wave; Inductor autotunes it per process, and other
+configs leave ~1e-5 of the q / K values one bf16 ulp off (the stock chain itself varies so between server launches).
 
 | Rows (draft at TP8) | cache | qkv: T -> us (stock) | multi-layer: R -> us (stock; Triton store) |
 |---|---|---|---|

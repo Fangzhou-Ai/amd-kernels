@@ -3,6 +3,8 @@
 """Each entry, at the smallest and largest served row counts and both cache dtypes, writes the same bits (q and every
 cache) as a direct call of the shape package it routes to, and its reason is None on those calls."""
 
+import importlib
+
 import pytest
 import torch
 
@@ -45,3 +47,20 @@ def test_multilayer(n, kind):
     _, a = cases.multilayer(n, kind=kind)
     assert E.kv_norm_rope_insert_multilayer_unsupported_reason(*a) is None
     same_bits(lambda: cases.multilayer(n, kind=kind))
+
+
+@torch.inference_mode()
+def test_multilayer_reason_in_capture():
+    """Inside CUDA graph capture, a cache set without an eager call yet gets a reason (the caller runs stock in that
+    graph); after one eager call it has none."""
+    require_gfx950()
+    importlib.import_module(cases.PKG + ".kv_norm_rope_insert_multilayer")._tables.clear()  # freed sets' addresses
+    call, a = cases.multilayer(40, seed=7)
+    with torch.cuda.graph(torch.cuda.CUDAGraph()):
+        why = E.kv_norm_rope_insert_multilayer_unsupported_reason(*a)
+    assert why is not None and "inside CUDA graph capture" in why, why
+    call.run(True)
+    with torch.cuda.graph(torch.cuda.CUDAGraph()):
+        why = E.kv_norm_rope_insert_multilayer_unsupported_reason(*a)
+        call.run(True)
+    assert why is None, why

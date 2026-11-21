@@ -11,9 +11,12 @@ Norm: the sum of squares in the order of the op it replaces (DPP butterflies; ev
 bits), ``r = v_rsq_f32(sum / 64 + eps)`` and ``n = (x * r) * w`` in fp32. ``round_norm`` (vLLM's eager ``rms_norm`` +
 ``rotary_embedding``): lane j adds its 8 squares in order, the lanes add ((t0 + t1) + (t2 + t3)) + ((t4 + t5) +
 (t6 + t7)), and ``n`` is rounded to bf16 before RoPE. Otherwise (the Inductor-compiled norm + RoPE of a draft layer,
-its persistent-reduction layout of 8 lanes x 8 values): lane j adds ((s0 + s2) + fma(x4, x4, s6)) + ((s1 + s3) +
-fma(x5, x5, s7)), the lanes add by xor 4, 2, 1, and RoPE takes the fp32 ``n`` (Inductor elides that rounding). RoPE: dim d < 32 pairs with d + 32 in lane j ^ 4 (DPP row_shl / row_shr 4);
-``o = fma(n, cos, -/+ (n' * sin))``, rounded to bf16 once. V is stored as given.
+its persistent reduction at 8 rows a wave, i.e. 8 lanes x 8 values a row): lane j adds ((s0 + s2) + fma(x4, x4, s6)) +
+((s1 + s3) + fma(x5, x5, s7)), the lanes add by xor 4, 2, 1, and RoPE takes the fp32 ``n`` (Inductor elides that
+rounding). Inductor autotunes that reduction per process; a config with fewer rows a wave (XBLOCK / num_warps < 8)
+sums in another order, and ~1e-5 of the outputs then differ from it by one bf16 ulp. RoPE: dim d < 32 pairs with
+d + 32 in lane j ^ 4 (DPP row_shl / row_shr 4); ``o = fma(n, cos, -/+ (n' * sin))``, rounded to bf16 once. V is
+stored as given.
 
 Insert at ``slot`` (< 0, or a token at or past the slots given: skipped) into ``[pages, nkv, page, 128]`` (K 64 |
 V 64): bf16 as is, or e4m3 of ``value / scale`` (the bf16 K or V; IEEE fp32 divide, ``v_cvt_scalef32_pk_fp8_f32``

@@ -21,10 +21,36 @@ def _get_kernel(nl: int, nkv: int, block_size: int, cache: str):
     return _kernel.compile_norm_rope_insert(0, nkv, nl, block_size, cache, round_norm=True)
 
 
-@functools.cache
-def _pointer_table(ptrs: tuple[int, ...], device: torch.device) -> torch.Tensor:
-    """Persistent cache and scale pointers only (never batch slot views): built on the first call, before capture."""
-    return torch.tensor(ptrs, dtype=torch.int64, device=device)
+_CAPTURE_BLOCKER = "first call with these caches inside CUDA graph capture (their pointer table is built eagerly)"
+_tables: dict[tuple, torch.Tensor] = {}
+
+
+def _table_key(kv_caches, k_scales, v_scales, device) -> tuple:
+    """The persistent cache and scale pointers of a cache set (never batch slot views)."""
+    if cache_kind(kv_caches[0]) == "fp8":
+        scale_ptrs = [s.data_ptr() for s in k_scales] + [s.data_ptr() for s in v_scales]
+    else:
+        scale_ptrs = [0] * (2 * len(kv_caches))
+    return tuple([c.data_ptr() for c in kv_caches] + scale_ptrs), device
+
+
+def _pointer_table(key) -> torch.Tensor:
+    table = _tables.get(key)
+    if table is None:
+        if torch.cuda.is_current_stream_capturing():  # a host -> device copy cannot be captured
+            raise RuntimeError(f"kv_norm_rope_insert_multilayer: {_CAPTURE_BLOCKER}")
+        table = _tables[key] = torch.tensor(key[0], dtype=torch.int64, device=key[1])
+    return table
+
+
+def capture_blocker(kv: torch.Tensor, kv_caches: list[torch.Tensor], k_scales: list[torch.Tensor] | None,
+                    v_scales: list[torch.Tensor] | None) -> str | None:
+    """Why this call cannot run in the CUDA graph being captured (None: it can)."""
+    if not (torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing()):
+        return None
+    if _table_key(kv_caches, k_scales, v_scales, kv.device) in _tables:
+        return None
+    return _CAPTURE_BLOCKER
 
 
 def supports_multilayer(kv_caches: list[torch.Tensor], k_scales: list[torch.Tensor] | None,
@@ -58,7 +84,7 @@ def _kv_norm_rope_insert_multilayer(
     n_insert: int | None = None,
 ) -> None:
     """K norm + RoPE and the K / V inserts of the context rows into every layer's cache; only the first
-    ``n_insert`` rows (None: all) have slots."""
+    ``n_insert`` rows (None: all), and none past the shortest slot mapping, have slots."""
     n = kv.shape[0]
     nl = len(kv_caches)
     if n == 0 or nl == 0:
@@ -77,12 +103,8 @@ def _kv_norm_rope_insert_multilayer(
     for c in kv_caches:
         assert c.dtype == kv_caches[0].dtype and c.stride() == kv_caches[0].stride()
         assert tuple(c.shape[1:]) == tuple(kv_caches[0].shape[1:])
-    n_insert = n if n_insert is None else min(n_insert, n)
-    if cache == "fp8":
-        scale_ptrs = [s.data_ptr() for s in k_scales] + [s.data_ptr() for s in v_scales]
-    else:
-        scale_ptrs = [0] * (2 * nl)
-    table = _pointer_table(tuple([c.data_ptr() for c in kv_caches] + scale_ptrs), kv.device)
+    n_insert = min(n if n_insert is None else n_insert, n, *(s.shape[0] for s in slot_mappings))
+    table = _pointer_table(_table_key(kv_caches, k_scales, v_scales, kv.device))
     slots = slot_mappings[0]
     slot_stride = 0
     if any(s.data_ptr() != slots.data_ptr() for s in slot_mappings):

@@ -90,7 +90,10 @@ def kv_norm_rope_insert_multilayer_unsupported_reason(kv, positions, k_norm_weig
         return f"{_OP}: cos / sin cache {tuple(cs.shape)} {cs.dtype} (contiguous bf16 [rows, {key[1]}])"
     m = n if n_insert is None else min(n_insert, n)
     if len(slot_mappings) != nl or any(
-        s.dtype != torch.int64 or s.dim() != 1 or s.stride(0) != 1 or s.shape[0] < m for s in slot_mappings
+        s is None or s.dtype != torch.int64 or s.dim() != 1 or s.stride(0) != 1 for s in slot_mappings
     ):
-        return f"{_OP}: slot mappings (one contiguous int64 [>= {m}] a layer, {nl} layers)"
-    return None
+        return f"{_OP}: slot mappings (one contiguous int64 [rows] a layer, {nl} layers)"
+    if len({min(m, s.shape[0]) for s in slot_mappings}) > 1:
+        return f"{_OP}: slot mappings of {sorted({s.shape[0] for s in slot_mappings})} rows (every layer the same)"
+    blocker = _op_module(key).capture_blocker(kv, kv_caches, k_scales, v_scales)
+    return None if blocker is None else f"{_OP}: {blocker}"

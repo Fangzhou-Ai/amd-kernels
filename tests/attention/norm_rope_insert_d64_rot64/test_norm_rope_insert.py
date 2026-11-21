@@ -252,11 +252,57 @@ def test_multilayer_pointer_table_cache():
     gen = torch.Generator().manual_seed(3)
     kv, pos, weights, cs, caches, slots, ks, vs = make_multilayer(68, 16, "fp8", False, gen)
     kv_norm_rope_insert_multilayer(kv, pos, weights, cs, caches, slots, ks, vs, EPS)
-    misses = ml_host._pointer_table.cache_info().misses
+    tables = len(ml_host._tables)
     for offset in (1, 3):
         views = [torch.cat([torch.zeros(offset, device="cuda", dtype=s.dtype), s])[offset:] for s in slots]
         kv_norm_rope_insert_multilayer(kv, pos, weights, cs, caches, views, ks, vs, EPS)
-        assert ml_host._pointer_table.cache_info().misses == misses
+        assert len(ml_host._tables) == tables
+
+
+@torch.inference_mode()
+def test_multilayer_first_call_in_capture():
+    """A cache set's first call inside CUDA graph capture is refused (``capture_blocker`` says why); after an eager
+    call the captured call replays it bit for bit."""
+    require_gfx950()
+    ml_host._tables.clear()  # a freed cache set may have left these addresses in it
+    gen = torch.Generator().manual_seed(4)
+    kv, pos, weights, cs, caches0, slots, ks, vs = make_multilayer(40, 16, "fp8", False, gen)
+    caches = [c.clone() for c in caches0]
+    assert ml_host.capture_blocker(kv, caches, ks, vs) is None
+    graph = torch.cuda.CUDAGraph()
+    with pytest.raises(RuntimeError, match="inside CUDA graph capture"), torch.cuda.graph(graph):
+        assert ml_host.capture_blocker(kv, caches, ks, vs) is not None
+        kv_norm_rope_insert_multilayer(kv, pos, weights, cs, caches, slots, ks, vs, EPS)
+    kv_norm_rope_insert_multilayer(kv, pos, weights, cs, caches, slots, ks, vs, EPS)
+    eager = [c.clone() for c in caches]
+    for c, c0 in zip(caches, caches0):
+        c.copy_(c0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        assert ml_host.capture_blocker(kv, caches, ks, vs) is None
+        kv_norm_rope_insert_multilayer(kv, pos, weights, cs, caches, slots, ks, vs, EPS)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert all(same(a, b) for a, b in zip(caches, eager))
+
+
+@torch.inference_mode()
+def test_multilayer_short_slot_mappings():
+    """Slot mappings shorter than the rows insert their own length (as the stock per-layer insert), never reading
+    past them."""
+    require_gfx950()
+    gen = torch.Generator().manual_seed(5)
+    n, m = 64, 40
+    kv, pos, weights, cs, caches0, slots, ks, vs = make_multilayer(n, 16, "fp8", False, gen)
+    backing = torch.full((n,), 7, dtype=torch.int64, device="cuda")  # what lies past the views
+    backing[:m] = slots[0][:m]
+    short = [backing[:m]] * LAYERS
+    refs = kv_norm_rope_insert_multilayer_reference(kv, pos, weights, cs, caches0, short, ks, vs, EPS)
+    caches = [c.clone() for c in caches0]
+    kv_norm_rope_insert_multilayer(kv, pos, weights, cs, caches, short, ks, vs, EPS)
+    torch.cuda.synchronize()
+    for i, (got, (ref, mask), before) in enumerate(zip(caches, refs, caches0)):
+        check_cache(got, ref, before, mask, f"short slots layer {i}")
 
 
 def test_supports_multilayer():

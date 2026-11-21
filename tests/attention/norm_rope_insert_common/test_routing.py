@@ -145,7 +145,8 @@ ML_BRANCHES = [
     ("weights", _set("k_norm_weight", t(4, 64)), "K norm weights"),
     ("cos_sin", _set("cos_sin_cache", t(4096, 64, dtype=F32)), "cos / sin cache"),
     ("slot_layers", _set("slot_mappings", [t(40, dtype=I64)] * 4), "slot mappings"),
-    ("slot_rows", _set("slot_mappings", [t(39, dtype=I64)] * 5), "slot mappings"),
+    ("slot_none", _set("slot_mappings", [t(40, dtype=I64)] * 4 + [None]), "slot mappings"),
+    ("slot_lengths", _set("slot_mappings", [t(40, dtype=I64)] * 4 + [t(39, dtype=I64)]), "every layer the same"),
 ]  # fmt: skip
 
 

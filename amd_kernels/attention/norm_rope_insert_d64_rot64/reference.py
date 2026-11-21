@@ -22,9 +22,9 @@ Per 64-dim head ``x`` (bf16), both kernels compute
 
 Tolerances (``check_bf16``, ``check_cache``): ``torch.rsqrt`` may differ from ``v_rsq_f32`` by an ulp, so a normed
 value may sit one ulp from this reference, and RoPE can move that ulp into a smaller output or cancel it near zero;
-an Inductor build that picks another reduction layout sums in another order. Every output is within one step (bf16 ulp / e4m3 code) of the reference or within ``ROW_ATOL`` (2^-6)
-of its 64-value row's largest reference magnitude; at least ``EXACT_MIN`` bit-equal; every cache byte the kernel
-must not write is unchanged.
+an Inductor build that picks another reduction layout sums in another order. Every output is within one step (bf16
+ulp / e4m3 code) of the reference or within ``ROW_ATOL`` (2^-6) of its 64-value row's largest reference magnitude; at
+least ``EXACT_MIN`` bit-equal; every cache byte the kernel must not write is unchanged.
 """
 
 import torch
@@ -141,11 +141,12 @@ def kv_norm_rope_insert_multilayer_reference(
     v_scales, eps, n_insert=None,
 ):  # fmt: skip
     """``kv [n, layers * 2 * kv_heads * 64]`` (per layer: K heads then V heads) -> per layer (the updated copy of
-    its cache, the mask of the elements written); rows >= ``n_insert`` are not inserted."""
+    its cache, the mask of the elements written); rows >= ``n_insert`` or past the shortest slot mapping are not
+    inserted."""
     n = kv.shape[0]
     nl = len(kv_caches)
     nkv = kv_caches[0].shape[1]
-    m = n if n_insert is None else min(n_insert, n)
+    m = min(n if n_insert is None else n_insert, n, *(s.shape[0] for s in slot_mappings))
     x = kv.reshape(n, nl, 2, nkv, D)
     out = []
     for lay in range(nl):
