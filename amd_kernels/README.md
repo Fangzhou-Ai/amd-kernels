@@ -89,6 +89,11 @@ One line per kernel package. Each package's README has what it does, its entry p
   sliding-window decode attention over an fp8 KV cache, 1 or 2 KV heads per GPU (TP4 / TP2).
 - [`attention/norm_rope_fp8_insert_d128_rot64`](attention/norm_rope_fp8_insert_d128_rot64/README.md): the draft's
   norm + RoPE + fp8 KV insert, 1 or 2 KV heads per GPU (TP4 / TP2).
+- [`attention/norm_rope_insert_common`](attention/norm_rope_insert_common/README.md): RMS norm + RoPE + KV insert
+  entries (`qkv_norm_rope_insert`, `kv_norm_rope_insert_multilayer`): the shape -> package routing and the reason a
+  call has no kernel.
+- [`attention/norm_rope_insert_d64_rot64`](attention/norm_rope_insert_d64_rot64/README.md): the Kimi-K3.1 draft's
+  RMS norm + NeoX RoPE + bf16 / fp8 KV insert of 64-dim heads: one layer's qkv rows, the context rows of all layers.
 - [`attention/mla_decode_common`](attention/mla_decode_common/README.md): DSA / MLA decode entries
   (`qkv_a_norm_kv_insert`, `indexer_prep`, `q_bproj_wuk_gather`, `fp8_sparse_mla_decode`, `lse_combine_vup`,
   `fp8_dense_mla_decode`): the shape -> package routing and the reason a call has no kernel.
