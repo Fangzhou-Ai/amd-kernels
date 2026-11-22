@@ -71,10 +71,25 @@ class QueryGatherComm:
             torch.bfloat16
         )
         self.state = torch.zeros(4, dtype=torch.int32, device=self.device)
-        self.dbg = torch.zeros(65536 * 16, dtype=torch.int32, device=self.device)
-        self.scratch = torch.empty((MAX_ROWS, HEADS * KW.QW), dtype=torch.bfloat16, device=self.device)
+        self._dbg = self._scratch = None
+        if mode == "latent":
+            self.scratch  # noqa: B018 - created here, not inside a capture
         torch.cuda.synchronize()
         dist.barrier(group=group)
+
+    @property
+    def dbg(self):
+        """The timing variants' timestamp plane (created on first use)."""
+        if self._dbg is None:
+            self._dbg = torch.zeros(65536 * 16, dtype=torch.int32, device=self.device)
+        return self._dbg
+
+    @property
+    def scratch(self):
+        """The latent mode's q_b output."""
+        if self._scratch is None:
+            self._scratch = torch.empty((MAX_ROWS, HEADS * KW.QW), dtype=torch.bfloat16, device=self.device)
+        return self._scratch
 
     def _latent(self, q_a, w_qb, w_uk, cfg):
         m = q_a.shape[0]
@@ -115,7 +130,7 @@ class QueryGatherComm:
             *self.bufs,
             self.rank,
             self.state.data_ptr(),
-            self.dbg.data_ptr(),
+            self.dbg.data_ptr() if timing else 0,
             torch.cuda.current_stream(),
         )
 
