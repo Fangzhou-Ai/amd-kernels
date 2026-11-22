@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """``ExpertParallel`` on 8 GPUs: the fused dispatch / experts / combine of every rank's tokens equals ``reference.py``
 (cosine >= 0.99999 over the output, each row >= 0.9999) for uniform, skewed and all-to-rank-0 routing, MXFP8 and bf16
-rows, unequal and empty ranks, ids that are not routed, 48 and 56 experts per rank; two runs and a CUDA graph replay
-with new inputs are bitwise identical to the eager run; nothing compiles after the warm-up. Skipped with fewer than
-8 GPUs (``AKR_OVERSUBSCRIBE=1`` runs the 8 ranks on the GPUs there are: a plumbing check only)."""
+rows, unequal and empty ranks, ids that are not routed, 48, 49, 56 and 63 experts per rank; two runs and a CUDA graph
+replay with new inputs are bitwise identical to the eager run; nothing compiles after the warm-up. Skipped with fewer
+than 8 GPUs (``AKR_OVERSUBSCRIBE=1`` runs the 8 ranks on the GPUs there are: a plumbing check only)."""
 
 import torch
 import torch.distributed as dist
@@ -109,6 +109,17 @@ def test_ranks8_experts48():
     ]
     graphs = [[64] * WORLD, [768] * WORLD, [768, 1, 0, 33, 200, 64, 5, 128]]
     run_on_8_gpus(worker, 48, cases, graphs, timeout=1800)
+
+
+def test_ranks8_experts49():
+    # one replica slot per rank: the geometry of vLLM's shipped DeepSeek-V4.1 expert plan (S = 49), decode rows
+    # up to 1024 per rank
+    cases = [
+        ("skew", [16] * WORLD, True, False),
+        ("uniform", [848] * WORLD, True, False),
+        ("hot", [1024, 0, 5, 300, 64, 1, 128, 33], True, False),
+    ]
+    run_on_8_gpus(worker, 49, cases, [[64] * WORLD, [848] * WORLD], timeout=1800)
 
 
 def test_ranks8_experts56():
