@@ -130,11 +130,6 @@ def store_lds(field, idx, v):
     field.ptr[idx] = v
 
 
-def now():
-    """s_memrealtime (100 MHz)."""
-    return I64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
-
-
 def popcount(mask):
     return I(fx.math.ctpop(mask).to(I))
 

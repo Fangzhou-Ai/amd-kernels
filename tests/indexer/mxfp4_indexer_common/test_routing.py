@@ -99,7 +99,7 @@ def test_signatures_match_the_ops():
     for op, other in pairs:
         assert inspect.signature(op).parameters == inspect.signature(other).parameters, other.__name__
     routed = [
-        (paged.mxfp4_paged_score_topk, paged._SHAPE_HOSTS, "mxfp4_paged_score_topk", ("dbg", "split")),
+        (paged.mxfp4_paged_score_topk, paged._SHAPE_HOSTS, "mxfp4_paged_score_topk", ("split",)),
         (prefill.mxfp4_prefill_score, prefill._SCORE_HOSTS, "score_rows", ()),
         (prefill.mxfp4_prefill_topk, prefill._TOPK_HOSTS, "topk_rows", ()),
     ]

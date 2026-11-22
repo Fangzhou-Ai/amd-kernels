@@ -50,13 +50,11 @@ class Scorer:
 
 
 @flyc.jit
-def score_chunk(sc, rows, cmax, num_waves, cb, cc, field, base, hook=None):
+def score_chunk(sc, rows, cmax, num_waves, cb, cc, field, base):
     """Scores keys ``[cc * cb, (cc + 1) * cb)`` (``cb`` <= ``cmax``, a multiple of 64) of the tile's ``rows`` rows (flat
     rows ``first ..``) into ``field.ptr[base + r * cmax + key]``, ``key`` the position in the chunk; keys of a step
     past ``cb`` are not written. Every wave of the workgroup takes part."""
     wave, lane = sc.wave, sc.lane
-    if hook is not None:
-        hook(8)
     l = lane & 15
     g = (lane >> 4) & 3
     steps = max(1, cmax // 64 // num_waves)
@@ -83,9 +81,6 @@ def score_chunk(sc, rows, cmax, num_waves, cb, cc, field, base, hook=None):
         w_l.append(wl)
     nst = (fx.max(fx.min(sc.max_end - cc * cb, cb), I(0)) + 63) // 64
     step0 = cc * (cb // 64)
-    if hook is not None:
-        fx.rocdl.s_waitcnt(vmcnt=0)
-        hook(9)
 
     def load_keys(k):
         st = fx.min(step0 + wave + k * num_waves, step0 + fx.max(nst - 1, I(0)))
@@ -99,15 +94,10 @@ def score_chunk(sc, rows, cmax, num_waves, cb, cc, field, base, hook=None):
         kvb = sc.kv + I64(phys) * I64(sc.page_stride)
         kvsb = sc.kvs + I64(phys) * I64(sc.page_stride)
         kvs = fx.Vector(global_i32(kvsb + I64(g * 64 + l * 4), 1))[0]
-        if fx.const_expr(hook is not None and k == 0):
-            hook(10)
         kv = [global_i32(kvb + I64(g * 1024 + l * 16 + nt * 256), 4, True) for nt in range(4)]
         return kv, kvs
 
     def compute(k, kv, kvs):
-        if fx.const_expr(hook is not None and k == 0):
-            fx.rocdl.s_waitcnt(vmcnt=0)
-            hook(11)
         per_tile = []
         for nt in range_constexpr(4):
             bfrag = fx.make_rmem_tensor(4, I)
@@ -138,8 +128,6 @@ def score_chunk(sc, rows, cmax, num_waves, cb, cc, field, base, hook=None):
             tot = vop("v_add_f32 $0, $1, $2", x, y)
             okey = ((cc * cb + key) < sc.ends[r]).select(score_key(tot.bitcast(I)), I(INT_MIN))
             store_lds(field, base + r * cmax + key, okey)
-        if fx.const_expr(hook is not None and k == 0):
-            hook(12)
 
     def fill_invalid(k):
         key = (wave + k * num_waves) * 64 + g * 16 + l
