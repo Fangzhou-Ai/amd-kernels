@@ -209,7 +209,7 @@ def main():
     ap.add_argument("--stages", action="store_true", help="also time each stage alone (fused and stock)")
     ap.add_argument("--skeleton", action="store_true", help="also time the scan's no-math skeleton (run last: it patches the launchers)")
     args = ap.parse_args()
-    print(f"{'T':>6} {'seqs':>4} {'path':>6} {'v2 us':>8} {'staged':>8} {'stock':>8} {'v2/stock':>9} {'v2/staged':>10} {'io floor':>9} {'%io':>5} "
+    print(f"{'T':>6} {'seqs':>4} {'path':>6} {'kernel':>8} {'staged':>8} {'stock':>8} {'speedup':>9} {'vs staged':>10} {'io floor':>9} {'%io':>5} "
           f"{'+ws floor':>10} {'%+ws':>5} {'mfma us':>8}")
     batches = [[int(x) for x in args.lens.split(",")]] if args.lens else None
     for k, tokens in enumerate(sum(b) for b in batches) if batches else enumerate(int(x) for x in args.tokens.split(",")):
@@ -226,8 +226,8 @@ def main():
         copies = max(2, min(12, -(-MIN_SET_BYTES // set_bytes)))
         cases = [c0] + [make_case(lens, seed=i + 1) for i in range(copies - 1)]
         path = "mega" if host.uses_mega(counts) else "staged"
-        v2 = timeit_graph([fused_arm(c, cu, ci, co, counts) for c in cases])[0]
-        staged = timeit_graph([fused_arm(c, cu, ci, co, counts, "v1") for c in cases])[0] if path == "mega" else v2
+        kernel = timeit_graph([fused_arm(c, cu, ci, co, counts) for c in cases])[0]
+        staged = timeit_graph([fused_arm(c, cu, ci, co, counts, "staged") for c in cases])[0] if path == "mega" else kernel
         stock = float("nan")
         if not args.no_stock:
             stock = timeit_graph([stock_arm(c, cu, ci, co) for c in cases])[0]
@@ -245,8 +245,8 @@ def main():
                 ss.append((name, timeit_graph([a[1][k][1] for a in sets])[0]))
             print("    staged stages us (min): " + ", ".join(f"{n} {v:.1f}" for n, v in fs))
             print("    stock stages us (min): " + ", ".join(f"{n} {v:.1f}" for n, v in ss))
-        print(f"{tokens:>6} {len(lens):>4} {path:>6} {v2:>8.1f} {staged:>8.1f} {stock:>8.1f} {stock / v2:>8.2f}x {staged / v2:>9.2f}x {io:>9.1f} "
-              f"{100 * io / v2:>4.0f}% {with_ws:>10.1f} {100 * with_ws / v2:>4.0f}% {mfma:>8.1f}", flush=True)
+        print(f"{tokens:>6} {len(lens):>4} {path:>6} {kernel:>8.1f} {staged:>8.1f} {stock:>8.1f} {stock / kernel:>8.2f}x {staged / kernel:>9.2f}x {io:>9.1f} "
+              f"{100 * io / kernel:>4.0f}% {with_ws:>10.1f} {100 * with_ws / kernel:>4.0f}% {mfma:>8.1f}", flush=True)
 
 
 if __name__ == "__main__":

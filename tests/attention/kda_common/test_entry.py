@@ -44,13 +44,13 @@ def test_decode(rows, tokens, uniform):
 
 
 PREFILL = [
-    ([1], "mega", None), ([3000, 600], "mega", None), ([64], "v1", None), ([10240], "v1", None),
+    ([1], "mega", None), ([3000, 600], "mega", None), ([64], "staged", None), ([10240], "staged", None),
     ([300, 64, 77, 1], None, None), ([2048, 300], "mega", ([1024, 256], [3, 1])),
-    ([2048, 300], "v1", ([1024, 256], [3, 1])),
+    ([2048, 300], "staged", ([1024, 256], [3, 1])),
 ]  # fmt: skip
 
 
-PREFILL_IDS = ["1_mega", "3600_mega", "64_v1", "10240_v1", "ragged4", "ckpt_mega", "ckpt_v1"]
+PREFILL_IDS = ["1_mega", "3600_mega", "64_staged", "10240_staged", "ragged4", "ckpt_mega", "ckpt_staged"]
 
 
 @pytest.mark.parametrize("seq,impl,ck", PREFILL, ids=PREFILL_IDS)

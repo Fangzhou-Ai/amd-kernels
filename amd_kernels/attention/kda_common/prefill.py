@@ -129,6 +129,6 @@ def kda_prefill_unsupported_reason(mixed, raw_g, beta_logit, gate, A_log, dt_bia
         if checkpoint_offsets is None or checkpoint_offsets.dtype != torch.int32 or (
                 checkpoint_rows is not None and checkpoint_rows.dtype != torch.int32):
             return f"{_OP}: checkpoint offsets / rows (int32)"
-    if impl not in (None, "mega", "v1"):
-        return f"{_OP}: impl {impl!r} (None, 'mega' or 'v1')"
+    if impl not in (None, "mega", "staged"):
+        return f"{_OP}: impl {impl!r} (None, 'mega' or 'staged')"
     return None

@@ -12,7 +12,7 @@ from .inputs import make_case, require_gfx950
 
 OUT_TOL = 8e-3
 STATE_TOL = 5e-3
-IMPLS = ["mega", "v1"]
+IMPLS = ["mega", "staged"]
 
 
 def rel(a, b):

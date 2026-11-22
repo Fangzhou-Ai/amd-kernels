@@ -38,8 +38,8 @@ def call(c, w_f32, ck, impl=None):
 @pytest.mark.parametrize("w_f32,ck", [(True, False), (False, False), (True, True)])
 def test_no_compile_after_warmup(w_f32, ck, monkeypatch):
     require_gfx950()
-    call(make_case([2048]), w_f32, ck, "v1")  # grouped chains
-    call(make_case([64]), w_f32, ck, "v1")  # whole chains
+    call(make_case([2048]), w_f32, ck, "staged")  # grouped chains
+    call(make_case([64]), w_f32, ck, "staged")  # whole chains
     call(make_case([2048]), w_f32, ck, "mega")
     torch.cuda.synchronize()
     compiled = []

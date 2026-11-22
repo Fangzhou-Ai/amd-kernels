@@ -230,9 +230,9 @@ def chunk_outputs(ws, sb, table, gate, norm_weight, norm_eps, out):
     return out
 
 
-def prefill_v1(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices, has_initial_state,
-             cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale=D ** -0.5, table=None,
-             chunk_counts=None, checkpoint_state=None, checkpoint_offsets=None, checkpoint_rows=None):
+def prefill_staged(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices, has_initial_state,
+                   cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale=D ** -0.5, table=None,
+                   chunk_counts=None, checkpoint_state=None, checkpoint_offsets=None, checkpoint_rows=None):
     """The KDA prefill of one layer: conv + prologue, chunk scan, gated RMSNorm. Writes ``out`` [T, 12, 128] bf16, rolls
     ``conv_state`` and updates ``state_cache`` rows in place. ``table``: ``prologue.chunk_table`` of the step (built once per step
     and shared by the layers; built here when ``None``); ``chunk_counts``: the chunks of each sequence as host ints (sizes the
@@ -251,7 +251,7 @@ MEGA_TINY_CHUNKS = 16  # a batch this small takes the one-launch path whatever i
 
 def uses_mega(chunk_counts):
     """Whether sequences of ``chunk_counts`` chunks (host ints) take the one-launch path (``prefill_mega``) rather than the staged
-    one (``prefill_v1``: prologue, grouped chains, gated norm); the staged path when the counts are not known."""
+    one (``prefill_staged``: prologue, grouped chains, gated norm); the staged path when the counts are not known."""
     if chunk_counts is None:
         return False
     n, nc = len(chunk_counts), sum(chunk_counts)
@@ -262,10 +262,10 @@ def _prefill(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_s
              cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale=D ** -0.5, table=None,
              chunk_counts=None, checkpoint_state=None, checkpoint_offsets=None, checkpoint_rows=None, impl=None):
     """The KDA prefill of one layer (reference.py): writes ``out`` [T, 12, 128] bf16, rolls ``conv_state`` and updates
-    ``state_cache`` rows in place. ``impl``: ``"mega"`` / ``"v1"`` force a path, by default ``uses_mega(chunk_counts)`` chooses."""
+    ``state_cache`` rows in place. ``impl``: ``"mega"`` / ``"staged"`` force a path, by default ``uses_mega(chunk_counts)`` chooses."""
     if impl is None:
-        impl = "mega" if uses_mega(chunk_counts) else "v1"
-    run = prefill_mega if impl == "mega" else prefill_v1
+        impl = "mega" if uses_mega(chunk_counts) else "staged"
+    run = prefill_mega if impl == "mega" else prefill_staged
     return run(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, conv_state, state_cache, state_indices, has_initial_state,
                cu_seqlens, chunk_indices, chunk_offsets, norm_weight, norm_eps, out, lower_bound, scale, table, chunk_counts,
                checkpoint_state, checkpoint_offsets, checkpoint_rows)
@@ -296,7 +296,7 @@ def _inputs(mode, n, mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight
     args = (x, torch.zeros((n, NH, D), dtype=raw_g.dtype, device=dev), xg[:, 6272:6284], g, A_log, dt_bias, conv_weight, conv_state,
             state_cache, zero, torch.zeros(1, dtype=torch.bool, device=dev), cu, ci, co, norm_weight, norm_eps,
             torch.empty((n, NH, D), dtype=out.dtype, device=dev), lower_bound)
-    kwargs = {"chunk_counts": [chunks], "impl": "v1" if n == 64 else None}
+    kwargs = {"chunk_counts": [chunks], "impl": "staged" if n == 64 else None}
     if mode[1]:
         kwargs.update(checkpoint_state=checkpoint_state, checkpoint_offsets=zero, checkpoint_rows=None)
     return args, kwargs
