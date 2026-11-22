@@ -183,3 +183,27 @@ def test_conv_state_slots_past_2gb(impl):
     for s in (2, 65, 128):
         assert torch.equal(cs[s], sentinel), f"slot {s} (no sequence) was written"
     del pool
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+@pytest.mark.parametrize("seq,init", [([300, 500], [False, False]), ([700, 300, 1500, 64, 900], [True, False, True, True, False])],
+                         ids=["two_fresh", "five"])
+@torch.inference_mode()
+def test_strided_state_indices(impl, seq, init):
+    """vLLM passes the state indices as the column view ``block_table[:, 0]`` (row stride 1 + speculative blocks). Every sequence
+    must read and write its own slot: the walk read ``state_indices[n]`` at unit stride before, so sequences past the first
+    took their initial state from, and wrote their final state into, other requests' blocks."""
+    require_gfx950()
+    n = len(seq)
+    c = make_case(seq, init=init, slots=4 * n + 1)
+    bt = torch.arange(4 * n, dtype=torch.int32, device="cuda").view(n, 4).flip(0).contiguous()
+    c["state_indices"] = bt[:, 0]
+    assert not c["state_indices"].is_contiguous()
+    ref, ref_conv, ref_state = reference(c)
+    out, conv, state = run(c, impl)
+    assert rel(out, ref) < OUT_TOL
+    for s in bt[:, 0].tolist():
+        assert rel(state[s], ref_state[s]) < STATE_TOL, f"slot {s}"
+        assert torch.equal(conv[s], ref_conv[s])
+    for s in bt[:, 1:].flatten().tolist() + [4 * n]:
+        assert torch.equal(state[s], c["state_cache"][s]), f"slot {s} (no sequence) was written"

@@ -31,6 +31,12 @@ MAX_GROUPS = 32
 NUM_CUS = 256
 
 
+def _dense(*xs):
+    """The kernels index these per sequence from a raw pointer: unit-stride copies of strided views (vLLM's state indices are
+    ``block_table[:, 0]``)."""
+    return tuple(x if x.is_contiguous() else x.contiguous() for x in xs)
+
+
 @functools.cache
 def _walk_launcher(ckpt=False, foldwalk=False):
     return _scan.compile_scan(WALK_WAVES, WALK_NVT, False, WALK_STAGES, ckpt, False, foldwalk)
@@ -77,7 +83,7 @@ def chunk_scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_in
     assert state_cache.dtype == torch.float32 and state_cache.shape[1:] == (NH, D, D) and state_cache.stride(1) == D * D
     assert out.dtype == torch.bfloat16 and out.shape[1:] == (NH, D) and out.stride(1) == D and out.stride(2) == 1
     assert chunk_offsets.dtype == torch.int64 and cu_seqlens.dtype == torch.int32 and state_indices.dtype == torch.int32
-    has = has_initial_state.to(torch.uint8) if has_initial_state.dtype != torch.uint8 else has_initial_state
+    state_indices, has, cu_seqlens, chunk_offsets = _dense(state_indices, has_initial_state.to(torch.uint8), cu_seqlens, chunk_offsets)
     if groups is None:
         groups = plan_groups(chunk_counts if chunk_counts is not None else [-(-nc // n)] * n)
     g = groups
@@ -96,6 +102,7 @@ def chunk_scan(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_in
     if ckpt:
         assert checkpoint_state.dtype == torch.float32 and checkpoint_state.shape[1:] == (NH, D, D) and checkpoint_offsets.dtype == torch.int32
         rows = checkpoint_rows if checkpoint_rows is not None else torch.arange(n, dtype=torch.int32, device=dev)
+        checkpoint_offsets, rows = _dense(checkpoint_offsets, rows)
         ck = (checkpoint_state.data_ptr(), checkpoint_state.stride(0) * 4, checkpoint_offsets.data_ptr(), rows.data_ptr())
     else:
         ck = (ws.data_ptr(), 0, ws.data_ptr(), ws.data_ptr())
@@ -155,7 +162,7 @@ def prefill_mega(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, co
     assert chunk_offsets.dtype == torch.int64 and cu_seqlens.dtype == torch.int32 and state_indices.dtype == torch.int32
     wf32 = norm_weight.dtype == torch.float32
     assert wf32 or norm_weight.dtype == torch.bfloat16
-    has = has_initial_state.to(torch.uint8) if has_initial_state.dtype != torch.uint8 else has_initial_state
+    state_indices, has, cu_seqlens, chunk_offsets = _dense(state_indices, has_initial_state.to(torch.uint8), cu_seqlens, chunk_offsets)
     if table is None:
         table = _prologue.chunk_table(cu_seqlens, chunk_indices, state_indices, has_initial_state)
     ws = torch.empty(NH, nc, RECORD_BYTES, dtype=torch.uint8, device=dev)
@@ -165,6 +172,7 @@ def prefill_mega(mixed, raw_g, beta_logit, gate, A_log, dt_bias, conv_weight, co
     if ckpt:
         assert checkpoint_state.dtype == torch.float32 and checkpoint_state.shape[1:] == (NH, D, D) and checkpoint_offsets.dtype == torch.int32
         rows = checkpoint_rows if checkpoint_rows is not None else torch.arange(n, dtype=torch.int32, device=dev)
+        checkpoint_offsets, rows = _dense(checkpoint_offsets, rows)
         ck = (checkpoint_state.data_ptr(), checkpoint_state.stride(0) * 4, checkpoint_offsets.data_ptr(), rows.data_ptr())
     else:
         ck = (ws.data_ptr(), 0, ws.data_ptr(), ws.data_ptr())
@@ -200,11 +208,12 @@ def walk_states(ws, cu_seqlens, chunk_offsets, state_cache, state_indices, has_i
     n = cu_seqlens.numel() - 1
     nc = ws.shape[1]
     dev = ws.device
-    has = has_initial_state.to(torch.uint8) if has_initial_state.dtype != torch.uint8 else has_initial_state
+    state_indices, has, cu_seqlens, chunk_offsets = _dense(state_indices, has_initial_state.to(torch.uint8), cu_seqlens, chunk_offsets)
     sb = torch.empty(NH, nc, SREC_BYTES, dtype=torch.uint8, device=dev)
     ckpt = checkpoint_state is not None
     if ckpt:
         rows = checkpoint_rows if checkpoint_rows is not None else torch.arange(n, dtype=torch.int32, device=dev)
+        checkpoint_offsets, rows = _dense(checkpoint_offsets, rows)
         ck = (checkpoint_state.data_ptr(), checkpoint_state.stride(0) * 4, checkpoint_offsets.data_ptr(), rows.data_ptr())
     else:
         ck = (ws.data_ptr(), 0, ws.data_ptr(), ws.data_ptr())
