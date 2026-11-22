@@ -20,6 +20,8 @@ with the same text off the table. `<op>_shapes` lists the covered keys for load-
   (its reason checks the router -> experts hand-off); `moe_sort`: the sort by AITER; `moe_sort_capacity`: its rows.
 - `quantize_moe_activations`: the experts' MXFP4 activation codes and scales.
 - `mxfp4_moe_experts`: the routed experts, summed or as the slot buffer.
+- `swap_stream_workspaces`: lend the router's and experts' per-stream workspaces of one stream to another (a graph
+  capture stream), so a capture allocates no second set.
 - `latent_tail_comm`: the latent tail communicator; `allreduce_latent_rmsnorm_up_proj`,
   `allreduce_slots_rmsnorm_up_proj`: the tail on a summed partial or on the experts' slot buffer.
 - `layer_tail_runner`: the layer tail's per-rank state; `layer_tail_launch`: one layer's tail from a build mapping

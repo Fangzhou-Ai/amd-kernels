@@ -3,7 +3,7 @@
 """Shape-agnostic entries of the latent MoE decode ops (router, routed experts, latent tail, layer tail): each reads
 its key from the tensors (or the communicator / runner) and calls the shape package that serves it, imported on first
 use; ``<op>_unsupported_reason`` says why a call has no kernel."""
-from .dispatch import available
+from .dispatch import available, swap_stream_workspaces
 from .experts import (
     moe_sort,
     moe_sort_capacity,
@@ -42,6 +42,8 @@ from .router import (
     router_sigmoid_bias_topk_weight_reason,
 )
 
+
+
 __all__ = [
     "allreduce_latent_rmsnorm_up_proj", "allreduce_latent_rmsnorm_up_proj_shapes",
     "allreduce_latent_rmsnorm_up_proj_unsupported_reason", "allreduce_slots_rmsnorm_up_proj",
@@ -52,5 +54,5 @@ __all__ = [
     "moe_weights_unsupported_reason", "mxfp4_moe_experts", "mxfp4_moe_experts_shapes",
     "mxfp4_moe_experts_unsupported_reason", "quantize_moe_activations", "quantize_moe_activations_unsupported_reason",
     "router_aux", "router_sigmoid_bias_topk", "router_sigmoid_bias_topk_shapes",
-    "router_sigmoid_bias_topk_unsupported_reason", "router_sigmoid_bias_topk_weight_reason",
+    "router_sigmoid_bias_topk_unsupported_reason", "router_sigmoid_bias_topk_weight_reason", "swap_stream_workspaces",
 ]

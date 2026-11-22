@@ -89,3 +89,16 @@ def latent_down_xcd_local(device_index: int, on: bool, *, w: torch.Tensor) -> No
     if host is None:
         raise ValueError(_no_kernel(tuple(w.shape)))
     host._XCD_LOCAL[device_index] = bool(on)
+
+
+def latent_down_swap_stream_workspaces(device_index: int, stream_a: int, stream_b: int) -> None:
+    """Exchange the per-stream workspaces (partial slabs, tile tickets) of two streams on a device, dict keys only:
+    see ``latent_moe_common.swap_stream_workspaces``."""
+    import sys
+
+    for host in [sys.modules[n] for n in _SHAPE_HOSTS.values() if n in sys.modules]:
+        work = host._WORK
+        moved = {}
+        for key in [k for k in work if k[0] == device_index and k[1] in (stream_a, stream_b)]:
+            moved[(key[0], stream_b if key[1] == stream_a else stream_a, *key[2:])] = work.pop(key)
+        work.update(moved)

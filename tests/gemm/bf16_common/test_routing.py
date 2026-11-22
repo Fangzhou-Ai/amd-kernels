@@ -135,6 +135,20 @@ def test_latent_down_xcd_switch():
         host._XCD_LOCAL.update(saved)
 
 
+def test_latent_down_swap_stream_workspaces():
+    (n, k), = latent_down._SHAPE_HOSTS
+    host = latent_down._shape_host((n, k))
+    saved = dict(host._WORK)
+    try:
+        host._WORK.clear()
+        host._WORK.update({(0, 1): "a", (0, 2): "b", (1, 1): "c"})
+        latent_down.latent_down_swap_stream_workspaces(0, 1, 5)
+        assert host._WORK == {(0, 5): "a", (0, 2): "b", (1, 1): "c"}
+    finally:
+        host._WORK.clear()
+        host._WORK.update(saved)
+
+
 def test_linear_gather_routes(monkeypatch):
     for key, name in linear_gather._SHAPE_HOSTS.items():
         n_shard, k, world = key

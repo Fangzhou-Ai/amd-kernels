@@ -339,3 +339,22 @@ def test_layer_tail_reasons(gfx950, runner):
     with pytest.raises(ValueError) as e:
         E.layer_tail_launch(other, build, **launch_kw())
     assert str(e.value) == reason
+
+
+def test_swap_stream_workspaces_moves_keys_only(monkeypatch):
+    """Lending exchanges the two streams' entries of one device in every loaded host's dicts, objects unchanged, and
+    twice is the identity; another device's and another stream's entries stay."""
+    work = {(0, 1, 4, ()): "a4", (0, 2, 4, ()): "b4", (0, 1, 8, ()): "a8", (1, 1, 4, ()): "d1", (0, 3, 4, ()): "c4"}
+    aux = {(0, 1, 16): "x", (0, 2, 32): "y"}
+    slots = {(0, 1): "s"}
+    hosts = {router._SHAPE_HOSTS[(896, 7168, 16)]: SimpleNamespace(_WORK=work, _AUX_WORK=aux),
+             experts._SHAPE_HOSTS[(896, 768, 1792)]: SimpleNamespace(_WORK=slots)}
+    for name, host in hosts.items():
+        monkeypatch.setitem(sys.modules, name, host)
+    before = (dict(work), dict(aux), dict(slots))
+    E.swap_stream_workspaces(0, 1, 2)
+    assert work == {(0, 2, 4, ()): "a4", (0, 1, 4, ()): "b4", (0, 2, 8, ()): "a8", (1, 1, 4, ()): "d1",
+                    (0, 3, 4, ()): "c4"}
+    assert aux == {(0, 2, 16): "x", (0, 1, 32): "y"} and slots == {(0, 2): "s"}
+    E.swap_stream_workspaces(0, 2, 1)
+    assert (work, aux, slots) == before

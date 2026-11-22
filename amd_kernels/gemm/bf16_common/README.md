@@ -22,6 +22,7 @@ arguments of its op. The packed weights keep the raw weights' shapes: pass the e
 - `bf16_latent_down_mxfp4_quant`, `..._unsupported_reason`: the op and whether a call is served.
 - `bf16_latent_down_mxfp4_quant_shapes`, `..._weight_reason`: load-time coverage, from the weight (and bias) alone.
 - `latent_down_xcd_local`: turns the L2-local partial exchange off on a device (a kernel running beside it).
+- `latent_down_swap_stream_workspaces`: lend one stream's workspaces to another (a graph capture stream).
 - `linear_gather_comm`, `linear_gather_comm_unsupported_reason`: the collective communicator of the group.
 - `linear_gather_pack_weight`, `linear_gather_pack_aux` (+ `_unsupported_reason`), `linear_gather_packed_tiles`,
   `linear_gather_rows_buffer`: the load-time weight layout and the packed activations.

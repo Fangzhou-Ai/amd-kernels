@@ -96,3 +96,98 @@ def test_router_without_sort_and_into_out(chain):
     got = E.router_sigmoid_bias_topk(x, w, bias, 2.5, out)
     want = rh.router_sigmoid_bias_top16_e896_h7168(x, w, bias, 2.5)
     assert got[0] is out[0] and same(got[0], want[0]) and same(got[1], want[1])
+
+
+def test_borrowed_workspaces(chain):
+    """A stream that borrows another's workspaces (``swap_stream_workspaces``, the latent down projection's too)
+    makes no set of its own and gives the same bits; the set goes back the same way."""
+    from amd_kernels.gemm import bf16_common
+
+    w, bias, rh, eh, weights = chain
+    dev, m = w.device, 64
+    g = torch.Generator(device=dev).manual_seed(3)
+    x = (torch.randn(m, 7168, device=dev, generator=g) * 0.5).to(torch.bfloat16)
+    w_down = (torch.randn(3584, 7168, device=dev, generator=g) * 0.02).to(torch.bfloat16)
+    dh = importlib.import_module(bf16_common.latent_down._SHAPE_HOSTS[(3584, 7168)])
+    aux = E.router_aux(w, m, dev, zero_moe_buf=False)
+
+    def run(stream):
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            tw, ti = E.router_sigmoid_bias_topk(x, w, bias, 1.0, aux=aux)
+            codes, scales = bf16_common.bf16_latent_down_mxfp4_quant(x, w_down)
+            out = E.mxfp4_moe_experts(codes, scales, weights, E.moe_sort_from_aux(aux, weights=weights))
+        torch.cuda.synchronize()
+        return tw.clone(), ti.clone(), codes.clone(), scales.clone(), out.clone()
+
+    def swap(a, b):
+        E.swap_stream_workspaces(dev.index, a.cuda_stream, b.cuda_stream)
+        bf16_common.latent_down_swap_stream_workspaces(dev.index, a.cuda_stream, b.cuda_stream)
+
+    def sets():
+        return [sorted(k[1] for k in d) for d in (rh._WORK, rh._AUX_WORK, eh._WORK, dh._WORK)]
+
+    home, other = torch.cuda.Stream(), torch.cuda.Stream()
+    ref = run(home)
+    owned = sets()
+    assert all(other.cuda_stream not in s for s in owned)
+    swap(home, other)
+    got = run(other)
+    assert sets() == [sorted(other.cuda_stream if s == home.cuda_stream else s for s in d) for d in owned]
+    swap(other, home)
+    again = run(home)
+    assert sets() == owned
+    for a, b, c in zip(ref, got, again):
+        assert same(a, b) and same(a, c)
+
+
+def test_one_set_serves_eager_calls_and_replays(chain):
+    """A graph captured on a stream that borrowed the main stream's workspaces, then
+    replays and eager calls on the main stream in any order (one set, one stream
+    order): every result is the bits of the same call on a stream with its own set."""
+    from amd_kernels.gemm import bf16_common
+
+    w, bias, rh, eh, weights = chain
+    dev, m = w.device, 48
+    g = torch.Generator(device=dev).manual_seed(4)
+    w_down = (torch.randn(3584, 7168, device=dev, generator=g) * 0.02).to(torch.bfloat16)
+    inputs = [(torch.randn(m, 7168, device=dev, generator=g) * 0.5).to(torch.bfloat16) for _ in range(5)]
+    x = torch.empty_like(inputs[0])
+    aux = E.router_aux(w, m, dev, zero_moe_buf=False)
+
+    def body():
+        tw, ti = E.router_sigmoid_bias_topk(x, w, bias, 1.0, aux=aux)
+        codes, scales = bf16_common.bf16_latent_down_mxfp4_quant(x, w_down)
+        out = E.mxfp4_moe_experts(codes, scales, weights, E.moe_sort_from_aux(aux, weights=weights))
+        return tw, ti, codes, scales, out
+
+    own = torch.cuda.Stream()
+    want = []
+    for inp in inputs:
+        x.copy_(inp)
+        own.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(own):
+            want.append([t.clone() for t in body()])
+        torch.cuda.current_stream().wait_stream(own)
+    main, capture = torch.cuda.current_stream(), torch.cuda.Stream()
+    x.copy_(inputs[0])
+    body()
+    torch.cuda.synchronize()
+
+    def swap(a, b):
+        E.swap_stream_workspaces(dev.index, a.cuda_stream, b.cuda_stream)
+        bf16_common.latent_down_swap_stream_workspaces(dev.index, a.cuda_stream, b.cuda_stream)
+
+    swap(main, capture)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture):
+        outs = body()
+    swap(capture, main)
+    for i, replay in enumerate((True, False, True, True, False)):
+        x.copy_(inputs[i])
+        got = outs if replay else body()
+        if replay:
+            graph.replay()
+        torch.cuda.synchronize()
+        for a, b in zip(got, want[i]):
+            assert same(a, b), (i, replay)

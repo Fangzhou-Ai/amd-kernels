@@ -21,7 +21,7 @@ def available() -> bool:
 
 from .latent_down import (bf16_latent_down_mxfp4_quant, bf16_latent_down_mxfp4_quant_shapes,  # noqa: E402
                           bf16_latent_down_mxfp4_quant_unsupported_reason, bf16_latent_down_mxfp4_quant_weight_reason,
-                          latent_down_xcd_local)
+                          latent_down_swap_stream_workspaces, latent_down_xcd_local)
 from .linear_gather import (bf16_linear_gather, bf16_linear_gather_shapes,  # noqa: E402
                             bf16_linear_gather_unsupported_reason, linear_gather_comm,
                             linear_gather_comm_unsupported_reason, linear_gather_pack_aux,
@@ -31,6 +31,7 @@ from .linear_gather import (bf16_linear_gather, bf16_linear_gather_shapes,  # no
 __all__ = ["available", "bf16_latent_down_mxfp4_quant", "bf16_latent_down_mxfp4_quant_shapes",
            "bf16_latent_down_mxfp4_quant_unsupported_reason", "bf16_latent_down_mxfp4_quant_weight_reason",
            "bf16_linear_gather", "bf16_linear_gather_shapes", "bf16_linear_gather_unsupported_reason",
-           "latent_down_xcd_local", "linear_gather_comm", "linear_gather_comm_unsupported_reason",
-           "linear_gather_pack_aux", "linear_gather_pack_aux_unsupported_reason", "linear_gather_pack_weight",
-           "linear_gather_packed_tiles", "linear_gather_rows_buffer"]
+           "latent_down_swap_stream_workspaces", "latent_down_xcd_local", "linear_gather_comm",
+           "linear_gather_comm_unsupported_reason", "linear_gather_pack_aux",
+           "linear_gather_pack_aux_unsupported_reason", "linear_gather_pack_weight", "linear_gather_packed_tiles",
+           "linear_gather_rows_buffer"]
