@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 from tests.gemm.bf16_linear_gather_n896_k35840_ranks8.multi_gpu8 import run_on_8_gpus
 
-SERVED = (1, 8, 12, 16, 17, 32, 33, 40, 48, 49, 65, 80, 81, 96, 128, 129, 144, 192)
+SERVED = (1, 8, 12, 16, 17, 32, 33, 40, 48, 49, 65, 80, 81, 96, 128, 129, 144, 192, 193, 200, 240, 241, 256)
 
 
 def worker(rank, errors):

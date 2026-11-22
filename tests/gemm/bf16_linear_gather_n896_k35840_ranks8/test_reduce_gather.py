@@ -10,7 +10,7 @@ from amd_kernels.gemm.bf16_linear_gather_n896_k35840_ranks8.reference import N_F
 
 from tests.gemm.bf16_linear_gather_n896_k35840_ranks8.multi_gpu8 import run_on_8_gpus
 
-ROWS = (1, 12, 40, 65, 80, 192)
+ROWS = (1, 12, 40, 65, 80, 192, 240, 256)
 SPLITS = (1, 7, 35)
 
 

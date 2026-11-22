@@ -6,7 +6,7 @@ import torch
 from amd_kernels.gemm.bf16_linear_gather_n896_k35840_ranks8 import host
 from amd_kernels.gemm.bf16_linear_gather_n896_k35840_ranks8.reference import K, N_SHARD, linear_reference
 
-ROWS = (1, 12, 16, 17, 32, 40, 48, 49, 65, 80, 81, 128, 129, 192)
+ROWS = (1, 12, 16, 17, 32, 40, 48, 49, 65, 80, 81, 128, 129, 192, 193, 200, 240, 241, 256)
 
 
 @pytest.fixture(scope="module")

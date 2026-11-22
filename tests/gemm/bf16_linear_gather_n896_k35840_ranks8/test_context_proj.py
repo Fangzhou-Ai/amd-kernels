@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""The eight-rank sharded projection + gather + RMSNorm against reference.py: eager and graph calls, repeats."""
+"""The eight-rank sharded projection + gather + RMSNorm against reference.py: eager and graph calls, repeats; zero rows
+and NaN rows past ``rows`` in the aux states."""
 import torch
 import torch.distributed as dist
 from amd_kernels.gemm.bf16_linear_gather_n896_k35840_ranks8 import ProjComm, context_proj_gather_norm, host
@@ -9,7 +10,7 @@ from amd_kernels.gemm.bf16_linear_gather_n896_k35840_ranks8.reference import (K,
 
 from tests.gemm.bf16_linear_gather_n896_k35840_ranks8.multi_gpu8 import run_on_8_gpus
 
-ROWS = (12, 40, 65, 80, 192)
+ROWS = (12, 40, 65, 80, 192, 200, 240, 256)
 
 
 def shard_weight(r, dev):
@@ -25,18 +26,25 @@ def worker(rank, errors, rows_list):
     nw = (torch.rand(N_FULL, generator=torch.Generator().manual_seed(5)) + 0.5).bfloat16().to(dev)
     for rows in rows_list:
         g = torch.Generator().manual_seed(rows)
-        aux = [(torch.randn(rows, K // 5, generator=g) * 0.4).bfloat16().to(dev) for _ in range(5)]
+        nan = torch.full((5, K // 5), float("nan"))
+        src = [torch.cat([torch.randn(rows, K // 5, generator=g) * 0.4, nan]).bfloat16().to(dev) for _ in range(5)]
+        zero = (0, rows - 1) if rows > 40 else ()
+        for h in src:
+            h[list(zero)] = 0
+        aux = [h[:rows] for h in src]
         x = torch.cat(aux, dim=-1)
+        live = x.any(dim=1)
         xp = host.packed_rows_buffer(rows, dev)
         host.pack_aux(aux, xp, rows)
         shards = [linear_reference(x, shard_weight(r, dev)) if r != rank else linear_reference(x, w) for r in range(8)]
         ref = gather_norm_reference(shards, nw, 1e-6)
 
         def check(out, tag):
-            cos = torch.nn.functional.cosine_similarity(out.float(), ref.float(), dim=1).min().item()
-            rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
-            if not (cos >= 0.99999 and rel <= 1e-3):
-                errors.append(f"rank {rank} rows {rows} {tag}: cos {cos} rel {rel}")
+            o, r = out[live].float(), ref[live].float()
+            cos = torch.nn.functional.cosine_similarity(o, r, dim=1).min().item()
+            rel = ((o - r).norm() / r.norm()).item()
+            if not (cos >= 0.99999 and rel <= 1e-3) or out[~live].any() or not bool(torch.isfinite(out).all()):
+                errors.append(f"rank {rank} rows {rows} {tag}: cos {cos} rel {rel}, zero rows / finite")
 
         out = context_proj_gather_norm(comm, xp, wp, nw, rows)
         torch.cuda.synchronize()

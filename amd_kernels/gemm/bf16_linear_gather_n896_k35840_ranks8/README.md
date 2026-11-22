@@ -5,7 +5,7 @@
 The DSpark drafter's `context_proj` + `context_norm` of Kimi-K3.1 at TP8: the five aux hidden states [rows, 7168]
 (K 35840) times the replicated bf16 weight [7168, 35840] (514 MB), then RMSNorm. Each rank keeps only its 896-row shard
 (64 MB, packed at load), computes its 896 columns for all rows, and the eight shards are gathered and normalized on
-every rank: bf16 [rows, 7168] out, 1-192 rows. Two launches: the split-K projection (fp32 slabs) and one kernel that
+every rank: bf16 [rows, 7168] out, 1-256 rows. Two launches: the split-K projection (fp32 slabs) and one kernel that
 sums the slabs in a fixed order, posts the bf16 slice into every rank's mailbox, collects the eight slices and
 normalizes (the mailbox protocol is in `reduce_gather.py`). Contract (`reference.py`): fp64 product rounded once to
 bf16, then `bf16(x * rsqrt(mean(x^2) + eps) * w)` in fp32; cosine >= 0.99999, relative L2 <= 1e-3, bitwise repeatable
@@ -32,12 +32,14 @@ all-gather of the output (5 us + 7/8 x bytes / 400 GB/s).
 
 | rows | replicated GEMM + norm | sharded GEMM + AITER all-gather + norm | this entry | floor | % of floor |
 |---|---|---|---|---|---|
-| 40 | 91.7 | 30.9 | 22.3 | 17.6 | 79 |
-| 65 | 95.1 | 34.4 | 26.4 | 18.3 | 69 |
-| 80 | 97.5 | 35.8 | 27.9 | 18.8 | 67 |
-| 192 | 143.9 | 45.4 | 47.0 | 22.3 | 47 |
+| 40 | 91.0 | 31.0 | 22.5 | 17.6 | 78 |
+| 65 | 95.0 | 34.3 | 26.4 | 18.3 | 69 |
+| 80 | 97.2 | 35.8 | 27.8 | 18.8 | 68 |
+| 192 | 142.6 | 45.7 | 47.1 | 22.3 | 47 |
+| 240 | 141.9 | 50.5 | 54.4 | 23.8 | 44 |
+| 256 | 134.1 | 54.3 | 56.5 | 24.3 | 43 |
 
-`pack_aux` (eager, in place of the staging copy): 2.4 / 3.0 / 3.2 / 5.1 us.
+`pack_aux` (eager, in place of the staging copy): 2.4 / 2.9 / 3.0 / 5.1 / 7.5 / 9.2 us.
 
 ## Tests
 

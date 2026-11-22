@@ -16,7 +16,7 @@ import sys
 import torch
 import torch.distributed as dist
 
-CONFS = {"c16": 40, "c24": 65, "c32": 80, "c48": 192}
+CONFS = {"c16": 40, "c24": 65, "c32": 80, "c48": 192, "c48 k4": 240}
 CEIL_US = 11.34  # 64 MB cold HBM read, measured: 5.9 TB/s incl. launch
 
 

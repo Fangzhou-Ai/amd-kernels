@@ -11,7 +11,7 @@ through unchanged, so its outputs are the package's bits.
   `gemm/bf16_latent_down_mxfp4_quant_k7168_n3584`.
 - `bf16_linear_gather`: RMSNorm of the full [rows, N shard x world] projection on every rank of a group, from the
   packed activations and this rank's packed weight shard, key (N shard, K, world);
-  `gemm/bf16_linear_gather_n896_k35840_ranks8`.
+  `gemm/bf16_linear_gather_n896_k35840_ranks8`, 1-256 rows.
 
 A reason function is host-only (shapes, dtypes, strides, ints; no device read, no allocation) and takes exactly the
 arguments of its op. The packed weights keep the raw weights' shapes: pass the entry's `pack` output.
