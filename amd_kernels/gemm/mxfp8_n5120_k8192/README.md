@@ -13,9 +13,8 @@ fixed-order). Producer: `gemm/mxfp8_grouped_g8_n1024_k4096` MXFP8 epilogue, or b
   this folder is registered in `gemm._SHAPE_HOSTS` (`linear`, `covers`).
 - `gemm.mxfp8_n5120_k8192.mxfp8_linear`: the GEMM from a bf16 activation; fresh bf16 output, graph-capture safe, `serves(m)` tells where it beat the served path.
 - `gemm.mxfp8_n5120_k8192.preshuffle_weight`: the load-time weight and scale preshuffle (32 x 32 block scales accepted).
-- `gemm.mxfp8_n5120_k8192.preshuffle_weight_scale`: only the scales, for the served linear's weight, which already has the
-  codes' layout (no weight copy). `serves_after_wo_a(m)`: whether wo_a's bf16 output through `mxfp8_linear` beats wo_a's
-  MXFP8 epilogue + AITER on its codes (769-1024 rows).
+- `gemm.mxfp8_n5120_k8192.preshuffle_weight_scale`: only the scales, for the served linear's weight (no weight copy).
+- `gemm.mxfp8_n5120_k8192.serves_after_wo_a`: whether wo_a's bf16 output through `mxfp8_linear` beats the served pair.
 - `gemm.mxfp8_n5120_k8192.warmup_mxfp8_linear`: compiles every row and creates the split-K counters before graph capture.
 - `kernel.py`: the row table (kernel, tile, K-waves, split-K, `serves`); the kernels are `gemm/mxfp8_decode_prequant` and `gemm/mxfp8_common`.
 
@@ -34,19 +33,19 @@ with AITER PR #6605.
 | 256 | 25.86 | 29.01 | 29.03 | 1.12x |
 | 384 | 30.08 | 34.19 | 34.19 | 1.14x |
 | 512 | 33.54 | 39.36 | 39.09 | 1.17x |
+| 640 pair | 66.8 | 73.2 | - | 1.10x |
+| 768 pair | 74.2 | 76.7 | - | 1.03x |
+| 769 pair | 77.6 | 85.6 | - | 1.10x |
+| 800 pair | 78.8 | 87.0 | - | 1.10x |
+| 848 pair | 78.9 | 85.6 | - | 1.08x |
+| 896 pair | 80.1 | 88.8 | - | 1.11x |
+| 960 pair | 86.1 | 88.5 | - | 1.03x |
+| 1024 pair | 87.7 | 92.8 | - | 1.06x |
 
 Falls back to the served path (AITER) at M = 16, 32, 64, 128, 192 (and rows between them). Rows 513-1024 run the decode
-kernel on the shuffled-quantized bf16 (`kernel.LINEAR`: 96x80 up to 640, 112x80 up to 768, 128x80 up to 1024 rows, 2 K-waves).
-
-Chain, wo_a's bf16 output + `mxfp8_linear` vs wo_a's MXFP8 epilogue + AITER on its codes (the served pair), us per pair
-(rows 528-736 also win, by 0.6-6.8 us):
-
-| M | 640 | 768 | 769 | 800 | 848 | 896 | 960 | 1024 |
-|---|---|---|---|---|---|---|---|---|
-| served pair | 73.2 | 76.7 | 85.6 | 87.0 | 85.6 | 88.8 | 88.5 | 92.8 |
-| this entry | 66.8 | 74.2 | 77.6 | 78.8 | 78.9 | 80.1 | 86.1 | 87.7 |
-
-rel. L2 to the served pair <= 1.7e-5.
+kernel on the shuffled-quantized bf16 (`kernel.LINEAR`: 96x80 up to 640, 112x80 up to 768, 128x80 up to 1024 rows, 2
+K-waves). `pair` rows: us per wo_a + wo_b pair, wo_a's bf16 output + `mxfp8_linear` against wo_a's MXFP8 epilogue +
+AITER on its codes (the served pair; rel. L2 <= 1.7e-5); rows 528-736 also win, by 0.6-6.8 us.
 
 Limit: at M 16 the HBM weight stream, 8.02 us for 43.3 MB; achieved 11.72 us (68%). At 848 rows fp8 MFMA at the
 power-capped clock (3.46 PF measured with 256 CUs busy), then the per-kernel latency chain; quantizer launch + GEMM

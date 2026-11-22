@@ -29,8 +29,8 @@ An entry (`amd_kernels.warm_up`): the first call per column split compiles every
 ## Performance
 
 One MI355X; one graph of 100 launches with their own activations and 8 cycled weight copies, A B B A, median of 5 x 10
-replays, us per call (a second run within 0.1 us; the 848 and 1024 rows are one run, and 769 / 800 / 896 / 960 rows lie
-between their neighbours' ratios, 1.12-1.40x). The baseline is two launches: `torch.mm(x, wa^T, out_dtype=float32)`
+replays, us per call (a second run within 0.1 us; the 848 and 1024 rows are one run; a separate run at 769 / 800 / 848 /
+896 / 960 / 1024 rows measured 1.12-1.40x over the three column splits). The baseline is two launches: `torch.mm(x, wa^T, out_dtype=float32)`
 and `F.linear(x, wb)`; NA = 0 is the second launch alone.
 
 | Rows | NA 1024 | Baseline | NA 512 | Baseline | NA 0 | Baseline |

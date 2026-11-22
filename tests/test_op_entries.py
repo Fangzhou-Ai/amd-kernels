@@ -164,6 +164,10 @@ def test_mxfp8_linear_registry_covers_the_new_shapes():
     assert G.mxfp8_linear_blocker(32, 4096, 1280, prequant=True) is None
     assert G.mxfp8_linear_blocker(16, 4096, 1280, prequant=True) is not None
     assert G.mxfp8_linear_blocker(16, 5120, 2304, prequant=True) is None
+    assert G.mxfp8_linear_blocker(848, 32768, 1280, prequant=True) is None
+    assert G.mxfp8_linear_blocker(768, 32768, 1280, prequant=True) is not None
+    assert G.mxfp8_linear_blocker(1025, 32768, 1280, prequant=True) is not None
+    assert G.mxfp8_linear_blocker(1024, 5120, 8192) is None
     assert G.mxfp8_linear_blocker(16, 5120, 15360) is not None and G.mxfp8_linear_blocker(640, 5120, 15360) is None
     assert G.mxfp8_linear_blocker(16, 1792, 5120, torch.float16) is not None
     assert G.mxfp8_linear_blocker(16, 2560, 6144) is None

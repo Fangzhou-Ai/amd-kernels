@@ -3,8 +3,8 @@
 ## What it does
 
 One launch per rank for a whole EP MoE layer of DeepSeek-V4.1-Flash (384 experts over 8 ranks, `epr` = 48 local experts
-by default; any `epr` <= 63 is a shape parameter, 56 and 63 are tested): MXFP8 quantize of bf16 rows (or MXFP8 rows as
-given), dispatch to the owner ranks (one row per distinct destination), route records, GEMM1 with
+by default; any `epr` <= 63 is a shape parameter, 48, 49, 56 and 63 are tested): MXFP8 quantize of bf16 rows (or MXFP8
+rows as given), dispatch to the owner ranks (one row per distinct destination), route records, GEMM1 with
 `silu(min(g, 10)) * clamp(u, -10, 10)` and MXFP8 requant in the epilogue, GEMM2 with route weights and a return of each
 weighted row to the token's rank as its tile finishes, deterministic combine. Out: bf16 `[rows, 5120]`. Weights MXFP4 in
 AITER's shuffle layouts. No output atomics or fences, bitwise repeatable, graph capturable, counters reset by the kernel.
@@ -39,8 +39,8 @@ routes (ROCm/aiter#7788, `mega_moe_small_m.py`).
 | fused hot | 109.9 | 154.6 | 206.7 | 239.5 | 410.2 | 570.9 | 1033.6 | 1246.5 | 1813.0 |
 | #7788 hot | 112.7 | 167.8 | 227.4 | 311.8 | 513.5 | 621.5 | 1131 | 1495 | 2200 |
 
-No loss at any T and routing (uniform T 1 / 64 / 128 tie, 1.01-1.02x); route records interleave over an expert's blocks
-(zipf T 384-768 -14 %). Unequal rows per rank (one full rank + 1/8 elsewhere, ramp, 192 / 384 tokens): 1.10-1.22x.
+No loss at any T and routing (uniform T 1 / 64 / 128 tie, 1.01-1.02x). Unequal rows per rank (one full rank + 1/8
+elsewhere, ramp, 192 / 384 tokens): 1.10-1.22x.
 
 Limit (uniform, phases from `AKR_EP_TRACE=1`): to T 192 the HBM weight stream binds, 87-94 % of the measured
 7.15 TB/s inside the GEMM loops but 71-77 % for the whole call (arrival, tail and the first tile leave HBM idle); from

@@ -141,14 +141,17 @@ def test_dispatch_grid_within_cus():
 def test_warmup_covers_every_size():
     from flydsl.compiler.jit_function import MlirCompiler
 
-    warmup_mhc_post_pre_rmsnorm()
+    from amd_kernels import warm_up
+
+    warm_up.set_auto(True)  # tests/__init__.py turns it off for the single-size tests
     orig = MlirCompiler.compile
-
-    def unexpected(*a, **kw):
-        raise AssertionError("compile after warm-up")
-
-    MlirCompiler.compile = unexpected
     try:
+        warmup_mhc_post_pre_rmsnorm()
+
+        def unexpected(*a, **kw):
+            raise AssertionError("compile after warm-up")
+
+        MlirCompiler.compile = unexpected
         for m in (16, 64, 128, 256, 384, 512, 768):
             d = make(m)
             run(d, quant=True)
@@ -156,3 +159,4 @@ def test_warmup_covers_every_size():
         torch.cuda.synchronize()
     finally:
         MlirCompiler.compile = orig
+        warm_up.set_auto(False)
