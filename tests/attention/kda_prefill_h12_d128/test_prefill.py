@@ -190,9 +190,8 @@ def test_conv_state_slots_past_2gb(impl):
                          ids=["two_fresh", "five"])
 @torch.inference_mode()
 def test_strided_state_indices(impl, seq, init):
-    """vLLM passes the state indices as the column view ``block_table[:, 0]`` (row stride 1 + speculative blocks). Every sequence
-    must read and write its own slot: the walk read ``state_indices[n]`` at unit stride before, so sequences past the first
-    took their initial state from, and wrote their final state into, other requests' blocks."""
+    """State indices as vLLM's column view ``block_table[:, 0]`` (row stride 1 + speculative blocks): every sequence reads and
+    writes its own slot and no other slot changes."""
     require_gfx950()
     n = len(seq)
     c = make_case(seq, init=init, slots=4 * n + 1)
@@ -207,3 +206,21 @@ def test_strided_state_indices(impl, seq, init):
         assert torch.equal(conv[s], ref_conv[s])
     for s in bt[:, 1:].flatten().tolist() + [4 * n]:
         assert torch.equal(state[s], c["state_cache"][s]), f"slot {s} (no sequence) was written"
+
+
+@pytest.mark.parametrize("impl", IMPLS)
+@torch.inference_mode()
+def test_strided_checkpoint_views(impl):
+    """Column views for the state indices, initial-state flags and checkpoint offsets / rows give the bits of packed copies."""
+    require_gfx950()
+    seq, offs, rows = [2048, 300, 640], [1024, 256, 0], [3, 1, 0]
+    c = make_case(seq, init=[True, False, True], slots=12, dt_shift=-6.0)
+    col = lambda x: torch.stack([x, torch.zeros_like(x)], 1)[:, 0]
+    ck_off = torch.tensor(offs, dtype=torch.int32, device="cuda")
+    ck_rows = torch.tensor(rows, dtype=torch.int32, device="cuda")
+    ck, ck_strided = torch.zeros(2, 4, R.NH, R.D, R.D, device="cuda")
+    packed = run(c, impl, checkpoint_state=ck, checkpoint_offsets=ck_off, checkpoint_rows=ck_rows)
+    s = dict(c, state_indices=col(c["state_indices"]), has_initial_state=col(c["has_initial_state"]))
+    strided = run(s, impl, checkpoint_state=ck_strided, checkpoint_offsets=col(ck_off), checkpoint_rows=col(ck_rows))
+    assert all(torch.equal(a, b) for a, b in zip(packed, strided))
+    assert torch.equal(ck, ck_strided) and ck[3].any() and ck[1].any()

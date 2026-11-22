@@ -32,8 +32,7 @@ NUM_CUS = 256
 
 
 def _dense(*xs):
-    """The kernels index these per sequence from a raw pointer: unit-stride copies of strided views (vLLM's state indices are
-    ``block_table[:, 0]``)."""
+    """Unit-stride copies of strided per-sequence views (vLLM's ``block_table[:, 0]``): the kernels index them from a raw pointer."""
     return tuple(x if x.is_contiguous() else x.contiguous() for x in xs)
 
 
