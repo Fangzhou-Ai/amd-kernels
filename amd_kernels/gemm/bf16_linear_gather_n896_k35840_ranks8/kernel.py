@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Split-K bf16 GEMM of an N-shard (896 rows) of the K 35840 projection for up to 192 activation rows (gfx950).
+"""Split-K bf16 GEMM of an N-shard (896 rows) of the K 35840 projection for up to 256 activation rows (gfx950).
 
 Both operands are in the load-time MFMA layout (``pack.py``): one (16 rows, 32 K) tile is 1 KB contiguous in lane
 order, so every wave load of weights or activations is one coalesced 1 KB. The weights are the MFMA's first operand,

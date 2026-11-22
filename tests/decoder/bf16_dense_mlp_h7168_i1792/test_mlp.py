@@ -60,7 +60,7 @@ def test_padding_and_zero_rows(weights, rows):
     padded = torch.full((tiles * 16, HIDDEN), float("nan"), dtype=torch.bfloat16, device="cuda")
     padded[:rows] = x
     xp = pack_rows(padded, tiles)
-    act_ref, out_ref = mlp_reference(x, gu, dn)
+    _, out_ref = mlp_reference(x, gu, dn)
     out = dense_mlp(ws, xp, gup, dnp, rows)
     torch.cuda.synchronize()
     assert bool(torch.isfinite(out).all()), rows
