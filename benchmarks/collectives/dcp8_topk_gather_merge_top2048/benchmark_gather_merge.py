@@ -25,7 +25,7 @@ WORLD, K, PAGE, STRIDE, BLOCKS = 8, 2048, 64, 72, 64
 XGMI_OUT_GBS = 343
 LATENCY_FLOOR_US = 6.7
 PUSH_BYTES_ROW = 7 * (8 + 4 * 512)
-ROWS = tuple(int(x) for x in __import__("os").environ.get("ROWS", "12,24,40,65,80,128,192").split(","))
+ROWS = tuple(int(x) for x in os.environ.get("ROWS", "12,24,40,65,80,128,192").split(","))
 
 
 def inputs(rank, rows, dev, n=100):
@@ -114,23 +114,6 @@ def run(rank, port, with_stock):
                 print(f"   stock parts: all-gather {t_g:.1f} us, merge_dcp_scores {t_m:.1f} us", flush=True)
         else:
             t_s = t_g = float("nan")
-        if os.environ.get("DCP8_TIMING"):
-            g2 = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g2):
-                for s_ in sets[:20]:
-                    comm(*s_, PAGE, STRIDE)
-            for _ in range(3):
-                dist.barrier(group)
-                g2.replay()
-            torch.cuda.synchronize()
-            d = comm.dbg.view(MAX_ROWS, 32)[:rows, :28].cpu()
-            if rank == 0:
-                d = (d - d[:, :1]).double() * 10 / 1000
-                m = d.mean(0).tolist()
-                names = {26: "scores loaded", 27: "cut known", 1: "keys pushed", 2: "headers received", 21: "keys received", 22: "hist done", 3: "bin picked", 23: "pass1", 24: "pass2",
-                         12: "prior", 6: "thr bcast", 7: "counts done"}
-                print("   phases (us from kernel start, mean over rows):", ", ".join(f"{n} {m[k]:.1f}" for k, n in names.items()),
-                      "| last row end %.1f" % d[-1, 7].item(), flush=True)
         s0, i0, b0, o0, p0 = sets[0]
         comm(s0, i0, b0, o0, p0, PAGE, STRIDE)
         torch.cuda.synchronize()

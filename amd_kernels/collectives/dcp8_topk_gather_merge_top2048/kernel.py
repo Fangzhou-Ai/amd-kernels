@@ -24,8 +24,7 @@ Two receive slots (call parity) bound peer lead and lag: a peer starts call c + 
 rank cannot end call c + 1 before every peer pushed its first round of c + 1, which follows that peer's reads of call c.
 Receivers zero what they read at the end of the call. The device counter is advanced by the last workgroup to arrive
 (ticket) after every workgroup has read it, so graph replays never reuse a host sequence. Waits are atomic loads (a
-plain-load wait loop is deleted by the compiler) and bounded by SPIN_LIMIT; DCP8_TIMING=1 builds stamp the phases
-into the debug buffer. Outputs use plain stores.
+plain-load wait loop is deleted by the compiler) and bounded by SPIN_LIMIT. Outputs use plain stores.
 """
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -64,7 +63,6 @@ SPIN_LIMIT = 1 << 28
 SLEEP = 1
 STAG = 2
 STAG_MIN_ROWS = 64
-TIMING = bool(__import__("os").environ.get("DCP8_TIMING"))
 
 
 def _now():
@@ -133,7 +131,7 @@ def _make_storage():
 def compile_topk_gather_merge():
     @flyc.kernel(name="dcp8_topk_gather_merge_top2048", known_block_size=[NT, 1, 1])
     def kernel(arg_scores: fx.Int64, arg_idx: fx.Int64, arg_bt: fx.Int64, arg_slots: fx.Int64, arg_indptr: fx.Int64,
-               arg_ctl: fx.Int64, arg_counts: fx.Int64, arg_dbg: fx.Int64,
+               arg_ctl: fx.Int64, arg_counts: fx.Int64,
                p0: fx.Int64, p1: fx.Int64, p2: fx.Int64, p3: fx.Int64, p4: fx.Int64, p5: fx.Int64, p6: fx.Int64, p7: fx.Int64,
                rows: fx.Int32, rank: fx.Int32, scores_stride: fx.Int32, idx_stride: fx.Int32, bt_stride: fx.Int32,
                page_size: fx.Int32, block_stride: fx.Int32):
@@ -242,12 +240,6 @@ def compile_topk_gather_merge():
                 if tid + e * NT < cnt:
                     buffer_ops.buffer_store(fx.Int32(0), rr, off + tid + e * NT, cache_modifier=SYS)
 
-        def stamp(dbg, row_, tid_, k):
-            if const_expr(TIMING):
-                if tid_ == 0:
-                    _ptr(dbg + fx.Int64(row_ * 32 + k) * 8, T.i64)[0] = _now()
-
-        stamp(arg_dbg, row, tid, 0)
         if tid == 0:
             for i in range_constexpr(48):
                 s_acc[i] = 0
@@ -270,7 +262,6 @@ def compile_topk_gather_merge():
         mine = Vec(buffer_ops.buffer_load(sr, tid * EPT, vec_width=EPT, dtype=fx.Int32))
         u = [_key(mine[i]) for i in range_constexpr(EPT)]
         _barrier()
-        stamp(arg_dbg, row, tid, 26)
         real = [_ugt(u[i], fx.Int32(NINF_KEY)) for i in range_constexpr(EPT)]
         bins_i = [(u[i] >> fx.Int32(HIST_SHIFT)) & fx.Int32(NB - 1) for i in range_constexpr(EPT)]
         ninf = fx.Int32(0)
@@ -297,7 +288,6 @@ def compile_topk_gather_merge():
             s_acc[9] = low_lo.select(2 * tid, 2 * tid + 1)
             s_acc[10] = low_lo.select(ge_lo, ge_hi)
         _barrier()
-        stamp(arg_dbg, row, tid, 27)
         cut = s_acc[9]
         n_e = s_acc[10]
         hit_s = [real[i] & (bins_i[i] >= cut) for i in range_constexpr(EPT)]
@@ -329,7 +319,6 @@ def compile_topk_gather_merge():
             dst = buffer_ops.create_buffer_resource_from_addr(peer_base[j - 1] + SPEC_OFF, num_records_bytes=16 + SPEC_E * 4)
             buffer_ops.buffer_store(kv, dst, 16 + 16 * tid, mask=tid < SPEC_E // 4, cache_modifier=SYS, offset_is_bytes=True)
             buffer_ops.buffer_store(hdr2, dst, 0, mask=tid == 0, cache_modifier=SYS)
-        stamp(arg_dbg, row, tid, 1)
 
         ir_ = buffer_ops.create_buffer_resource_from_addr(arg_idx + fx.Int64(row * idx_stride) * 4, num_records_bytes=K * 4)
         local = Vec(buffer_ops.buffer_load(ir_, tid * EPT, vec_width=EPT, dtype=fx.Int32))
@@ -357,7 +346,6 @@ def compile_topk_gather_merge():
                 w_ = fx.Int32(_poll(own_pool + region0 + ((rank + j) % WORLD) * REGION_BYTES + SPEC_ELEM_OFF + fx.Int64(tid) * 4, T.i32))
                 se0[j - 1] = (se0[j - 1] == fx.Int32(0)).select(w_, se0[j - 1])
                 pend = pend + (se0[j - 1] == fx.Int32(0)).select(fx.Int32(1), fx.Int32(0))
-        stamp(arg_dbg, row, tid, 21)
         if tid < WORLD - 1:
             h_lo = hv.to(fx.Int32)
             h_hi = (hv >> 32).to(fx.Int32)
@@ -371,7 +359,6 @@ def compile_topk_gather_merge():
             s_acc[48 + tid] = (h_hi & fx.Int32(0xFFFF)) - 1
             s_acc[40 + tid] = (h_hi >> fx.Int32(16)) - 1
         _barrier()
-        stamp(arg_dbg, row, tid, 2)
         lob = cut
         valid_t = tot_o
         prior_ninf = fx.Int32(0)
@@ -388,7 +375,6 @@ def compile_topk_gather_merge():
             hit = oks[k] & (bk >= lob)
             lds_add(s_gh, hit.select(bk, fx.Int32(NB) + lane) + (lane & fx.Int32(GHC - 1)) * (NB + 64), fx.Int32(1))
         _barrier()
-        stamp(arg_dbg, row, tid, 22)
         g0 = s_gh[2 * tid]
         g1 = s_gh[2 * tid + 1]
         for cpy in range_constexpr(1, GHC):
@@ -404,7 +390,6 @@ def compile_topk_gather_merge():
             s_acc[3] = 2 * tid
             s_acc[4] = fx.Int32(K) - above_t - g1
         _barrier()
-        stamp(arg_dbg, row, tid, 3)
 
         if (valid_t >= K) & (valid < K):
             hd = (c0 | fx.Int32(0x8000)) | ((c1 | fx.Int32(0x8000)) << fx.Int32(16))
@@ -502,7 +487,6 @@ def compile_topk_gather_merge():
                     s_acc[13] = 1
                     s_acc[14] = (mx + SEG - 1) // SEG
                 _barrier()
-            stamp(arg_dbg, row, tid, 5)
             cl = [s_acc[32 + p] for p in range_constexpr(WORLD)]
             nr = s_acc[14]
             prefix = bsel << fx.Int32(HIST_SHIFT)
@@ -535,7 +519,6 @@ def compile_topk_gather_merge():
                             s_state[sb + 6] = rem - run
                         run = run + c
                 _barrier()
-                stamp(arg_dbg, row, tid, 23 + pi)
                 prefix = s_state[sb + 4]
                 dmask = s_state[sb + 5]
                 rem = s_state[sb + 6]
@@ -554,12 +537,10 @@ def compile_topk_gather_merge():
             incp = inclusive(pr)
             if lane == fx.Int32(63):
                 lds_add(s_acc, 1, incp)
-            stamp(arg_dbg, row, tid, 12)
             if tid == 0:
                 s_state[12] = prefix
                 s_state[13] = rem
         _barrier()
-        stamp(arg_dbg, row, tid, 6)
 
         thr = s_state[12]
         room_all = s_state[13]
@@ -609,7 +590,6 @@ def compile_topk_gather_merge():
         if lane == fx.Int32(63):
             lds_add(s_acc, 2, incc)
         _barrier()
-        stamp(arg_dbg, row, tid, 7)
         base = s_acc[2]
         sl = buffer_ops.create_buffer_resource_from_addr(arg_slots, num_records_bytes=rows * K * 4)
         for i in range_constexpr(EPT):
@@ -641,11 +621,11 @@ def compile_topk_gather_merge():
     @flyc.jit
     def launch_dcp8_topk_gather_merge_top2048(
             arg_scores: fx.Int64, arg_idx: fx.Int64, arg_bt: fx.Int64, arg_slots: fx.Int64, arg_indptr: fx.Int64,
-            arg_ctl: fx.Int64, arg_counts: fx.Int64, arg_dbg: fx.Int64,
+            arg_ctl: fx.Int64, arg_counts: fx.Int64,
             p0: fx.Int64, p1: fx.Int64, p2: fx.Int64, p3: fx.Int64, p4: fx.Int64, p5: fx.Int64, p6: fx.Int64, p7: fx.Int64,
             rows: fx.Int32, rank: fx.Int32, scores_stride: fx.Int32, idx_stride: fx.Int32, bt_stride: fx.Int32,
             page_size: fx.Int32, block_stride: fx.Int32, stream: fx.Stream):
-        kernel(arg_scores, arg_idx, arg_bt, arg_slots, arg_indptr, arg_ctl, arg_counts, arg_dbg,
+        kernel(arg_scores, arg_idx, arg_bt, arg_slots, arg_indptr, arg_ctl, arg_counts,
                p0, p1, p2, p3, p4, p5, p6, p7,
                rows, rank, scores_stride, idx_stride, bt_stride, page_size, block_stride).launch(
             grid=(rows, 1, 1), block=(NT, 1, 1), stream=stream)

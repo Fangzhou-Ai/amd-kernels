@@ -26,7 +26,6 @@ class TopkGatherMerge:
         self.ptrs = [ptr if r == rank else _open_pool(h, self.device) for r, h in enumerate(handles)]
         self.ctl = torch.zeros(2, dtype=torch.int32, device=self.device)
         self.counts = torch.zeros(MAX_ROWS, dtype=torch.int64, device=self.device)
-        self.dbg = torch.zeros(MAX_ROWS * 32, dtype=torch.int64, device=self.device)
         self.closed = False
 
     def __call__(self, scores, local_idx, block_table, out_slots, out_indptr, page_size, block_stride_rows):
@@ -46,7 +45,7 @@ class TopkGatherMerge:
         assert out_slots.dtype == out_indptr.dtype == torch.int32 and out_slots.numel() >= rows * K and out_indptr.numel() > rows
         assert all(t.device == self.device for t in (scores, local_idx, block_table, out_slots, out_indptr))
         _run(_exe(), scores.data_ptr(), local_idx.data_ptr(), block_table.data_ptr(), out_slots.data_ptr(),
-             out_indptr.data_ptr(), self.ctl.data_ptr(), self.counts.data_ptr(), self.dbg.data_ptr(), *self.ptrs,
+             out_indptr.data_ptr(), self.ctl.data_ptr(), self.counts.data_ptr(), *self.ptrs,
              rows, self.rank, scores.stride(0), local_idx.stride(0), block_table.stride(0), page_size, block_stride_rows,
              torch.cuda.current_stream(self.device))
         return out_slots, out_indptr
