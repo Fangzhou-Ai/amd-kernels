@@ -34,13 +34,13 @@ routes (ROCm/aiter#7788, `mega_moe_small_m.py`).
 |---|---|---|---|---|---|---|---|---|---|
 | fused uniform | 46.9 | 145.0 | 155.2 | 168.2 | 178.8 | 187.8 | 228.3 | 306.0 | 354.8 |
 | staged / #7788 | 88 / 47.3 | 316 / 162 | 209 / 166 | 229 / 169 | 232 / 182 | 345 / 221 | 385 / 266 | 453 / 356 | 566 / 560 |
-| fused zipf | 41.6 | 104.4 | 137.2 | 172.0 | 240.3 | 299.0 | 494.7 | 620.2 | 878.9 |
+| fused zipf | 41.7 | 104.4 | 135.1 | 169.1 | 227.9 | 279.6 | 425.8 | 570.2 | 768.7 |
 | #7788 zipf | 44.2 | 114.4 | 150.2 | 204.5 | 283.8 | 334.7 | 492.5 | 624.5 | 932.5 |
-| fused hot | 108.8 | 155.3 | 207.7 | 237.9 | 403.7 | 571.2 | 1072 | 1283 | 1899 |
+| fused hot | 109.9 | 154.6 | 206.7 | 239.5 | 410.2 | 570.9 | 1033.6 | 1246.5 | 1813.0 |
 | #7788 hot | 112.7 | 167.8 | 227.4 | 311.8 | 513.5 | 621.5 | 1131 | 1495 | 2200 |
 
-No loss at any T and routing; ties within noise: uniform T 1 / 64 / 128 (1.01-1.02x), zipf 384 / 512 (1.00-1.01x).
-Unequal rows per rank (one full rank + 1/8 elsewhere, or a ramp, 192 / 384 tokens): 1.10-1.22x over the best baseline.
+No loss at any T and routing (uniform T 1 / 64 / 128 tie, 1.01-1.02x); route records interleave over an expert's blocks
+(zipf T 384-768 -14 %). Unequal rows per rank (one full rank + 1/8 elsewhere, ramp, 192 / 384 tokens): 1.10-1.22x.
 
 Limit (uniform, phases from `AKR_EP_TRACE=1`): to T 192 the HBM weight stream binds, 87-94 % of the measured
 7.15 TB/s inside the GEMM loops but 71-77 % for the whole call (arrival, tail and the first tile leave HBM idle); from

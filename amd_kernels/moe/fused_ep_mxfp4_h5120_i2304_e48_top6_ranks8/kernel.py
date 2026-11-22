@@ -313,7 +313,7 @@ def _gemm1_tile(*, world, epr, kw, pf, bm, ni, nbuf, nwv, hot=False):
     st_kw = {"cache_modifier": SC1}
 
     @flyc.jit
-    def tile(base, mb, nb, expert, j0, cnt, multi, rx, rxs, meta, W, WS, Q, S, rows, ready):
+    def tile(base, mb, nb, expert, j0, js, cnt, multi, rx, rxs, meta, W, WS, Q, S, rows, ready):
         tx = fx.thread_idx.x
         lane, wave = tx % 64, tx // 64
         l16, q16 = lane % 16, lane // 16
@@ -330,7 +330,7 @@ def _gemm1_tile(*, world, epr, kw, pf, bm, ni, nbuf, nwv, hot=False):
             ss = buffer_ops.create_buffer_resource(S, max_size=False, num_records_bytes=rows * (I // 32))
 
             def row_arena(r):
-                j = j0 + r
+                j = j0 + r * js
                 ok = j < cnt
                 w0 = fx.Int32(buffer_ops.buffer_load(mr_, (expert * arena + j) * 2, vec_width=1, dtype=fx.Int32,
                                                      mask=ok, cache_modifier=SYS))
@@ -562,7 +562,7 @@ def _gemm2_tile(*, world, epr, tn, bm, pf, nbuf, signal, hot, nwv):
     retire = _retire_fin_for(world)
 
     @flyc.jit
-    def tile(base, mb, nb, expert, j0, cnt, multi, meta, A, AS, W, WS, pools, rows, ready, done, nblk, ctls, me):
+    def tile(base, mb, nb, expert, j0, js, cnt, multi, meta, A, AS, W, WS, pools, rows, ready, done, nblk, ctls, me):
         tx = fx.thread_idx.x
         lane, wave = tx % 64, tx // 64
         l16, q16 = lane % 16, lane // 16
@@ -625,7 +625,7 @@ def _gemm2_tile(*, world, epr, tn, bm, pf, nbuf, signal, hot, nwv):
             acc = [[None] * ni for _ in range(mr)]
 
             def meta_word(row, which):
-                j = j0 + row
+                j = j0 + row * js
                 return fx.Int32(buffer_ops.buffer_load(mr_, (expert * arena + j) * 2 + which, vec_width=1,
                                                        dtype=fx.Int32, mask=j < cnt, cache_modifier=SYS))
 
@@ -633,7 +633,7 @@ def _gemm2_tile(*, world, epr, tn, bm, pf, nbuf, signal, hot, nwv):
             epi_dst = []
             for rr in range_constexpr(bm // rpp):
                 row = rr * rpp + tx // tpr
-                ok = (j0 + row) < cnt
+                ok = (j0 + row * js) < cnt
                 w0 = meta_word(row, 0)
                 token_row, slot = w0 & 0xFFFFFF, w0.shrui(fx.Int32(24))
                 src = ok.select(token_row // TM, fx.Int32(0))
@@ -1058,15 +1058,18 @@ def compile_fused(*, world, epr, nd, nw, bm, kw, pf1, ni, nb1, tn2, pf2, nb2, ho
                 cand = e + (1 << sh)
                 e = ((cand <= epr) & (plan_word(64 + cand - 1) <= mb)).select(cand, e)
             fb = (e == 0).select(fx.Int32(0), plan_word(64 + (e > 0).select(e - 1, fx.Int32(0))))
-            j0 = (mb - fb) * bm
+            # block b of an expert with nbe blocks takes records b, b + nbe, ...: records arrive clustered by source
+            # rank, so a contiguous split sends a hot expert's GEMM2 returns over one or two links at a time
+            j0 = mb - fb
+            js = plan_word(64 + e) - fb
             cnt = plan_word(e)
             multi = (plan_word(64 + e) - fb) > 1
             if const_expr(TRACE):
                 t_a = _rt()
             if is1:
-                g1(base, mb, nbt, e, j0, cnt, multi, rx, rxs, meta, W13, WS13, Q, S, rows, ready)
+                g1(base, mb, nbt, e, j0, js, cnt, multi, rx, rxs, meta, W13, WS13, Q, S, rows, ready)
             else:
-                g2(base, mb, nbt, e, j0, cnt, multi, meta, Q, S, W2, WS2, pools, rows, ready, done, nblk, ctls, me)
+                g2(base, mb, nbt, e, j0, js, cnt, multi, meta, Q, S, W2, WS2, pools, rows, ready, done, nblk, ctls, me)
             fx.gpu.barrier()
             if const_expr(TRACE):
                 t_b = _rt()
