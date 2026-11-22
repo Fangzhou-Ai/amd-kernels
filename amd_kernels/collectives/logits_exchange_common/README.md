@@ -18,7 +18,8 @@ compares the weight with the communicator's key; it is host-only and takes the m
 
 - `available`: gfx950 with FlyDSL importable.
 - `logits_gemm_exchange_shapes`: the covered (N, K, world), the load-time check of an lm_head shard.
-- `logits_exchange_comm`, `logits_exchange_comm_unsupported_reason`: the collective communicator.
+- `logits_exchange_comm`, `logits_exchange_comm_unsupported_reason`: the collective communicator (two receive
+  buffers, or one when every rank reads an exchange before any issues the next).
 - `logits_gemm_exchange_unsupported_reason`: whether `comm.gemm_exchange(...)` with these arguments is served.
 
 Dispatch: `host._SHAPE_HOSTS` ((N, K, world) -> host module of the shape package).

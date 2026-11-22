@@ -16,7 +16,8 @@ through a fixed-order L2 exchange (workspace + self-clearing flags), member orde
 - `bf16_gemm_n20480_k7168`: the logits of 1-256 rows, graph-safe, no host sync; optionally fuses the hidden-row gather
   and pushes the rows straight to their owner rank (or every rank) of `collectives/all_to_all_bf16_n20480_ranks8`.
   An `amd_kernels.warm_up` entry: the first call of each mode (contiguous / gather / owner / all) compiles its bands.
-  The split-K bands share one workspace per device: two split-K launches must not run concurrently on different streams.
+  The split-K bands share one workspace per device (42 MB; made by the first split-K launch, or ahead of a capture by
+  `host.prepare`, not by the compile-only warm-up): two split-K launches must not run concurrently on two streams.
 - `supports`: whether a weight is the [20480, 7168] bf16 contiguous shard and there is no bias.
 
 `host.band_of` gives the kernel configuration of a row count (the dispatch is `host._kernel`);

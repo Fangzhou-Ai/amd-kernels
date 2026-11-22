@@ -34,7 +34,8 @@ def _kernel(top: int, push: str | None = None, gather: bool = False):
 
 @functools.cache
 def _exchange_workspace(device: torch.device):
-    """The split-K exchange workspace and flags of a device (zero; the kernels leave the flags zero)."""
+    """The split-K exchange workspace and flags of a device (zero; the kernels leave the flags zero), created by the
+    first split-K launch or by ``prepare``."""
     words = [splitk.workspace_words(cfg) for cfg in splitk.SPLITK]
     return (torch.zeros(max(w[0] for w in words), dtype=torch.float32, device=device),
             torch.zeros(max(w[1] for w in words), dtype=torch.int32, device=device))
@@ -57,10 +58,22 @@ def _run(exe, *args):
         cf(*args)
 
 
+def prepare(device: torch.device, max_rows: int) -> None:
+    """Allocate what calls of up to ``max_rows`` rows use (the split-K workspace above the band rows), so that none of
+    them allocates (graph capture)."""
+    if max_rows > band.MAX_ROWS:
+        _exchange_workspace(torch.device(device))
+
+
 def _extra(top: int, device: torch.device) -> tuple:
-    """Workspace and flag pointers of the split-K launchers."""
+    """Workspace and flag pointers of the split-K launchers; a compile-only call (the warm-up) launches nothing and
+    gets placeholders, so a caller that never runs split-K never holds the workspace."""
+    from flydsl.utils import env
+
     if top <= band.MAX_ROWS:
         return ()
+    if env.compile.compile_only:
+        return 0, 0
     ws, flags = _exchange_workspace(device)
     return ws.data_ptr(), flags.data_ptr()
 
@@ -120,12 +133,9 @@ def _mode(x, w, out=None, *, row_indices=None, push=None):
     return ("all" if push[1] is None else "owner",)
 
 
-_KEEP: list = []  # the private exchange state of the warm-up call being made
-
-
 def _inputs(mode, n, x, w, out=None, *, row_indices=None, push=None):
-    """One warm-up call at ``n`` rows (zeros). A variant compiled before the warm-up launches even in compile-only
-    mode, so a push call gets a private receive buffer, flag block and counter, never the caller's exchange."""
+    """One warm-up call at ``n`` rows (zeros). A push call gets a private receive buffer, flag block and counter, never
+    the caller's exchange; they live as long as the call's arguments (the peers table holds their addresses)."""
     if mode[0] == "contiguous":
         return (torch.zeros(n, K, dtype=torch.bfloat16, device=x.device), w), {}
     if mode[0] == "gather":
@@ -138,7 +148,7 @@ def _inputs(mode, n, x, w, out=None, *, row_indices=None, push=None):
     counter = torch.zeros(1, dtype=torch.int32, device=dev)
     counts = torch.zeros(8, dtype=torch.int32, device=dev)
     counts[0] = n
-    _KEEP[:] = [recv, flag, peers, counter, counts]
+    peers.private = (recv, flag)
     return (x, w), {"row_indices": torch.zeros(n, dtype=torch.int64, device=dev),
                     "push": ((peers, counter, flag.data_ptr(), 0, 0), counts if mode[0] == "owner" else None)}
 

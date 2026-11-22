@@ -40,21 +40,22 @@ def logits_gemm_exchange_shapes() -> frozenset[tuple[int, int, int]]:
     return frozenset(_SHAPE_HOSTS)
 
 
-def logits_exchange_comm(rank: int, group, device, *, n_shard: int, k: int, max_rows: int):
+def logits_exchange_comm(rank: int, group, device, *, n_shard: int, k: int, max_rows: int, buffers: int = 2):
     """The routed package's communicator (collective on the group) with its first-use buffers allocated, so that no
-    call allocates (graph capture)."""
+    call allocates (graph capture). ``buffers=1``: buffer 1 is buffer 0, for a caller whose ranks all read an
+    exchange's rows before any of them issues the next."""
     key = (n_shard, k, dist.get_world_size(group))
     host = _shape_host(key)
     if host is None:
         raise ValueError(_no_kernel("logits_exchange_comm", key))
-    comm = host.RowAllToAll(rank, group, device, max_rows=max_rows)
+    comm = host.RowAllToAll(rank, group, device, max_rows=max_rows, buffers=buffers)
     comm._zero_counts()
     comm._local = torch.empty(max_rows, n_shard, dtype=torch.bfloat16, device=comm.counter.device)
     return comm
 
 
-def logits_exchange_comm_unsupported_reason(rank: int, group, device, *, n_shard: int, k: int,
-                                            max_rows: int) -> str | None:
+def logits_exchange_comm_unsupported_reason(rank: int, group, device, *, n_shard: int, k: int, max_rows: int,
+                                            buffers: int = 2) -> str | None:
     op = "logits_exchange_comm"
     if not available():
         return f"{op}: needs gfx950 with FlyDSL"
@@ -64,6 +65,8 @@ def logits_exchange_comm_unsupported_reason(rank: int, group, device, *, n_shard
         return _no_kernel(op, key)
     if not 1 <= max_rows <= host.RECV_ROWS:
         return f"{op}: max_rows {max_rows} (the kernel takes 1..{host.RECV_ROWS})"
+    if not 1 <= buffers <= host.BUFFERS:
+        return f"{op}: {buffers} buffers (the kernel takes 1..{host.BUFFERS})"
     if dist.get_rank(group) != rank:
         return f"{op}: rank {rank} is not this process's rank {dist.get_rank(group)} in the group"
     return None

@@ -95,31 +95,37 @@ def _run(exe, *args):
 
 
 class RowAllToAll:
-    def __init__(self, rank, group, device, max_rows=RECV_ROWS):
+    def __init__(self, rank, group, device, max_rows=RECV_ROWS, buffers=BUFFERS):
+        """``buffers`` receive buffers of ``max_rows`` rows (the same on every rank). With 1, buffer 1 is buffer 0
+        (same peers table): for a caller whose ranks all read an exchange's rows before any of them issues the next (a
+        collective of their stream in between), which the alternating buffers otherwise guarantee."""
         assert dist.get_world_size(group) == WORLD
         assert rank == dist.get_rank(group) and 0 <= rank < WORLD
-        assert 0 < max_rows <= RECV_ROWS
+        assert 0 < max_rows <= RECV_ROWS and 1 <= buffers <= BUFFERS
         self.rank, self.device = rank, torch.device(device)
         self.group = group
         self.closed = False
-        self.max_rows = max_rows
-        ptr, handle, self.pool = _alloc_pool(BUFFERS * max_rows * V * 2, device)
+        self.max_rows, self.buffers = max_rows, buffers
+        ptr, handle, self.pool = _alloc_pool(buffers * max_rows * V * 2, device)
         flag, fh = ops.allocate_shared_buffer_and_handle(512)
         handles = _exchange((handle, fh), rank, WORLD, group)
         bases = [ptr if r == rank else _open_pool(h, device) for r, (h, _) in enumerate(handles)]
-        self.ptrs = [b + buf * max_rows * V * 2 for buf in range(BUFFERS) for b in bases]
+        self.ptrs = [b + (buf % buffers) * max_rows * V * 2 for buf in range(BUFFERS) for b in bases]
         self._bases = bases
         self.flags = [flag if r == rank else ops.open_mem_handle(h) for r, (_, h) in enumerate(handles)]
         self.peer_table = torch.tensor(self.ptrs + self.flags, dtype=torch.int64, device=device)
         self.counter = torch.zeros(1, dtype=torch.int32, device=device)
-        self._recv = self.pool.view(torch.bfloat16).view(BUFFERS, max_rows, V)
+        self._recv = self.pool.view(torch.bfloat16).view(buffers, max_rows, V)
         self.pushes = {m: kernel.compile_push(m) for m in ("owner", "all")}
         self.waiter = kernel.compile_wait()
+        from amd_kernels.gemm.bf16_n20480_k7168.host import prepare
+
+        prepare(self.counter.device, max_rows)  # gemm_exchange's split-K workspace, not inside a capture
 
     def recv(self, rows, buf=0):
         """This rank's receive buffer ``buf`` [rows, 163840] bf16: the rows pushed by the exchange, in place."""
         assert 0 <= rows <= self.max_rows and 0 <= buf < BUFFERS
-        return self._recv[buf, :rows]
+        return self._recv[buf % self.buffers, :rows]
 
     def send_args(self, buf=0):
         """What a producer that pushes the rows itself (`bf16_gemm_n20480_k7168`'s push modes) needs: the device

@@ -11,7 +11,8 @@ bit kept (NaN payloads too). Protocol (IPC buffers and flag blocks, two-level ti
 alternating buffers): module docstring of `kernel.py`. The rows are valid until the next exchange. No atomic output adds.
 
 ## Entry points
-- `RowAllToAll`: a collective; a receive buffer of `max_rows x 163840 x 2` B per rank (84 MB at 256 rows).
+- `RowAllToAll`: a collective; two receive buffers of `max_rows x 163840 x 2` B per rank (84 MB each at 256 rows), or
+  one (`buffers=1`: buffer 1 is buffer 0) when every rank reads an exchange before any issues the next.
 - `RowAllToAll.warmup`: a collective before capture; compiles both pushes and the wait.
 - `RowAllToAll.__call__`: push of rows `[rows, 20480]` (owner-sorted with `counts`, a CUDA int32 `[8]` the same on every
   rank; or all-gather without) and wait; read the rows with `recv(n)`.

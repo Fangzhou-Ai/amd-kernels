@@ -121,3 +121,38 @@ def worker(rank, errors):
 
 def test_logits_exchange_entry_ranks8():
     run_on_8_gpus(worker, timeout=110)
+
+
+def one_buffer_worker(rank, errors):
+    """``buffers=1``: half the receive pool, buffer 1 is buffer 0, and an exchange gives the two-buffer bits (every
+    rank reads the rows before any issues the next exchange: the barrier)."""
+    from amd_kernels.collectives.logits_exchange_common import logits_exchange_comm
+    from amd_kernels.collectives.logits_exchange_common import host as entry
+
+    dev = torch.device("cuda", rank)
+    group = dist.group.WORLD
+    (key, name), = entry._SHAPE_HOSTS.items()
+    n, k, _ = key
+    host = importlib.import_module(name)
+    one = logits_exchange_comm(rank, group, dev, n_shard=n, k=k, max_rows=40, buffers=1)
+    two = logits_exchange_comm(rank, group, dev, n_shard=n, k=k, max_rows=40)
+    if one.pool.numel() * 2 != two.pool.numel() or one.recv(40, 1).data_ptr() != one.recv(40, 0).data_ptr():
+        errors.append(f"rank {rank}: one buffer: pool {one.pool.numel()} vs {two.pool.numel()}")
+    w = (torch.randn(n, k, device=dev, generator=torch.Generator(device=dev).manual_seed(rank)) * 0.02).bfloat16()
+    x = torch.randn(40, k, device=dev, generator=torch.Generator(device=dev).manual_seed(7)).bfloat16()
+    for rows, buf in ((8, 0), (40, 1), (24, 0)):
+        idx = torch.arange(rows, device=dev)
+        one.gemm_exchange(x, w, idx, None, buf)
+        two.gemm_exchange(x, w, idx, None, buf)
+        torch.cuda.synchronize()
+        if not torch.equal(one.recv(rows, buf).view(torch.int16), two.recv(rows, buf).view(torch.int16)):
+            errors.append(f"rank {rank}: one buffer differs at {rows} rows, buffer {buf}")
+        dist.barrier(group)
+    if host.BUFFERS != 2:
+        errors.append(f"rank {rank}: the package has {host.BUFFERS} buffers")
+    one.close()
+    two.close()
+
+
+def test_one_buffer_ranks8():
+    run_on_8_gpus(one_buffer_worker, timeout=110)
