@@ -1,33 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Eight spawned ranks: raw bits, dynamic GPU counts, the all-gather mode, repeated exchanges into one buffer, graphs.
+"""Eight ranks: raw bits, dynamic GPU counts, the all-gather mode, repeated exchanges into one buffer, graphs.
 
 No arithmetic occurs here; the exact byte exchange covers every bf16 pattern (NaN payloads, signed zeros). The received
 rows are read in place by a copy kernel after each wait, so a stale cache line of the receive buffer fails a case.
 """
-import socket
-from datetime import timedelta
-
-import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from amd_kernels.collectives.all_to_all_bf16_n20480_ranks8.reference import N, WORLD, merge_received_reference
+from tests.multi_gpu8 import run_on_8_gpus
 
 
-def _rccl_reference(x, counts, rank):
+def _rccl_reference(x, counts, rank, rccl):
     n = counts[rank]
     recv = torch.empty(WORLD * n * N * 2, dtype=torch.uint8, device=x.device)
     dist.all_to_all_single(recv, x.view(torch.uint8).flatten(),
                            output_split_sizes=[n * N * 2] * WORLD,
-                           input_split_sizes=[c * N * 2 for c in counts])
+                           input_split_sizes=[c * N * 2 for c in counts], group=rccl)
     return merge_received_reference(recv.view(torch.bfloat16).view(WORLD, n, N))
 
 
-def _gather_reference(x, rows):
+def _gather_reference(x, rows, rccl):
     parts = [torch.empty_like(x) for _ in range(WORLD)]
-    dist.all_gather(parts, x)
+    dist.all_gather(parts, x, group=rccl)
     return torch.cat(parts, dim=1)[:rows]
 
 
@@ -45,15 +41,11 @@ def patterns():
     return out
 
 
-def _worker(rank, port):
-    torch.set_num_threads(4)
-    torch.cuda.set_device(rank)
+def _worker(rank, errors):
     dev = torch.device("cuda", rank)
-    dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=WORLD,
-                            timeout=timedelta(minutes=3), device_id=dev)
-    group = dist.new_group(backend="gloo")
+    rccl = dist.new_group(backend="nccl")
     from amd_kernels.collectives.all_to_all_bf16_n20480_ranks8 import RowAllToAll
-    comm = RowAllToAll(rank, group, dev)
+    comm = RowAllToAll(rank, dist.group.WORLD, dev)
     generator = torch.Generator(device=dev).manual_seed(17001 + rank)
     comm.warmup()
     from flydsl.compiler.jit_function import MlirCompiler
@@ -72,7 +64,7 @@ def _worker(rank, port):
             sets = [torch.randint(-32768, 32768, (rows, N), dtype=torch.int16, device=dev,
                                   generator=generator).view(torch.bfloat16) for _ in range(4)]
             outs = [torch.empty(max(n, 1), WORLD * N, device=dev, dtype=torch.bfloat16) for _ in sets]
-            refs = [_rccl_reference(x, counts, rank) for x in sets]
+            refs = [_rccl_reference(x, counts, rank, rccl) for x in sets]
             for j, (x, out, ref) in enumerate(zip(sets, outs, refs)):
                 comm(x, cs, j % 2)
                 out[:n].copy_(comm.recv(n, j % 2))
@@ -100,7 +92,7 @@ def _worker(rank, port):
                     comm(x, None, 0)
                     comm(x, None, 1)
                     out.copy_(comm.recv(rows, 1))
-                ref = _gather_reference(x, rows)
+                ref = _gather_reference(x, rows, rccl)
                 for _ in range(2):
                     out.fill_(float("nan"))
                     graph.replay()
@@ -120,7 +112,7 @@ def _worker(rank, port):
             counts[-1] += 80 - sum(counts)
             cs.copy_(torch.tensor(counts, dtype=torch.int32))
             x.view(torch.int16).random_(-32768, 32768, generator=generator)
-            ref = _rccl_reference(x, counts, rank)
+            ref = _rccl_reference(x, counts, rank, rccl)
             graph.replay()
             torch.cuda.synchronize()
             assert torch.equal(out[:counts[rank]].view(torch.int16), ref.view(torch.int16)), (rank, "dynamic", k)
@@ -129,14 +121,8 @@ def _worker(rank, port):
         MlirCompiler.compile = original
     del graph
     comm.close()
-    dist.barrier()
-    dist.destroy_process_group()
+    dist.destroy_process_group(rccl)
 
 
 def test_eight_rank_exchange():
-    if torch.cuda.device_count() < WORLD:
-        pytest.skip("requires eight gfx950 GPUs")
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port,), nprocs=WORLD, join=True)
+    run_on_8_gpus(_worker)

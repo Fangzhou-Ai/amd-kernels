@@ -1,49 +1,42 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Eight spawned ranks: the lm_head GEMM's publish epilogue into all_to_all_bf16_n20480_ranks8's slot, then its pull.
+"""Eight ranks: the lm_head GEMM's publish epilogue into all_to_all_bf16_n20480_ranks8's slot, then its pull.
 
 The received bytes must equal the contiguous GEMM of the mapped rows followed by an RCCL all_to_all (owner rows) or
 all_gather (all-gather counts), at the served row counts, dense and random owners, ranks owning 0 rows, all rows on one
 owner; slots alternate through graph replays with new inputs and row maps.
 """
-import socket
-from datetime import timedelta
-
-import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
-N, K, WORLD = 20480, 7168, 8
+from tests.multi_gpu8 import WORLD, run_on_8_gpus
+
+N, K = 20480, 7168
 
 
-def _a2a_reference(y, counts, rank):
+def _a2a_reference(y, counts, rank, rccl):
     from amd_kernels.collectives.all_to_all_bf16_n20480_ranks8.reference import merge_received_reference
     n = counts[rank]
     recv = torch.empty(WORLD * n * N * 2, dtype=torch.uint8, device=y.device)
     dist.all_to_all_single(recv, y.view(torch.uint8).flatten(), output_split_sizes=[n * N * 2] * WORLD,
-                           input_split_sizes=[c * N * 2 for c in counts])
+                           input_split_sizes=[c * N * 2 for c in counts], group=rccl)
     return merge_received_reference(recv.view(torch.bfloat16).view(WORLD, n, N))
 
 
-def _ag_reference(y):
+def _ag_reference(y, rccl):
     parts = [torch.empty_like(y) for _ in range(WORLD)]
-    dist.all_gather(parts, y)
+    dist.all_gather(parts, y, group=rccl)
     return torch.cat(parts, dim=1)
 
 
-def _worker(rank, port):
-    torch.set_num_threads(4)
-    torch.cuda.set_device(rank)
+def _worker(rank, errors):
     dev = torch.device("cuda", rank)
-    dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=WORLD,
-                            timeout=timedelta(minutes=10), device_id=dev)
-    group = dist.new_group(backend="gloo")
+    rccl = dist.new_group(backend="nccl")
     from amd_kernels.collectives.all_to_all_bf16_n20480_ranks8 import RowAllToAll
     from amd_kernels.gemm.bf16_n20480_k7168 import bf16_gemm_n20480_k7168
     gen = torch.Generator(device=dev).manual_seed(4100 + rank)
     w = (torch.randn(N, K, device=dev, generator=gen) * 0.02).to(torch.bfloat16)
-    comm = RowAllToAll(rank, group, dev)
+    comm = RowAllToAll(rank, dist.group.WORLD, dev)
     comm.warmup()
     xg = torch.Generator(device=dev).manual_seed(99)
     x = torch.randn(256, K, device=dev, generator=xg).to(torch.bfloat16)
@@ -64,11 +57,11 @@ def _worker(rank, port):
         n = counts[rank]
         maps = [torch.randperm(256, generator=torch.Generator().manual_seed(1000 * k + j))[:m].to(dev) for j in range(3)]
         outs = [torch.empty(max(n, 1), WORLD * N, dtype=torch.bfloat16, device=dev) for _ in maps]
-        refs = [_a2a_reference(bf16_gemm_n20480_k7168(x[rm], w), counts, rank) for rm in maps]
+        refs = [_a2a_reference(bf16_gemm_n20480_k7168(x[rm], w), counts, rank, rccl) for rm in maps]
         outs_serial = [torch.empty_like(out) for out in outs]
         ag_out = torch.empty(m, WORLD * N, dtype=torch.bfloat16, device=dev)
         ag_serial = torch.empty_like(ag_out)
-        ag_ref = _ag_reference(bf16_gemm_n20480_k7168(x[maps[0]], w))
+        ag_ref = _ag_reference(bf16_gemm_n20480_k7168(x[maps[0]], w), rccl)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             for j, (rm, out) in enumerate(zip(maps, outs)):
@@ -98,14 +91,8 @@ def _worker(rank, port):
             assert torch.equal(ag_serial.view(torch.int16), ag_ref.view(torch.int16)), (rank, k, repeat, "serial gather")
         del graph
     comm.close()
-    dist.barrier()
-    dist.destroy_process_group()
+    dist.destroy_process_group(rccl)
 
 
 def test_eight_rank_push():
-    if torch.cuda.device_count() < WORLD:
-        pytest.skip("requires eight gfx950 GPUs")
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port,), nprocs=WORLD, join=True)
+    run_on_8_gpus(_worker)

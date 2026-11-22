@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-import socket
 from unittest.mock import patch
-import pytest
+
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
-from amd_kernels.collectives.dcp8_topk_gather_merge_top2048.reference import reference
-from .workload import K, PAGE, STRIDE, make_block_table, make_plane
 
-WORLD = 8
+from amd_kernels.collectives.dcp8_topk_gather_merge_top2048.reference import reference
+from tests.multi_gpu8 import WORLD, run_on_8_gpus
+
+from .workload import K, PAGE, STRIDE, make_block_table, make_plane
 
 
 def check(rank, dev, comm, rows, seed, ties, graph):
@@ -53,18 +52,7 @@ def check(rank, dev, comm, rows, seed, ties, graph):
     assert torch.equal(runs[0][0][: want_slots.numel()], runs[1][0][: want_slots.numel()])
 
 
-def _die_with_parent(timeout):
-    import ctypes
-    import faulthandler
-    ctypes.CDLL("libc.so.6").prctl(1, 9)
-    faulthandler.dump_traceback_later(timeout, exit=True)
-
-
-def run(rank, port):
-    _die_with_parent(100)
-    torch.set_num_threads(4)
-    torch.cuda.set_device(rank)
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", world_size=WORLD, rank=rank)
+def run(rank, errors):
     dev = torch.device("cuda", rank)
     from amd_kernels.collectives.dcp8_topk_gather_merge_top2048 import TopkGatherMerge
 
@@ -87,14 +75,7 @@ def run(rank, port):
         check(rank, dev, comm, 24, 12, ties=4, graph=True)
         check(rank, dev, comm, 65, 10, ties=2, graph=True)
     comm.close()
-    dist.destroy_process_group()
 
 
 def test_eight_rank_served_rows_ties_and_graph_replay():
-    if torch.cuda.device_count() < WORLD:
-        pytest.skip("requires eight MI355X GPUs")
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    mp.spawn(run, args=(port,), nprocs=WORLD, join=True)
+    run_on_8_gpus(run, timeout=100)
