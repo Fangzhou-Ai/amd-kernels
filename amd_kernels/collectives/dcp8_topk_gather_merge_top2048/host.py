@@ -5,8 +5,8 @@ import ctypes
 import functools
 import torch
 import torch.distributed as dist
-from amd_kernels.collectives.all_to_all_bf16_n50016_ranks4.host import _alloc_pool, _exchange, _open_pool, _run
 from amd_kernels.common import hip_runtime as ops
+from .ipc import alloc_pool, exchange, open_pool, run_compiled
 from .kernel import K, MAX_ROWS, SLOT_BYTES, WORLD, compile_topk_gather_merge
 
 
@@ -19,11 +19,11 @@ class TopkGatherMerge:
     def __init__(self, rank, group, device):
         assert dist.get_world_size(group) == WORLD and rank == dist.get_rank(group)
         self.rank, self.group, self.device = rank, group, torch.device(device)
-        ptr, handle, self.pool = _alloc_pool(2 * SLOT_BYTES, self.device)
+        ptr, handle, self.pool = alloc_pool(2 * SLOT_BYTES, self.device)
         self.pool.zero_()
         torch.cuda.synchronize(self.device)
-        handles = _exchange(handle, rank, WORLD, group)
-        self.ptrs = [ptr if r == rank else _open_pool(h, self.device) for r, h in enumerate(handles)]
+        handles = exchange(handle, rank, WORLD, group)
+        self.ptrs = [ptr if r == rank else open_pool(h, self.device) for r, h in enumerate(handles)]
         self.ctl = torch.zeros(2, dtype=torch.int32, device=self.device)
         self.counts = torch.zeros(MAX_ROWS, dtype=torch.int64, device=self.device)
         self.closed = False
@@ -44,7 +44,7 @@ class TopkGatherMerge:
         assert block_table.stride(1) == 1
         assert out_slots.dtype == out_indptr.dtype == torch.int32 and out_slots.numel() >= rows * K and out_indptr.numel() > rows
         assert all(t.device == self.device for t in (scores, local_idx, block_table, out_slots, out_indptr))
-        _run(_exe(), scores.data_ptr(), local_idx.data_ptr(), block_table.data_ptr(), out_slots.data_ptr(),
+        run_compiled(_exe(), scores.data_ptr(), local_idx.data_ptr(), block_table.data_ptr(), out_slots.data_ptr(),
              out_indptr.data_ptr(), self.ctl.data_ptr(), self.counts.data_ptr(), *self.ptrs,
              rows, self.rank, scores.stride(0), local_idx.stride(0), block_table.stride(0), page_size, block_stride_rows,
              torch.cuda.current_stream(self.device))
