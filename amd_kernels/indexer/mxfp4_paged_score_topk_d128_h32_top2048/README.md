@@ -12,7 +12,10 @@ row) wait on their sequence's ready count and select the top 2048 from the lists
 
 ## Entry points
 - `mxfp4_paged_score_topk`: the fused scorer + top-2048, an `amd_kernels.warm_up` entry, CUDA-graph safe; `uniform=True`
-  when every sequence has `max_query_len` rows; scratch ~145 MB a device and stream.
+  when every sequence has `max_query_len` rows; scratch a device and stream: 0.59 MB a query row + 0.5 MB (151 MB at
+  256 rows).
+- `host.set_scratch_rows`, `host.release_scratch`: the rows of the scratch sets created from then on (a caller whose
+  calls never exceed them), and dropping the sets of streams that no longer call.
 - `prefer_fused`: the measured gate (stock is 5 - 10% faster only for >= 24 sequences of <= 8192 keys).
 - `cache_views`: payload and scale views of a merged index cache, without a copy.
 

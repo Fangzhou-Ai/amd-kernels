@@ -59,7 +59,7 @@ def test_paged_scratch_helpers():
     stream = torch.cuda.Stream()
     paged_score_topk_preallocate("cuda", [torch.cuda.current_stream(), stream], cache=inputs["cache"], out_indices=out)
     dev = inputs["cache"].device
-    assert PAGED.host._scratch_set.cache_info().currsize >= 2
+    assert len(PAGED.host._SETS) >= 2
     with torch.cuda.stream(stream):
         counts = PAGED.host._scratch(dev)[4]
     counts.fill_(5)
@@ -71,6 +71,37 @@ def test_paged_scratch_helpers():
     assert int(counts[:used].abs().sum()) == 0 and bool((counts[used:] == 5).all())
     counts.zero_()
     torch.cuda.synchronize()
+
+
+def test_paged_scratch_rows():
+    """Sets sized for 40 rows: a 40-row call equals the package's at full size, a 41-row call gets a reason; the
+    release keeps only the given streams' sets."""
+    require_gfx950()
+    inputs = paged_inputs(10, 4, 16384, seed=5)
+    big = paged_inputs(41, 1, 4096)
+    got, want, over = outputs(40), outputs(40), outputs(41)
+    stream = torch.cuda.Stream()
+    try:
+        with torch.cuda.stream(torch.cuda.Stream()):
+            PAGED.mxfp4_paged_score_topk(**inputs, out_indices=want[0], out_scores=want[1])
+        torch.cuda.synchronize()
+        paged_score_topk_preallocate("cuda", [stream], cache=inputs["cache"], out_indices=got[0], rows=40,
+                                     release_others=True)
+        dev = torch.cuda.current_device()
+        assert [k[1] for k in PAGED.host._SETS if k[0] == dev] == [stream.cuda_stream]
+        assert PAGED.host._SETS[(dev, stream.cuda_stream)][0].numel() == 40 * PAGED.geometry.POOL
+        assert "the scratch holds 40" in mxfp4_paged_score_topk_unsupported_reason(
+            **big, out_indices=over[0], out_scores=over[1])
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            assert mxfp4_paged_score_topk_unsupported_reason(**inputs, out_indices=got[0], out_scores=got[1]) is None
+            mxfp4_paged_score_topk(**inputs, out_indices=got[0], out_scores=got[1])
+        torch.cuda.synchronize()
+        assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
+    finally:
+        torch.cuda.synchronize()
+        PAGED.host.set_scratch_rows(PAGED.geometry.MAX_ROWS)
+        PAGED.host.release_scratch("cuda")
 
 
 @pytest.mark.parametrize("rows,keys", [(1, 64), (8, 4096), (512, 32768)])

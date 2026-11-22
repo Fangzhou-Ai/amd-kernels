@@ -91,6 +91,8 @@ def mxfp4_paged_score_topk_unsupported_reason(q_payload, q_scales, weights, cach
     geo, host = pkg.geometry, pkg.host
     if not 1 <= rows <= geo.MAX_ROWS:
         return f"{_OP}: {rows} rows (the kernel takes 1..{geo.MAX_ROWS})"
+    if rows > host.scratch_rows():
+        return f"{_OP}: {rows} rows (the scratch holds {host.scratch_rows()}: paged_score_topk_preallocate)"
     if not 1 <= max_query_len <= geo.QMAX:
         return f"{_OP}: max_query_len {max_query_len} (the kernel takes 1..{geo.QMAX})"
     if (batch < 1 or query_start_loc.dtype != torch.int32 or query_start_loc.ndim != 1
@@ -133,9 +135,17 @@ def paged_score_topk_prefer(batch: int, width: int, *, cache, out_indices) -> bo
     return host is not None and host.prefer_fused(batch, width)
 
 
-def paged_score_topk_preallocate(device, streams, *, cache, out_indices) -> None:
-    """Create the scratch of each of ``streams`` (one set a device and stream) before graph capture."""
+def paged_score_topk_preallocate(device, streams, *, cache, out_indices, rows=None, release_others=False) -> None:
+    """Create the scratch of each of ``streams`` (one set a device and stream) before graph capture. ``rows``: the
+    query rows a call may have from now on, which sizes the sets created from now on (default the kernel's maximum;
+    a call above them gets a reason). ``release_others``: drop the device's sets of other streams (the warm-up's
+    call made one on its stream), after a device synchronize; such a stream's next call creates its set again."""
     host = _scratch_host(cache, out_indices, need=True).host
+    if rows is not None:
+        host.set_scratch_rows(rows)
+    if release_others:
+        torch.cuda.synchronize(device)
+        host.release_scratch(device, keep={s.cuda_stream for s in streams})
     for stream in streams:
         host._scratch_set(torch.device(device), stream.cuda_stream)
 

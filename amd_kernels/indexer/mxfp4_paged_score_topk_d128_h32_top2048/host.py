@@ -11,8 +11,8 @@ from amd_kernels.warm_up import entry
 from . import fused as _fused
 from . import lists as _lists
 from . import merge as _merge
-from .geometry import (CHUNK_MAX, CHUNKS_TARGET, pack_target, MAX_ROWS, NCH_MAX, QMAX, TOPK, chunk_size, list_size, num_chunks,
-                       scratch_words, slot_size, COUNTER_GROUPS)
+from .geometry import (CHUNK_MAX, CHUNKS_TARGET, pack_target, MAX_ROWS, NCH_MAX, POOL, QMAX, TOPK, chunk_size,
+                       list_size, num_chunks, scratch_words, slot_size, COUNTER_GROUPS)
 
 HEADS = 32
 _FORCE = None
@@ -38,9 +38,45 @@ def cache_views(cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return payload, scales
 
 
-@functools.cache
-def _scratch_set(device: torch.device, stream: int):
-    return tuple(torch.zeros(words, dtype=torch.int32, device=device) for words in scratch_words(MAX_ROWS))
+_SETS: dict = {}  # (device index, stream handle) -> planes
+_ROWS = [MAX_ROWS]
+
+
+def _index(device) -> int:
+    device = torch.device(device)
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+def set_scratch_rows(rows: int) -> None:
+    """Size the scratch sets created from now on for calls of at most ``rows`` query rows (sets that exist keep
+    theirs). The key, position and full-score planes are row-major; the meta plane keeps ``MAX_ROWS`` rows (its
+    records sit at ``INFO_OFFSET``)."""
+    if not 1 <= rows <= MAX_ROWS:
+        raise ValueError(f"1 - {MAX_ROWS} scratch rows, got {rows}")
+    _ROWS[0] = rows
+
+
+def scratch_rows() -> int:
+    """The query rows of the sets created from now on."""
+    return _ROWS[0]
+
+
+def release_scratch(device, keep=()) -> None:
+    """Drop the sets of ``device`` but those of the stream handles in ``keep`` (their launches are done: the caller
+    synchronized). A dropped stream's next call creates its set again."""
+    dev = _index(device)
+    for key in [k for k in _SETS if k[0] == dev and k[1] not in keep]:
+        del _SETS[key]
+
+
+def _scratch_set(device, stream: int):
+    key = (_index(device), stream)
+    planes = _SETS.get(key)
+    if planes is None:
+        words = list(scratch_words(_ROWS[0]))
+        words[2] = scratch_words(MAX_ROWS)[2]
+        planes = _SETS[key] = tuple(torch.zeros(w, dtype=torch.int32, device=device) for w in words)
+    return planes
 
 
 def _scratch(device: torch.device):
@@ -144,6 +180,7 @@ def _score_topk(
     tile, target, min_chunk = plan(max_query_len, batch)
     nch = grid_chunks(width, target, min_chunk)
     keys, pos, meta, full, cnt = _scratch(cache.device)
+    assert rows * POOL <= keys.numel(), f"{rows} rows, the stream's scratch holds {keys.numel() // POOL}"
     stream = torch.cuda.current_stream()
     common = (
         q_payload.data_ptr(), q_scales.data_ptr(), payload.data_ptr(), scales.data_ptr(), block_table.data_ptr(),

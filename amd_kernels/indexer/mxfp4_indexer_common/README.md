@@ -25,7 +25,8 @@ head dim) of `q_payload`; prefill top-k the width of `out`.
 - `mxfp4_paged_score_topk_kernel`: the routed `amd_kernels.warm_up` entry, for a caller that compiles without
   launching.
 - `paged_score_topk_prefer`: whether the fused call beats the unfused scorer + top-k pair (the package's gate).
-- `paged_score_topk_preallocate`: the scorer's scratch for the given streams, created before graph capture.
+- `paged_score_topk_preallocate`: the scorer's scratch for the given streams, created before graph capture, sized
+  for the rows a call may have; it can drop the sets of other streams (the warm-up's).
 - `paged_score_topk_reset_counts`: zeroes the ready counts a call uses; needed when a batch has padding sequences.
 - `prefill_topk_workspace_bytes`: the scratch of one top-k call.
 
