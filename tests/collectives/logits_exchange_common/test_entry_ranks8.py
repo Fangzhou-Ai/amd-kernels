@@ -126,8 +126,8 @@ def test_logits_exchange_entry_ranks8():
 def one_buffer_worker(rank, errors):
     """``buffers=1``: half the receive pool, buffer 1 is buffer 0, and an exchange gives the two-buffer bits (every
     rank reads the rows before any issues the next exchange: the barrier)."""
-    from amd_kernels.collectives.logits_exchange_common import logits_exchange_comm
     from amd_kernels.collectives.logits_exchange_common import host as entry
+    from amd_kernels.collectives.logits_exchange_common import logits_exchange_comm
 
     dev = torch.device("cuda", rank)
     group = dist.group.WORLD

@@ -45,7 +45,7 @@ def scenario():
 def test_warm_up_keeps_no_buffer():
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
-    proc = subprocess.run([sys.executable, "-m", __name__], capture_output=True, text=True, timeout=1800,
+    proc = subprocess.run([sys.executable, "-m", __name__], capture_output=True, text=True, timeout=1800, check=False,
                           env=dict(os.environ))
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
     r = json.loads(proc.stdout.strip().splitlines()[-1])

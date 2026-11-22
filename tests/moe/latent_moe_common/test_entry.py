@@ -142,52 +142,67 @@ def test_borrowed_workspaces(chain):
 
 
 def test_one_set_serves_eager_calls_and_replays(chain):
-    """A graph captured on a stream that borrowed the main stream's workspaces, then
-    replays and eager calls on the main stream in any order (one set, one stream
-    order): every result is the bits of the same call on a stream with its own set."""
+    """Graphs of two row counts captured on a stream that borrowed the main stream's workspaces (after eager runs on
+    it, as a capture's warm-up), then replays and eager calls of three row counts on the main stream in any order (one
+    set, one stream order): the capture makes no set, every result is the bits of the same call on a stream with its
+    own set."""
     from amd_kernels.gemm import bf16_common
 
     w, bias, rh, eh, weights = chain
-    dev, m = w.device, 48
+    dev = w.device
+    dh = importlib.import_module(bf16_common.latent_down._SHAPE_HOSTS[(3584, 7168)])
     g = torch.Generator(device=dev).manual_seed(4)
     w_down = (torch.randn(3584, 7168, device=dev, generator=g) * 0.02).to(torch.bfloat16)
-    inputs = [(torch.randn(m, 7168, device=dev, generator=g) * 0.5).to(torch.bfloat16) for _ in range(5)]
+    plan = [(48, True), (8, False), (16, True), (48, False), (48, True), (100, False), (16, False), (16, True),
+            (48, True), (8, False)]
+    inputs = [(torch.randn(100, 7168, device=dev, generator=g) * 0.5).to(torch.bfloat16) for _ in plan]
     x = torch.empty_like(inputs[0])
-    aux = E.router_aux(w, m, dev, zero_moe_buf=False)
+    auxes = {m: E.router_aux(w, m, dev, zero_moe_buf=False) for m in (8, 16, 48, 100)}
 
-    def body():
-        tw, ti = E.router_sigmoid_bias_topk(x, w, bias, 1.0, aux=aux)
-        codes, scales = bf16_common.bf16_latent_down_mxfp4_quant(x, w_down)
-        out = E.mxfp4_moe_experts(codes, scales, weights, E.moe_sort_from_aux(aux, weights=weights))
+    def body(m):
+        tw, ti = E.router_sigmoid_bias_topk(x[:m], w, bias, 1.0, aux=auxes[m])
+        codes, scales = bf16_common.bf16_latent_down_mxfp4_quant(x[:m], w_down)
+        out = E.mxfp4_moe_experts(codes, scales, weights, E.moe_sort_from_aux(auxes[m], weights=weights))
         return tw, ti, codes, scales, out
 
     own = torch.cuda.Stream()
     want = []
-    for inp in inputs:
+    for (m, _), inp in zip(plan, inputs):
         x.copy_(inp)
         own.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(own):
-            want.append([t.clone() for t in body()])
+            want.append([t.clone() for t in body(m)])
         torch.cuda.current_stream().wait_stream(own)
     main, capture = torch.cuda.current_stream(), torch.cuda.Stream()
-    x.copy_(inputs[0])
-    body()
+    for m in auxes:
+        body(m)
     torch.cuda.synchronize()
 
     def swap(a, b):
         E.swap_stream_workspaces(dev.index, a.cuda_stream, b.cuda_stream)
         bf16_common.latent_down_swap_stream_workspaces(dev.index, a.cuda_stream, b.cuda_stream)
 
+    def sets():
+        return sum(len(d) for d in (rh._WORK, rh._AUX_WORK, eh._WORK, dh._WORK))
+
+    before = sets()
     swap(main, capture)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=capture):
-        outs = body()
+    graphs, outs = {}, {}
+    capture.wait_stream(main)
+    with torch.cuda.stream(capture):
+        for m in (16, 48):
+            body(m)
+    for m in (16, 48):
+        graphs[m] = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graphs[m], stream=capture):
+            outs[m] = body(m)
     swap(capture, main)
-    for i, replay in enumerate((True, False, True, True, False)):
-        x.copy_(inputs[i])
-        got = outs if replay else body()
+    assert sets() == before
+    for i, ((m, replay), inp) in enumerate(zip(plan, inputs)):
+        x.copy_(inp)
+        got = outs[m] if replay else body(m)
         if replay:
-            graph.replay()
+            graphs[m].replay()
         torch.cuda.synchronize()
         for a, b in zip(got, want[i]):
-            assert same(a, b), (i, replay)
+            assert same(a, b), (i, m, replay)

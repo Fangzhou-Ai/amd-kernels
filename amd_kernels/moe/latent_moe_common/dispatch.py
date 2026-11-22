@@ -41,7 +41,6 @@ def key_of_type(table, cls):
     return next((k for k, name in table.items() if cls.__module__ == name), None)
 
 
-
 def swap_stream_keys(workspaces: dict, device_index: int, a: int, b: int) -> None:
     """Exchange the entries of streams ``a`` and ``b`` on a device in a dict keyed (device index, stream, ...)."""
     moved = {}

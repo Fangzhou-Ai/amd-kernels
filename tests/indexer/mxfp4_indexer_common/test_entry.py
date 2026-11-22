@@ -73,11 +73,24 @@ def test_paged_scratch_helpers():
     torch.cuda.synchronize()
 
 
-def test_paged_scratch_rows():
-    """Sets sized for 40 rows: a 40-row call equals the package's at full size, a 41-row call gets a reason; the
-    release keeps only the given streams' sets."""
+def ragged_padded(qlens, pad, width, seed):
+    """Sequences of ``qlens`` rows (the last rows of 6-row sequences) and ``pad`` padding sequences without rows."""
+    base = paged_inputs(len(qlens) + pad, 6, width, seed=seed)
+    idx = torch.tensor([s * 6 + r for s, q in enumerate(qlens) for r in range(6 - q, 6)], device="cuda")
+    starts = torch.tensor([0, *qlens, *[0] * pad], dtype=torch.int32, device="cuda").cumsum(0, dtype=torch.int32)
+    rows = {k: base[k][idx].contiguous() for k in ("q_payload", "q_scales", "weights", "row_ends")}
+    return {**base, **rows, "query_start_loc": starts, "max_query_len": max(qlens)}
+
+
+@pytest.mark.parametrize("batch", ["uniform", "ragged_padded"])
+def test_paged_scratch_rows(batch):
+    """Sets sized for 40 rows: a 40-row call (uniform, or ragged with padding sequences) equals the package's at full
+    size, a 41-row call gets a reason; the release keeps only the given streams' sets."""
     require_gfx950()
-    inputs = paged_inputs(10, 4, 16384, seed=5)
+    if batch == "uniform":
+        inputs = paged_inputs(10, 4, 16384, seed=5)
+    else:
+        inputs = ragged_padded([5, 1, 6, 3, 5, 5, 5, 4, 6], 7, 16384, seed=5)
     big = paged_inputs(41, 1, 4096)
     got, want, over = outputs(40), outputs(40), outputs(41)
     stream = torch.cuda.Stream()
@@ -95,6 +108,8 @@ def test_paged_scratch_rows():
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             assert mxfp4_paged_score_topk_unsupported_reason(**inputs, out_indices=got[0], out_scores=got[1]) is None
+            paged_score_topk_reset_counts(inputs["query_start_loc"], inputs["max_query_len"], cache=inputs["cache"],
+                                          out_indices=got[0])
             mxfp4_paged_score_topk(**inputs, out_indices=got[0], out_scores=got[1])
         torch.cuda.synchronize()
         assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
