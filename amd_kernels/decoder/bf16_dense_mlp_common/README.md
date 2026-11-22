@@ -8,9 +8,9 @@ package that serves it (imported on first use) and, for a call no package covers
 the caller falls back. Computation, dtypes and numerics are the routed package's (its `reference.py`); the entry
 passes the arguments through, so its outputs are the package's bits.
 
-Routed: (7168, 1792) -> `decoder/bf16_dense_mlp_h7168_i1792`. The workspace is built for one key; the reason checks it
-against the call's weights. The packed weights keep the raw weights' shapes: pass the entry's `pack` output. The
-reason is host-only (shapes, dtypes, strides, ints) and takes exactly the op's arguments.
+Routed: (7168, 1792) -> `decoder/bf16_dense_mlp_h7168_i1792`, 1-256 rows. The workspace is built for one key; the
+reason checks it against the call's weights. The packed weights keep the raw weights' shapes: pass the entry's `pack`
+output. The reason is host-only (shapes, dtypes, strides, ints) and takes exactly the op's arguments.
 
 ## Entry points
 

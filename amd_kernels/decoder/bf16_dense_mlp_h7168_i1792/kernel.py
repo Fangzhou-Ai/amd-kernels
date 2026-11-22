@@ -6,9 +6,10 @@ Operands are in the load-time MFMA layout (``pack.py``), so every wave load of w
 1 KB. The weights are the MFMA's first operand, the activation rows the second. A workgroup owns ``mt`` row tiles of
 16, ``g`` weight groups of 16 rows and 1 / ``split`` of K; its ``wr * wk`` waves split the row tiles and K, so every
 activation and weight byte is loaded once per workgroup (the weights bypass the L2 so that the activation tiles stay
-resident). The K loop is fully unrolled with ``depth`` steps of loads in flight, which a loop-carried software
-pipeline cannot keep (the compiler drains its loads at the back edge). The waves of a K group are summed in wave order
-through LDS.
+resident). ``mblocks`` row blocks of ``mt`` tiles split the rows across workgroups: past 144 rows two blocks read the
+weights twice but halve the activation reads per workgroup, which bound one block there. The K loop is fully unrolled
+with ``depth`` steps of loads in flight, which a loop-carried software pipeline cannot keep (the compiler drains its
+loads at the back edge). The waves of a K group are summed in wave order through LDS.
 
 ``split`` > 1: the ``split`` workgroups of a tile run on one XCD (workgroup id mod 8), store their fp32 partial tiles
 to the workspace, take a ticket, and the last one to arrive sums the partials in split order (its own from
@@ -74,7 +75,7 @@ def compile_gemm(k: int, groups: int, mt: int, g: int, split: int, depth: int, w
     steps = -(-ks // (split * wk))
     tw = mtw * g
     lds = max(nw * tw * 1024, 4096)
-    assert lds <= LDS_MAX, lds
+    assert lds + 16 <= LDS_MAX, lds
     ntot = groups * 16
     nv = 2 if mode == 2 else 1
     ipt = mtw * (gp if mode == 2 else g)

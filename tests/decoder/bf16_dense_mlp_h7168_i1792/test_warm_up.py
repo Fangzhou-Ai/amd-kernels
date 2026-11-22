@@ -8,7 +8,8 @@ from amd_kernels.decoder.bf16_dense_mlp_h7168_i1792 import MlpWorkspace, dense_m
 from amd_kernels.decoder.bf16_dense_mlp_h7168_i1792.reference import HIDDEN, INTER
 from flydsl.compiler.jit_function import CompiledFunction, MlirCompiler
 
-SERVED = (1, 8, 12, 16, 17, 32, 33, 40, 48, 52, 60, 64, 65, 80, 81, 96, 97, 128, 129, 144, 145, 192)
+SERVED = (1, 8, 12, 16, 17, 32, 33, 40, 48, 52, 60, 64, 65, 80, 81, 96, 97, 128, 129, 144, 145, 160, 176, 192, 193, 200,
+          224, 240, 241, 256)
 
 
 def test_warm_up_then_no_compile():

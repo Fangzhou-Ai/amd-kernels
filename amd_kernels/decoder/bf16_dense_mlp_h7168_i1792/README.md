@@ -3,7 +3,7 @@
 ## What it does
 
 One rank's shard (TP8) of the DSpark drafter's dense MLP (vLLM's `KimiMLP`, hidden_act silu, `reduce_results=False`):
-`out = down(silu(x gate^T) * (x up^T))` for 1-192 rows, the rank's bf16 [rows, 7168] partial that the next
+`out = down(silu(x gate^T) * (x up^T))` for 1-256 rows, the rank's bf16 [rows, 7168] partial that the next
 all-reduce + RMSNorm sums. `gate_up` is the merged [3584, 7168] weight (gate rows, then up rows),
 `down` [7168, 1792]. Two launches: gate_up with the SwiGLU epilogue (fp32 accumulators, bf16 intermediate written in the
 packed layout `down` reads) and down. Contract (`reference.py`): fp64 products, the intermediate rounded once to bf16 (gate
@@ -29,13 +29,13 @@ workgroups of one XCD, last arrival sums, weights bypass the L2).
 
 One MI355X, graph replay of 24 calls over six rotated copies of the 77 MB weights, min of 15 rounds, us per call. Stock =
 vLLM `rocm_unquantized_gemm_impl` (gate_up, down) + `silu_and_mul`. Floor = the weights at the 6.5 TB/s cold-read
-ceiling (11.9 us) + two launch floors (1.6 us).
+ceiling (11.9 us) + two launch floors (1.6 us); from 160 rows on, two row blocks read the weights twice.
 
-| rows | 16 | 32 | 52 | 60 | 80 | 128 | 144 | 192 |
-|---|---|---|---|---|---|---|---|---|
-| stock | 22.9 | 27.2 | 29.6 | 29.9 | 38.5 | 39.1 | 42.0 | 44.2 |
-| this entry | 17.1 | 19.4 | 24.4 | 24.5 | 26.5 | 32.1 | 34.6 | 42.7 |
-| % of floor | 88 | 78 | 62 | 61 | 57 | 47 | 43 | 35 |
+| rows | 16 | 32 | 60 | 80 | 128 | 144 | 160 | 192 | 224 | 240 | 256 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| stock | 22.8 | 27.1 | 29.9 | 38.1 | 38.8 | 41.6 | 41.9 | 43.9 | 44.7 | 49.6 | 47.2 |
+| this entry | 17.3 | 19.1 | 23.9 | 26.2 | 31.8 | 34.3 | 34.7 | 37.0 | 39.6 | 42.3 | 42.3 |
+| % of floor | 87 | 79 | 63 | 58 | 47 | 44 | 44 | 41 | 38 | 36 | 36 |
 
 ## Tests
 
