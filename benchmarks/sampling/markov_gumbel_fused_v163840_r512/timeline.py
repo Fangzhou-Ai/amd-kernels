@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """Per-step timeline of the fused chain from the kernel's own timestamps (``s_memrealtime``, 100 MHz, wave 0 of every
-workgroup, written to the scratch with ``AMD_KERNELS_MARKOV_TS=1``), under the benchmark's conditions (graph replay,
+workgroup, written to the scratch by the ``timestamps`` build), under the benchmark's conditions (graph replay,
 rotated ``markov_w2`` copies and inputs). Per step: the tile loop's start, its end (min / median / max over the 256
 workgroups: the spread), the last aggregation, and the tokens at workgroup 0.
 Run: python3 benchmarks/sampling/markov_gumbel_fused_v163840_r512/timeline.py 8 4   (requests, steps)
 """
 
-import os
 import sys
-
-os.environ["AMD_KERNELS_MARKOV_TS"] = "1"
 
 import numpy as np
 import torch
@@ -18,8 +15,8 @@ import torch
 from amd_kernels.sampling.markov_gumbel_fused_v163840_r512 import (
     RANK,
     V,
+    host,
     kernel,
-    markov_gumbel_fused,
     scratch_dwords,
 )
 
@@ -46,10 +43,12 @@ def main():
     seeds = torch.arange(n + 3, dtype=torch.int64, device=dev) + 7
     scratch = torch.zeros(scratch_dwords(n) + 256 * k * 24, dtype=torch.int32, device=dev)
 
+    timed = host._chain_exe(host.row_tiles(n), k, True)
+
     def call(i):
         d = sets[i % 8]
-        markov_gumbel_fused(d["base"], w1, w2s[i % 3], d["ids"], anchor, d["toks"], idx, d["pos"], temp, seeds,
-                            d["cache"], scratch)
+        host._launch(timed, d["base"], w1, w2s[i % 3], d["ids"], anchor, d["toks"], idx, d["pos"], temp, seeds,
+                     d["cache"], scratch, None)
 
     call(0)
     torch.cuda.synchronize()

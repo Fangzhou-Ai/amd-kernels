@@ -27,10 +27,10 @@ def scratch_dwords(n: int) -> int:
 
 
 @functools.cache
-def _chain_exe(mt: int, k: int):
+def _chain_exe(mt: int, k: int, timestamps: bool = False):
     from .kernel import compile_markov_chain
 
-    return compile_markov_chain(mt, k)
+    return compile_markov_chain(mt, k, timestamps)
 
 
 def _run_compiled(exe, *args):
@@ -89,12 +89,17 @@ def markov_gumbel_fused(base, w1, w2, input_ids, anchor_idx, draft_tokens, idx_m
     assert cache.numel() * 2 < (1 << 32) and base.numel() * 2 < (1 << 32)
     assert row_mapping is None or row_mapping.dtype == torch.int32
     assert scratch.dtype == torch.int32 and scratch.numel() >= scratch_dwords(n)
-    exe = _chain_exe(row_tiles(n), k)
+    _launch(_chain_exe(row_tiles(n), k), base, w1, w2, input_ids, anchor_idx, draft_tokens, idx_mapping, sample_pos,
+            temperature, seeds, cache, scratch, row_mapping)
+
+
+def _launch(exe, base, w1, w2, input_ids, anchor_idx, draft_tokens, idx_mapping, sample_pos, temperature, seeds, cache,
+            scratch, row_mapping):
     _run_compiled(
         exe, base.data_ptr(), base.stride(0), w1.data_ptr(), w2.data_ptr(), input_ids.data_ptr(),
         anchor_idx.data_ptr(), draft_tokens.data_ptr(), draft_tokens.stride(0), idx_mapping.data_ptr(),
         idx_mapping.stride(0), sample_pos.data_ptr(), sample_pos.stride(0), temperature.data_ptr(),
         seeds.data_ptr(), cache.data_ptr(), cache.stride(0), cache.stride(1),
-        0 if row_mapping is None else row_mapping.data_ptr(), scratch.data_ptr(), n, (1 << 30) - 1,
+        0 if row_mapping is None else row_mapping.data_ptr(), scratch.data_ptr(), base.shape[0], (1 << 30) - 1,
         torch.cuda.current_stream(),
     )

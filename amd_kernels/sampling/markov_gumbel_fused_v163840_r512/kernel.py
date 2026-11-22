@@ -51,7 +51,6 @@ NT = 2  # non-temporal: the base-logit read and the cache write must not push ``
 RES_TILES = {1: (2, 2, 2, 1), 2: (2, 1, 1, 1), 3: (0, 0, 0, 0)}  # tiles per wave kept in LDS across the steps, by row tiles
 AFR_LDS = {1: True, 2: False, 3: True}  # the MFMA operand of the w1 rows read from LDS a k step ahead, not held in registers
 RES_LO = 1  # their first tile index
-TS = bool(int(__import__("os").environ.get("AMD_KERNELS_MARKOV_TS", "0")))  # per-workgroup timestamps into the scratch
 TS_OFF = SCRATCH_DW
 WG_COLS = V // NWG
 ER = RANK // 2 + 4  # LDS row pitch in dwords
@@ -197,7 +196,9 @@ def _wave_or(b, upper16, upper32):
     return I(fx.rocdl.readfirstlane(T.i32, fx.as_ir_value(b)))
 
 
-def compile_markov_chain(mt: int, ksteps: int):
+def compile_markov_chain(mt: int, ksteps: int, timestamps: bool = False):
+    """``timestamps``: wave 0 of every workgroup stores ``s_memrealtime`` per step and stage at ``TS_OFF`` of the
+    scratch (benchmarks/.../timeline.py)."""
     MT = mt
     K = ksteps
     T1 = TILES // 2  # tiles of the first half
@@ -211,7 +212,7 @@ def compile_markov_chain(mt: int, ksteps: int):
     assert 1 <= MT <= 3 and 1 <= K <= 8 and TILES * NWG * NW * 16 == V and TILES % 2 == 0
     RW = RES_TILES[MT]
     NSLOT = sum(RW)
-    name = f"markov_gumbel_chain_v163840_r512_mt{MT}_k{K}"
+    name = f"markov_gumbel_chain_v163840_r512_mt{MT}_k{K}" + ("_ts" if timestamps else "")
 
     @fx.struct
     class Shared:
@@ -268,7 +269,7 @@ def compile_markov_chain(mt: int, ksteps: int):
         has_map = arg_rowmap != 0
 
         def stamp(s, stage):
-            if TS:  # noqa: SIM102
+            if timestamps:  # noqa: SIM102
                 if tx == 0:
                     t64 = fx.Int64(_llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
                     buffer_ops.buffer_store(t64.to(fx.Int32), sy_r, TS_OFF + (bid * K + s) * 24 + stage)
