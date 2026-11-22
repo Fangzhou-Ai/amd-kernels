@@ -1,7 +1,7 @@
 # MXFP8 GEMM, N 5120 x K 8192 (wo_b)
 
 ## What it does
-`out [M, 5120] = x [M, 8192] @ W^T` for the wo_b of the DEP8 decode step, M = the padded decode rows 16-768 (more rows run
+`out [M, 5120] = x [M, 8192] @ W^T` for the wo_b of the DEP8 decode step, M = the padded decode rows 16-1024 (more rows run
 the common dispatcher). `x` is bf16, quantized per 1 x 32 block (the vLLM Triton quantizer's bytes) in the GEMM's
 registers at small M and by a quantizer launch above it, or pre-quantized codes + row-major E8M0 scales; `W` is the
 checkpoint's E4M3 codes with 32 x 32 block scales, expanded per row and preshuffled at load. fp32 sums, one bf16
@@ -13,6 +13,9 @@ fixed-order). Producer: `gemm/mxfp8_grouped_g8_n1024_k4096` MXFP8 epilogue, or b
   this folder is registered in `gemm._SHAPE_HOSTS` (`linear`, `covers`).
 - `gemm.mxfp8_n5120_k8192.mxfp8_linear`: the GEMM from a bf16 activation; fresh bf16 output, graph-capture safe, `serves(m)` tells where it beat the served path.
 - `gemm.mxfp8_n5120_k8192.preshuffle_weight`: the load-time weight and scale preshuffle (32 x 32 block scales accepted).
+- `gemm.mxfp8_n5120_k8192.preshuffle_weight_scale`: only the scales, for the served linear's weight, which already has the
+  codes' layout (no weight copy). `serves_after_wo_a(m)`: whether wo_a's bf16 output through `mxfp8_linear` beats wo_a's
+  MXFP8 epilogue + AITER on its codes (769-1024 rows).
 - `gemm.mxfp8_n5120_k8192.warmup_mxfp8_linear`: compiles every row and creates the split-K counters before graph capture.
 - `kernel.py`: the row table (kernel, tile, K-waves, split-K, `serves`); the kernels are `gemm/mxfp8_decode_prequant` and `gemm/mxfp8_common`.
 
@@ -31,14 +34,25 @@ with AITER PR #6605.
 | 256 | 25.86 | 29.01 | 29.03 | 1.12x |
 | 384 | 30.08 | 34.19 | 34.19 | 1.14x |
 | 512 | 33.54 | 39.36 | 39.09 | 1.17x |
-| 768 | 47.69 | 49.00 | 48.98 | 1.03x |
 
-Falls back to the served path (AITER) at M = 16, 32, 64, 128, 192, 768 (and rows between them).
+Falls back to the served path (AITER) at M = 16, 32, 64, 128, 192 (and rows between them). Rows 513-1024 run the decode
+kernel on the shuffled-quantized bf16 (`kernel.LINEAR`: 96x80 up to 640, 112x80 up to 768, 128x80 up to 1024 rows, 2 K-waves).
 
-Limit: at M 16 the HBM weight stream, 8.02 us for 43.3 MB; achieved 11.72 us (68%). At M 768 fp8 MFMA at the
-power-capped clock (3.46 PF measured with 256 CUs busy), then the per-kernel latency chain; achieved 1.33 PF (38%;
-AITER on codes 1.41 PF, hipBLASLt fp8 1.47 PF).
+Chain, wo_a's bf16 output + `mxfp8_linear` vs wo_a's MXFP8 epilogue + AITER on its codes (the served pair), us per pair
+(rows 528-736 also win, by 0.6-6.8 us):
+
+| M | 640 | 768 | 769 | 800 | 848 | 896 | 960 | 1024 |
+|---|---|---|---|---|---|---|---|---|
+| served pair | 73.2 | 76.7 | 85.6 | 87.0 | 85.6 | 88.8 | 88.5 | 92.8 |
+| this entry | 66.8 | 74.2 | 77.6 | 78.8 | 78.9 | 80.1 | 86.1 | 87.7 |
+
+rel. L2 to the served pair <= 1.7e-5.
+
+Limit: at M 16 the HBM weight stream, 8.02 us for 43.3 MB; achieved 11.72 us (68%). At 848 rows fp8 MFMA at the
+power-capped clock (3.46 PF measured with 256 CUs busy), then the per-kernel latency chain; quantizer launch + GEMM
+achieve 1.57 PF (45%; AITER on codes 1.38 PF, hipBLASLt fp8 1.46 PF).
 
 ## Tests
 - `python3 -m pytest tests/gemm/mxfp8_n5120_k8192 -q`
 - `python3 benchmarks/gemm/mxfp8_n5120_k8192/benchmark_mxfp8_n5120_k8192.py [--ms 16,64] [--scenarios linear] [--out result.json]`
+- `python3 benchmarks/gemm/mxfp8_n5120_k8192/benchmark_chain.py [--ms 769,848]` (the wo_a + wo_b pair)

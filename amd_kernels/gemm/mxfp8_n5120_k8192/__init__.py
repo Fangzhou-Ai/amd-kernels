@@ -16,7 +16,14 @@ def available() -> bool:
     return True
 
 
-from .host import mxfp8_linear, preshuffle_weight, serves, warmup_mxfp8_linear
+from .host import (
+    mxfp8_linear,
+    preshuffle_weight,
+    preshuffle_weight_scale,
+    serves,
+    serves_after_wo_a,
+    warmup_mxfp8_linear,
+)
 from .reference import K, N, mxfp8_linear_reference, quantize_mxfp8
 
 __all__ = [
@@ -26,7 +33,9 @@ __all__ = [
     "mxfp8_linear",
     "mxfp8_linear_reference",
     "preshuffle_weight",
+    "preshuffle_weight_scale",
     "quantize_mxfp8",
     "serves",
+    "serves_after_wo_a",
     "warmup_mxfp8_linear",
 ]

@@ -1,4 +1,4 @@
-# bf16 GEMM, K 5120, fp32 columns plus 32 bf16 columns, up to 768 rows
+# bf16 GEMM, K 5120, fp32 columns plus 32 bf16 columns, up to 1024 rows
 
 ## What it does
 
@@ -21,7 +21,7 @@ contiguous run of [column group][row group][K split], so its L2 reads each weigh
 
 - `gemm.gemm`: compute both outputs for the caller's activation rows into the caller's tensors.
 - `gemm.shuffle_weight`: the load-time layout of `[wa; wb]` (call once, before graph capture).
-- `gemm.supports`: whether the shapes fit (gfx950, M up to 768).
+- `gemm.supports`: whether the shapes fit (gfx950, M up to 1024).
 
 An entry (`amd_kernels.warm_up`): the first call per column split compiles every M tile. The shape to tile dispatch
 (tile of 16-column x 16-row blocks, K parts in flight, waves) is `host.TILES`, the best of a sweep per row count.
@@ -29,7 +29,8 @@ An entry (`amd_kernels.warm_up`): the first call per column split compiles every
 ## Performance
 
 One MI355X; one graph of 100 launches with their own activations and 8 cycled weight copies, A B B A, median of 5 x 10
-replays, us per call (a second run within 0.1 us). The baseline is two launches: `torch.mm(x, wa^T, out_dtype=float32)`
+replays, us per call (a second run within 0.1 us; the 848 and 1024 rows are one run, and 769 / 800 / 896 / 960 rows lie
+between their neighbours' ratios, 1.12-1.40x). The baseline is two launches: `torch.mm(x, wa^T, out_dtype=float32)`
 and `F.linear(x, wb)`; NA = 0 is the second launch alone.
 
 | Rows | NA 1024 | Baseline | NA 512 | Baseline | NA 0 | Baseline |
@@ -40,6 +41,8 @@ and `F.linear(x, wb)`; NA = 0 is the second launch alone.
 | 192 | 11.14 | 21.42 | 9.16 | 20.25 | 4.66 | 9.83 |
 | 384 | 16.91 | 27.25 | 13.98 | 23.34 | 5.30 | 9.86 |
 | 768 | 26.74 | 28.58 | 17.92 | 26.15 | 5.93 | 9.58 |
+| 848 | 28.86 | 33.59 | 23.04 | 27.71 | 7.27 | 10.06 |
+| 1024 | 29.32 | 32.96 | 23.34 | 27.11 | 7.49 | 9.57 |
 
 The kernel wins at every row count and column split (NA = 0: 1.6-2.1x). Limit: NA 0 is bound by launch + cold operand
 read (1.59 us empty graph node, 1.8 / 2.5 / 3.4 us cold read at 16 / 192 / 768 rows) plus the ticket / partial chain;

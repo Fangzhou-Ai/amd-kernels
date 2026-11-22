@@ -4,7 +4,7 @@
 
 The router of one MoE layer for decode rows: the gate GEMM and the biased top-6 in two launches. Input: x bf16
 `[M, 5120]` (unit column stride, any row stride), gate weight bf16 `[384, 5120]` row-major, bias fp32 `[384]`, fp32
-routed scaling factor (1.5), optional bool `is_padding [M]`. M >= 0 (tuned for decode rows 16-768; larger M works).
+routed scaling factor (1.5), optional bool `is_padding [M]`. M >= 0 (tuned for decode rows 16-1024; larger M works).
 Outputs: `topk_weights` fp32 `[M, 6]`, `topk_ids` int32 `[M, 6]` in descending `score + bias` order.
 
 Contract (`reference.py`): `logits = x @ W^T` (bf16 products, fp32 accumulate), `score = sqrt(logit if logit > 20 else
@@ -33,13 +33,14 @@ waves, XCD grid); the second launch sums the k-slice partials and picks the top 
 
 One MI355X, graph replay of 100 distinct inputs, median of 5 x 5 replays, rounds A B B A, us per call, mean of two
 runs (spread <= 0.1 us). Baseline: vLLM's `fp32_router_gemm_dispatch` (its ROCm fp32 router kernel at the smallest M,
-hipBLASLt above) + `topk_hash_softplus_sqrt`. Every launch starts with a cold L2.
+hipBLASLt above) + `topk_hash_softplus_sqrt`. Every launch starts with a cold L2. The 848 and 1024 columns are one run;
+769-1024 rows (769, 800, 896, 960 too) stay within 28.6-29.2 us (plain gate) and 20.5-20.7 us (shuffled) against 28.6-30.3 us served.
 
-| rows | 16 | 32 | 48 | 64 | 96 | 128 | 192 | 256 | 384 | 512 | 768 |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| served GEMM + top-k | 14.89 | 19.25 | 17.21 | 17.34 | 17.23 | 17.25 | 19.39 | 19.98 | 24.84 | 24.52 | 28.12 |
-| this entry (plain gate) | 6.37 | 7.01 | 8.34 | 7.96 | 9.29 | 10.14 | 10.73 | 14.00 | 16.47 | 19.60 | 22.45 |
-| this entry, `weight_shuffled` | 6.09 | 6.67 | 6.86 | 7.27 | 8.32 | 8.57 | 9.43 | 10.70 | 14.73 | 15.27 | 17.52 |
+| rows | 16 | 32 | 48 | 64 | 96 | 128 | 192 | 256 | 384 | 512 | 768 | 848 | 1024 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| served GEMM + top-k | 14.89 | 19.25 | 17.21 | 17.34 | 17.23 | 17.25 | 19.39 | 19.98 | 24.84 | 24.52 | 28.12 | 30.26 | 29.17 |
+| this entry (plain gate) | 6.37 | 7.01 | 8.34 | 7.96 | 9.29 | 10.14 | 10.73 | 14.00 | 16.47 | 19.60 | 22.45 | 28.97 | 28.91 |
+| this entry, `weight_shuffled` | 6.09 | 6.67 | 6.86 | 7.27 | 8.32 | 8.57 | 9.43 | 10.70 | 14.73 | 15.27 | 17.52 | 20.54 | 20.72 |
 
 Limit: two launches' latency (2 graph nodes x 1.59 us) + the cold read of W and x (3.1 / 4.7 us at 192 / 768 rows);
 achieved 9.43 / 17.5 us (55 / 51 %): the GEMM is operand-traffic bound through the CU L1s, the top-6 launch is 3.6 us.

@@ -32,6 +32,23 @@ def serves(m: int, table=None) -> bool:
     return r is not None and r[2]
 
 
+def serves_after_wo_a(m: int) -> bool:
+    """Whether wo_a's bf16 output through ``mxfp8_linear`` beats wo_a's MXFP8 epilogue + AITER on its codes at ``m`` rows."""
+    return _kernel.AFTER_WO_A[0] <= m <= _kernel.AFTER_WO_A[1] and serves(m)
+
+
+def preshuffle_weight_scale(weight_scale: torch.Tensor) -> torch.Tensor:
+    """The scales the entries read, for a weight that already has ``preshuffle_weight``'s code layout (AITER's
+    (16, 16) shuffle, as the served linear's): E8M0 [N, K / 32] or the 32 x 32 blocks [N / 32, K / 32]."""
+    from aiter.ops.shuffle import shuffle_scale_a16w4
+
+    assert weight_scale.dtype == torch.uint8
+    if tuple(weight_scale.shape) == (N // 32, K // 32):
+        weight_scale = weight_scale.repeat_interleave(32, dim=0)
+    assert tuple(weight_scale.shape) == (N, K // 32)
+    return shuffle_scale_a16w4(weight_scale, 1, False)
+
+
 def _run_rows(table, x, weight, weight_scale):
     m = x.shape[0]
     r = _kernel.row(table, m)

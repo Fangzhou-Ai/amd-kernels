@@ -29,6 +29,14 @@ LINEAR = (
     ("common", 768, False, ("staged_ab", 128, 256, 128, 1, 0, 1, 2, 4, None)),
 )
 
+# Row-major MXFP8 codes + e8m0 scales as the producer (``norm/rmsnorm_dual_mxfp8_q1280_kv512``) writes them, the common
+# persistent 4-wave kernel on them after one launch that moves the scales to the kernel's layout. ``serves``: the pair
+# beat AITER's FlyDSL GEMM on the same codes (the served path); at 768 rows and below AITER is faster.
+PREQUANT = (
+    ("common", 768, False, ("4wave", 256, 256, 128, 1, 1, 0, 2, 2, None)),
+    ("common", 1024, True, ("4wave", 256, 256, 128, 1, 1, 0, 2, 2, None)),
+)
+
 
 def row(table, m: int):
     """The (kind, rows <=, serves, config) of ``table`` for ``m`` rows, or None above its last row."""

@@ -12,7 +12,7 @@ import torch
 from amd_kernels.moe.router_sqrtsoftplus_top6_h5120_e384 import router_topk, shuffle_gate, warmup_router_topk
 
 NIN = 100
-ROWS = (16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768)
+ROWS = (16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 848, 1024)
 
 
 def graph(fn):

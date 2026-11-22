@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from amd_kernels.gemm.bf16_k5120_n1056_f32_n32 import gemm, shuffle_weight
 
-ROWS = [16, 48, 96, 192, 384, 768]
+ROWS = [16, 48, 96, 192, 384, 768, 848, 1024]
 SPLITS = [(1024, 32), (512, 32), (0, 32)]
 
 

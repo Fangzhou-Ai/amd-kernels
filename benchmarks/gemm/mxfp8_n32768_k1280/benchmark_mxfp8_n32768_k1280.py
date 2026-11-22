@@ -8,7 +8,7 @@ A B then B A) of 5 replays, median us per call. Served path: vLLM's Triton MXFP8
 pre-quantized scenarios start from the quantized activation. Run it with AITER's PR #6605 on ``PYTHONPATH`` for that
 column; ``--baseline-only`` times the served path alone.
 
-  python3 benchmarks/gemm/mxfp8_n32768_k1280/benchmark_mxfp8_n32768_k1280.py [--ms 16,64] [--scenarios linear] [--out result.json]
+  python3 benchmarks/gemm/mxfp8_n32768_k1280/benchmark_mxfp8_n32768_k1280.py [--ms 16,64] [--scenarios linear,prequant] [--out result.json]
 """
 
 import argparse
@@ -17,7 +17,7 @@ import statistics
 
 import torch
 
-from amd_kernels.gemm.mxfp8_n32768_k1280 import K, N, kernel, mxfp8_linear, preshuffle_weight
+from amd_kernels.gemm.mxfp8_n32768_k1280 import K, N, kernel, mxfp8_linear, mxfp8_linear_prequant, preshuffle_weight
 from amd_kernels.gemm.mxfp8_n32768_k1280.reference import COS_MIN, compare, dequantize_mxfp8, quantize_mxfp8
 
 COUNT = 100
@@ -42,7 +42,16 @@ def base_linear(x, wp, blk):
 
 SCENARIOS = {
     "linear": (kernel.LINEAR, lambda x, q, s, wp, ws, blk: mxfp8_linear(x, wp, ws), lambda x, q, s, wp, ws, blk: base_linear(x, wp, blk)),
+    # codes + row-major scales as the norm producer writes them (scales in the storage of ceil(M / 32) rows)
+    "prequant": (kernel.PREQUANT, lambda x, q, s, wp, ws, blk: mxfp8_linear_prequant(q, s, wp, ws),
+                 lambda x, q, s, wp, ws, blk: base_prequant(q, s, wp, blk)),
 }
+
+
+def padded_scale(s):
+    full = torch.empty((s.shape[0] + 31) // 32 * 32, s.shape[1], dtype=s.dtype, device=s.device)
+    full[: s.shape[0]] = s
+    return full[: s.shape[0]]
 
 
 def capture(fn):
@@ -98,7 +107,7 @@ def main():
         for m in ms:
             xs = [torch.randn(m, K, generator=gen, device="cuda").bfloat16() for _ in range(COUNT)]
             qs = [quantize_mxfp8(x) for x in xs]
-            qs = [(c, e) for c, e in qs]
+            qs = [(c, padded_scale(e)) for c, e in qs]
 
             def call(fn, j):
                 wpj, wsj, bj = copies[j % len(copies)]

@@ -2,7 +2,7 @@
 
 ## What it does
 `out [M, 32768] = x [M, 1280] @ W^T` for the wq_b of the DEP8 decode step, M = the padded decode rows 16-768 (more rows run
-the common dispatcher). `x` is bf16, quantized per 1 x 32 block (the vLLM Triton quantizer's bytes) in the GEMM's
+the common dispatcher); above 768 rows, pre-quantized codes take `mxfp8_linear_prequant`. `x` is bf16, quantized per 1 x 32 block (the vLLM Triton quantizer's bytes) in the GEMM's
 registers at small M and by a quantizer launch above it, or pre-quantized codes + row-major E8M0 scales; `W` is the
 checkpoint's E4M3 codes with 32 x 32 block scales, expanded per row and preshuffled at load. fp32 sums, one bf16
 rounding (`reference.py`: cosine >= 0.99999, L2 <= 1e-3, bitwise repeats; no atomics into outputs, the split-K sum is
@@ -13,6 +13,11 @@ fixed-order). Producer: `norm/rmsnorm_dual_mxfp8_q1280_kv512` (q codes + scales,
   this folder is registered in `gemm._SHAPE_HOSTS` (`linear`, `covers`).
 - `gemm.mxfp8_n32768_k1280.mxfp8_linear`: the GEMM from a bf16 activation; fresh bf16 output, graph-capture safe, `serves(m)` tells where it beat the served path.
 - `gemm.mxfp8_n32768_k1280.preshuffle_weight`: the load-time weight and scale preshuffle (32 x 32 block scales accepted).
+- `gemm.mxfp8_n32768_k1280.mxfp8_linear_prequant`: E4M3 codes [M, 1280] + row-major E8M0 scales [M, 40] (the norm producer's
+  output), M up to 1024: one launch moves the scales to the kernel's layout (the first M rows of a buffer of
+  `ceil(M / 32)` rows; any other storage takes the copying path), then the persistent 4-wave kernel. `serves(m, table=
+  kernel.PREQUANT)` is true above 768 rows. `preshuffle_weight_scale`: only the scales, for the served linear's weight
+  (the codes' layout is AITER's, no weight copy).
 - `gemm.mxfp8_n32768_k1280.warmup_mxfp8_linear`: compiles every row and creates the split-K counters before graph capture.
 - `kernel.py`: the row table (kernel, tile, K-waves, split-K, `serves`); the kernels are `gemm/mxfp8_decode_prequant` and `gemm/mxfp8_common`.
 
@@ -35,10 +40,20 @@ with AITER PR #6605.
 
 Falls back to the served path (AITER) at M = 32, 64, 128, 192, 256, 384, 512, 768 (and rows between them).
 
+Pre-quantized rows, us per call, against AITER's FlyDSL GEMM on the same codes and the served weight (bytes equal):
+
+| M | 769 | 800 | 848 | 896 | 960 | 1024 |
+|---|---|---|---|---|---|---|
+| aiter on codes | 45.7 | 46.1 | 46.6 | 51.3 | 50.5 | 51.4 |
+| `mxfp8_linear_prequant` | 43.4 | 43.3 | 44.1 | 44.9 | 46.7 | 48.4 |
+
+The scale launch costs 2.5 us (40.2 us without it at 848); AITER is faster at 640 and 768 rows (39.8 / 41.3 us against
+43.0 / 45.4), where those rows do not serve.
+
 Limit: at M 16 the HBM weight stream, 8.02 us for 43.3 MB; achieved 8.54 us (94%). At M 768 fp8 MFMA at the
 power-capped clock (3.46 PF measured with 256 CUs busy), then the per-kernel latency chain; achieved 1.35 PF (39%;
-AITER on codes 1.56 PF, hipBLASLt fp8 1.60 PF).
+AITER on codes 1.56 PF, hipBLASLt fp8 1.60 PF); the prequant rows reach 1.5-1.8 PF at 769-1024 rows (43-51%).
 
 ## Tests
 - `python3 -m pytest tests/gemm/mxfp8_n32768_k1280 -q`
-- `python3 benchmarks/gemm/mxfp8_n32768_k1280/benchmark_mxfp8_n32768_k1280.py [--ms 16,64] [--scenarios linear] [--out result.json]`
+- `python3 benchmarks/gemm/mxfp8_n32768_k1280/benchmark_mxfp8_n32768_k1280.py [--ms 16,64] [--scenarios linear,prequant] [--out result.json]`

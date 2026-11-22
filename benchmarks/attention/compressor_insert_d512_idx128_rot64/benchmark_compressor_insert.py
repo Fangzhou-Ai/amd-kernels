@@ -16,7 +16,7 @@ from aiter.ops.triton.fusions.k_norm_rope_mxfp4_cache import k_norm_rope_mxfp4_c
 from amd_kernels.attention.compressor_insert_d512_idx128_rot64 import compressor_insert, shuffle_wk
 from vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache import fused_save_compress_norm, rope_quant_insert
 
-ROWS = [16, 48, 96, 192, 384, 768]
+ROWS = [16, 48, 96, 192, 384, 768, 848, 1024]
 RING = 8
 ENTRIES = {1: 128, 2: 64}
 INPUT_BUDGET = 4 << 30

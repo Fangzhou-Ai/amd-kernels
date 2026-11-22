@@ -9,7 +9,7 @@ import torch
 from amd_kernels.gemm.bf16_k5120_n1056_f32_n32 import gemm, shuffle_weight, supports
 from amd_kernels.gemm.bf16_k5120_n1056_f32_n32.reference import gemm_ref
 
-ROWS = [1, 16, 17, 48, 96, 192, 384, 768]
+ROWS = [1, 16, 17, 48, 96, 192, 384, 768, 769, 848, 1024]
 SPLITS = [(1024, 32), (512, 32), (0, 32)]
 
 
@@ -57,23 +57,23 @@ def test_matches_reference(m, na, nb):
 @torch.inference_mode()
 def test_no_compile_after_warmup(monkeypatch):
     require_gfx950()
-    x, w = make(768, 1024, 32)
+    x, w = make(1024, 1024, 32)
     ws = shuffle_weight(w[:1024], w[1024:])
-    out_a = torch.empty((768, 1024), dtype=torch.float32, device="cuda")
-    out_b = torch.empty((768, 32), dtype=torch.bfloat16, device="cuda")
-    tiles = [16, 32, 96, 192, 384, 768]
+    out_a = torch.empty((1024, 1024), dtype=torch.float32, device="cuda")
+    out_b = torch.empty((1024, 32), dtype=torch.bfloat16, device="cuda")
+    tiles = [16, 32, 96, 192, 384, 768, 1024]
     for m in tiles:
         gemm(x[:m], ws, out_a[:m], out_b[:m])
     torch.cuda.synchronize()
     compiled = []
     real = flyc.compile
     monkeypatch.setattr(flyc, "compile", lambda fn, *a, **k: compiled.append(fn) or real(fn, *a, **k))
-    for m in (1, 7, 40, 100, 250, 500, 700):
+    for m in (1, 7, 40, 100, 250, 500, 700, 850, 1000):
         gemm(x[:m], ws, out_a[:m], out_b[:m])
     assert not compiled
 
 
-@pytest.mark.parametrize("na,nb,m", [(0, 32, 16), (0, 32, 192), (0, 32, 768), (512, 32, 96), (1024, 32, 384), (1024, 32, 768)])
+@pytest.mark.parametrize("na,nb,m", [(0, 32, 16), (0, 32, 192), (0, 32, 768), (512, 32, 96), (1024, 32, 384), (1024, 32, 768), (0, 32, 1024), (512, 32, 848), (1024, 32, 1024)])
 @torch.inference_mode()
 def test_k_split_deterministic_and_graph_safe(na, nb, m):
     """The K split over workgroups (partials + ticket, the last workgroup of a tile adds the splits in K order): 30

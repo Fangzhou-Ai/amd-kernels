@@ -11,17 +11,18 @@ from amd_kernels.warm_up import entry
 from . import kernel as _kernel
 
 K = _kernel.K
-MAX_M = 768
+MAX_M = 1024
 MAX_PART_BYTES = 8 << 20  # K split partials: at most 6.6 MB over the tile table (splits x tile groups x tile bytes)
 MAX_TICKETS = 512  # tile groups (at most 224 over the tile table)
 # (rows up to, 16-column tiles, 16-row tiles, K steps in flight, waves, K splits) of a workgroup, by the fp32 columns; the best of
 # a sweep per row count (the last number: the K split over workgroups)
 TILES = {
     1024: ((16, 2, 1, 2, 8, 5), (48, 4, 1, 2, 8, 4), (96, 4, 2, 4, 8, 5), (192, 4, 2, 4, 8, 5), (384, 5, 3, 2, 8, 2),
-           (MAX_M, 5, 3, 2, 8, 1)),
+           (768, 5, 3, 2, 8, 1), (MAX_M, 6, 3, 1, 8, 1)),
     512: ((16, 1, 1, 4, 4, 4), (48, 2, 1, 2, 8, 4), (96, 2, 2, 4, 8, 5), (192, 4, 1, 2, 4, 2), (384, 4, 2, 4, 8, 2),
-          (MAX_M, 5, 3, 2, 4, 4)),
-    0: ((16, 1, 1, 4, 4, 10), (96, 2, 1, 2, 4, 10), (192, 1, 1, 4, 4, 5), (384, 1, 1, 4, 4, 4), (MAX_M, 2, 1, 4, 8, 5)),
+          (768, 5, 3, 2, 4, 4), (MAX_M, 5, 2, 1, 4, 1)),
+    0: ((16, 1, 1, 4, 4, 10), (96, 2, 1, 2, 4, 10), (192, 1, 1, 4, 4, 5), (384, 1, 1, 4, 4, 4), (768, 2, 1, 4, 8, 5),
+        (MAX_M, 2, 1, 2, 2, 4)),
 }
 
 
@@ -31,7 +32,7 @@ def _on_gfx950() -> bool:
 
 
 def supports(x: torch.Tensor, w: torch.Tensor, na: int) -> bool:
-    """gfx950, bf16 ``x [M <= 768, 5120]`` and ``w`` in ``shuffle_weight``'s layout, ``na`` one of 1024 / 512 / 0 and ``w`` of ``na + 32`` rows."""
+    """gfx950, bf16 ``x [M <= 1024, 5120]`` and ``w`` in ``shuffle_weight``'s layout, ``na`` one of 1024 / 512 / 0 and ``w`` of ``na + 32`` rows."""
     return (
         _on_gfx950()
         and x.dtype == w.dtype == torch.bfloat16

@@ -56,6 +56,7 @@ _TILES = (
     (384, (3, 3, 8, 1, 5, 2, 4)),
     (512, (2, 3, 2, 4, 5, 8, 1)),
     (768, (3, 6, 8, 2, 2, 2, 4)),
+    (1024, (4, 3, 10, 1, 4, 8, 1)),
 )
 _LARGE = (4, 3, 1, 4, 5, 8, 1)
 # the same for the load-time layout of the gate (``shuffle_gate``): a wave's weight fragment is one 1 KB run
@@ -72,6 +73,7 @@ _TILES_SHUF = (
     (384, (3, 2, 8, 1, 5, 2, 4)),
     (512, (2, 3, 4, 2, 5, 8, 1)),
     (768, (3, 3, 8, 1, 5, 8, 1)),
+    (1024, (2, 4, 4, 1, 5, 8, 1)),
 )
 
 
@@ -125,7 +127,7 @@ def _mode(x, weight, bias, routed_scaling_factor=1.5, *, is_padding=None, weight
 
 
 def _sizes(mode):
-    return tuple(bound for bound, _ in _TILES) + (769,)  # the shuffled table has the same bounds
+    return tuple(bound for bound, _ in _TILES) + (1025,)  # the shuffled table has the same bounds; 1025: ``_LARGE``
 
 
 def _inputs(mode, n, x, weight, bias, routed_scaling_factor=1.5, *, is_padding=None, weight_shuffled=False, **kw):

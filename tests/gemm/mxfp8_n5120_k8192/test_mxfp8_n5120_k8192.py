@@ -12,12 +12,15 @@ import sys
 import pytest
 import torch
 
-from amd_kernels.gemm.mxfp8_n5120_k8192 import K, N, kernel, mxfp8_linear, preshuffle_weight, serves
+from aiter.ops.shuffle import shuffle_weight
+from amd_kernels.gemm.mxfp8_n5120_k8192 import (
+    K, N, kernel, mxfp8_linear, preshuffle_weight, preshuffle_weight_scale, serves, serves_after_wo_a,
+)
 from amd_kernels.gemm.mxfp8_n5120_k8192.reference import COS_MIN, REL_L2_MAX, compare, dequantize_mxfp8, mxfp8_linear_reference, quantize_mxfp8
 
-MS = [16, 32, 64, 128, 192, 256, 384, 512, 768]
+MS = [16, 32, 64, 128, 192, 256, 384, 512, 640, 768, 1024]
 BETWEEN = [1, 5, 17, 50, 100, 150, 200, 300, 500, 700]
-BEYOND = [769, 1100]
+BEYOND = [769, 800, 848, 896, 960, 1025, 1100]
 _W = {}
 
 
@@ -47,6 +50,20 @@ def test_rows_cover():
         assert bounds == sorted(set(bounds)) and bounds[-1] == max(MS)
     assert kernel.row(kernel.LINEAR, 1) is not None and kernel.row(kernel.LINEAR, max(MS) + 1) is None
     assert serves(1) in (True, False)
+
+
+def test_after_wo_a_rows():
+    assert not serves_after_wo_a(768) and serves_after_wo_a(769) and serves_after_wo_a(1024) and not serves_after_wo_a(1025)
+    assert all(serves(m) for m in (513, 640, 768, 769, 848, 1024))
+
+
+def test_weight_scale_preshuffle_of_the_served_layout():
+    require_gfx950()
+    w = weights()
+    block = w["s"][::32].contiguous()
+    assert torch.equal(preshuffle_weight_scale(block), preshuffle_weight(w["q"], block)[1])
+    assert torch.equal(preshuffle_weight_scale(w["s"]), preshuffle_weight(w["q"], w["s"])[1])
+    assert torch.equal(shuffle_weight(w["q"], layout=(16, 16)), w["packed"][0])  # the served linear's weight bytes
 
 
 def test_block_scale_preshuffle():
@@ -120,7 +137,7 @@ def scenario():
     MlirCompiler.compile = spy
     w = weights()
     bad = []
-    for m in [1, 16, 33, 64, 100, 192, 300, 384, 512, 768]:
+    for m in [1, 16, 33, 64, 100, 192, 300, 384, 512, 600, 768, 800, 1024]:
         before = len(late)
         mxfp8_linear(activation(m), *w["packed"])
         if len(late) > before and m != 1:

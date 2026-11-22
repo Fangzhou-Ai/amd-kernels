@@ -12,12 +12,16 @@ import sys
 import pytest
 import torch
 
-from amd_kernels.gemm.mxfp8_n32768_k1280 import K, N, kernel, mxfp8_linear, preshuffle_weight, serves
+from aiter.ops.shuffle import shuffle_weight
+from amd_kernels.gemm.mxfp8_n32768_k1280 import (
+    K, N, kernel, mxfp8_linear, mxfp8_linear_prequant, preshuffle_weight, preshuffle_weight_scale, serves,
+)
 from amd_kernels.gemm.mxfp8_n32768_k1280.reference import COS_MIN, REL_L2_MAX, compare, dequantize_mxfp8, mxfp8_linear_reference, quantize_mxfp8
 
 MS = [16, 32, 64, 128, 192, 256, 384, 512, 768]
 BETWEEN = [1, 5, 17, 50, 100, 150, 200, 300, 500, 700]
 BEYOND = [769, 1100]
+PQ = [33, 640, 768, 769, 800, 848, 896, 960, 1024]  # pre-quantized rows: the 4-wave table
 _W = {}
 
 
@@ -47,6 +51,69 @@ def test_rows_cover():
         assert bounds == sorted(set(bounds)) and bounds[-1] == max(MS)
     assert kernel.row(kernel.LINEAR, 1) is not None and kernel.row(kernel.LINEAR, max(MS) + 1) is None
     assert serves(1) in (True, False)
+
+
+def test_prequant_rows():
+    bounds = [row[1] for row in kernel.PREQUANT]
+    assert bounds == sorted(set(bounds)) and bounds[-1] == 1024 and kernel.row(kernel.PREQUANT, 1025) is None
+    assert not serves(768, table=kernel.PREQUANT) and serves(769, table=kernel.PREQUANT) and serves(1024, table=kernel.PREQUANT)
+
+
+def padded_scale(s):
+    """The first m rows of a tensor with ceil(m / 32) rows of storage (what the producer hands over)."""
+    m = s.shape[0]
+    full = torch.empty((m + 31) // 32 * 32, s.shape[1], dtype=s.dtype, device=s.device)
+    full[:m] = s
+    return full[:m]
+
+
+def test_weight_scale_preshuffle_of_the_served_layout():
+    require_gfx950()
+    w = weights()
+    block = w["s"][::32].contiguous()
+    assert torch.equal(preshuffle_weight_scale(block), preshuffle_weight(w["q"], block)[1])
+    assert torch.equal(preshuffle_weight_scale(w["s"]), preshuffle_weight(w["q"], w["s"])[1])
+    assert torch.equal(shuffle_weight(w["q"], layout=(16, 16)), w["packed"][0])  # the served linear's weight bytes
+
+
+@pytest.mark.parametrize("m", PQ)
+@torch.inference_mode()
+def test_prequant_matches_reference(m):
+    require_gfx950()
+    w = weights()
+    x = activation(m)
+    codes, scale = quantize_mxfp8(x)
+    out = mxfp8_linear_prequant(codes, padded_scale(scale), *w["packed"])
+    assert out.shape == (m, N) and out.dtype == torch.bfloat16 and torch.isfinite(out.float()).all()
+    r = compare(out, mxfp8_linear_reference(x, w["q"], w["s"]))
+    assert r["cos"] >= COS_MIN and r["rel_l2"] <= REL_L2_MAX, (m, r)
+    # storage without the padding rows takes the copying scale path: the same bytes
+    assert torch.equal(out, mxfp8_linear_prequant(codes, scale.clone(), *w["packed"]))
+    assert torch.equal(out, mxfp8_linear_prequant(codes, padded_scale(scale), *w["packed"]))
+
+
+@pytest.mark.parametrize("m", [769, 848, 1024])
+@torch.inference_mode()
+def test_prequant_graph_replay_changed_inputs(m):
+    require_gfx950()
+    w = weights()
+    x = activation(m, 1)
+    codes, scale = quantize_mxfp8(x)
+    scale = padded_scale(scale)
+    mxfp8_linear_prequant(codes, scale, *w["packed"])
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = mxfp8_linear_prequant(codes, scale, *w["packed"])
+    for seed in (2, 3):
+        x = activation(m, seed)
+        c, sc = quantize_mxfp8(x)
+        codes.copy_(c)
+        scale.copy_(sc)
+        out.fill_(float("nan"))
+        graph.replay()
+        r = compare(out, mxfp8_linear_reference(x, w["q"], w["s"]))
+        assert r["cos"] >= COS_MIN and r["rel_l2"] <= REL_L2_MAX, (m, seed, r)
 
 
 def test_block_scale_preshuffle():
@@ -124,6 +191,12 @@ def scenario():
         before = len(late)
         mxfp8_linear(activation(m), *w["packed"])
         if len(late) > before and m != 1:
+            bad.append(m)
+    for m in [769, 848, 1024]:
+        before = len(late)
+        codes, scale = quantize_mxfp8(activation(m))
+        mxfp8_linear_prequant(codes, scale, *w["packed"])
+        if len(late) > before:
             bad.append(m)
     torch.cuda.synchronize()
     return {"late": bad, "warmed": len(warm_up.warmed())}

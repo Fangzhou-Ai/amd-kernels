@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""bf16 [M, 5120] x bf16 [NA + NB, 5120]^T for M up to 768: the first NA output columns fp32 (the compressor's
+"""bf16 [M, 5120] x bf16 [NA + NB, 5120]^T for M up to 1024: the first NA output columns fp32 (the compressor's
 kv_score), the last NB columns bf16 (the indexer's weights_proj), FlyDSL (gfx950).
 
 A workgroup of NW waves takes NT 16-column tiles x MT 16-row tiles of the output. Wave w sums the K part

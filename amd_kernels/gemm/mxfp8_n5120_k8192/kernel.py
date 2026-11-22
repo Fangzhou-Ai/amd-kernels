@@ -26,8 +26,13 @@ LINEAR = (
     ("common", 256, True, ("decode", 128, 80, 128, 0, 0, 2, 2, 0, 1)),
     ("common", 384, True, ("decode", 128, 64, 128, 0, 0, 1, 2, 0, 0)),
     ("common", 512, True, ("decode", 128, 80, 128, 0, 0, 1, 4, 0, 0)),
-    ("common", 768, False, ("staged_ab", 256, 128, 128, 1, 0, 2, 2, 4, None)),
+    ("common", 640, True, ("decode", 96, 80, 128, 0, 0, 1, 2, 0, 0)),
+    ("common", 768, True, ("decode", 112, 80, 128, 0, 0, 1, 2, 0, 0)),
+    ("common", 1024, True, ("decode", 128, 80, 128, 0, 0, 1, 2, 0, 0)),
 )
+# Rows where wo_a's bf16 output through this entry (quantizer launch + GEMM) beats wo_a's MXFP8 epilogue + AITER on its
+# codes (the pair the served flow runs): below 513 the two are within noise.
+AFTER_WO_A = (769, 1024)
 
 
 def row(table, m: int):

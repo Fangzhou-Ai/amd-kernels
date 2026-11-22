@@ -26,13 +26,13 @@ def scenario():
 
     MlirCompiler.compile = spy
     bad = []
-    x = torch.randn((768, 5120), dtype=torch.bfloat16, device="cuda")
+    x = torch.randn((1024, 5120), dtype=torch.bfloat16, device="cuda")
     for na in (1024, 512, 0):
         w = shuffle_weight(torch.randn((na, 5120), dtype=torch.bfloat16, device="cuda") if na else None,
                            torch.randn((32, 5120), dtype=torch.bfloat16, device="cuda"))
-        out_a = torch.empty((768, na), dtype=torch.float32, device="cuda") if na else None
-        out_b = torch.empty((768, 32), dtype=torch.bfloat16, device="cuda")
-        for n in (1, 3, 8, 21, 64, 150, 300, 768):
+        out_a = torch.empty((1024, na), dtype=torch.float32, device="cuda") if na else None
+        out_b = torch.empty((1024, 32), dtype=torch.bfloat16, device="cuda")
+        for n in (1, 3, 8, 21, 64, 150, 300, 768, 769, 1024):
             before = len(late)
             gemm(x[:n], w, None if out_a is None else out_a[:n], out_b[:n])
             if len(late) > before:
