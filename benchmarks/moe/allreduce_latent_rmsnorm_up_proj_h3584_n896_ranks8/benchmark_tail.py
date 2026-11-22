@@ -99,6 +99,6 @@ if __name__ == "__main__":
     p.add_argument("--rows", nargs="+", type=int, default=[12, 24, 40, 65, 80, 128, 192])
     p.add_argument("--rounds", type=int, default=5)
     a = p.parse_args()
-    from tests.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8.multi_gpu8 import run_on_8_gpus
+    from tests.multi_gpu8 import run_on_8_gpus
 
     run_on_8_gpus(worker, a.rows, a.rounds, timeout=900)

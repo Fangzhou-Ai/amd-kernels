@@ -11,7 +11,7 @@ from amd_kernels.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8 import (
 )
 from amd_kernels.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8.reference import slot_sum_reference
 
-from tests.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8.multi_gpu8 import run_on_8_gpus
+from tests.multi_gpu8 import run_on_8_gpus
 from tests.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8.test_latent_tail import bits, check
 from tests.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8.workload import K, N, WORLD, rand
 

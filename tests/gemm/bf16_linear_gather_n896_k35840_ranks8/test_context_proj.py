@@ -8,7 +8,7 @@ from amd_kernels.gemm.bf16_linear_gather_n896_k35840_ranks8 import ProjComm, con
 from amd_kernels.gemm.bf16_linear_gather_n896_k35840_ranks8.reference import (K, N_FULL, N_SHARD, gather_norm_reference,
                                                                               linear_reference)
 
-from tests.gemm.bf16_linear_gather_n896_k35840_ranks8.multi_gpu8 import run_on_8_gpus
+from tests.multi_gpu8 import run_on_8_gpus
 
 ROWS = (12, 40, 65, 80, 192, 200, 240, 256)
 

@@ -5,7 +5,7 @@ the warm-up), then every row count 1..256 compiles nothing."""
 import torch
 import torch.distributed as dist
 
-from tests.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8.multi_gpu8 import run_on_8_gpus
+from tests.multi_gpu8 import run_on_8_gpus
 from tests.moe.allreduce_latent_rmsnorm_up_proj_h3584_n896_ranks8.workload import K, N, rand
 
 WALK_ROWS = (1, 7, 16, 17, 33, 48, 65, 100, 129, 191, 192, 193, 256)

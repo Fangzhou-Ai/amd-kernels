@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from .harness import run_on_8_gpus
+from tests.multi_gpu8 import run_on_8_gpus
 
 W = 8
 TOKENS = ([1, 12, 16, 17, 24, 33, 40], [65, 80, 128, 129, 192], [193, 200, 240, 256])

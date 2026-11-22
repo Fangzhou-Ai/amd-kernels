@@ -133,7 +133,7 @@ if __name__ == "__main__":
     p.add_argument("--write", action="store_true")
     p.add_argument("--rounds", type=int, default=5)
     a = p.parse_args()
-    from tests.norm.allreduce_attnres_rmsnorm_h7168_ranks8.multi_gpu8 import run_on_8_gpus
+    from tests.multi_gpu8 import run_on_8_gpus
 
     for m in a.rows:
         run_on_8_gpus(worker, m, a.blocks, a.write, a.rounds)

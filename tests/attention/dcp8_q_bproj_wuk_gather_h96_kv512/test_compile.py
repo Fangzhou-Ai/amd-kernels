@@ -14,7 +14,7 @@ from amd_kernels.attention.dcp8_q_bproj_wuk_gather_h96_kv512 import (
     q_b_wuk_allgather_latent,
 )
 
-from tests.attention.dcp8_q_bproj_wuk_gather_h96_kv512.multi_gpu8 import run_on_8_gpus
+from tests.multi_gpu8 import run_on_8_gpus
 
 ROWS = (1, 5, 6, 10, 12, 15, 16, 17, 24, 30, 40, 45, 48, 49, 65, 80, 96, 97, 128, 160, 192, 193, 256)
 

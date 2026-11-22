@@ -8,7 +8,7 @@ from amd_kernels.gemm.bf16_linear_gather_n896_k35840_ranks8.ipc import f32_bits,
 from amd_kernels.gemm.bf16_linear_gather_n896_k35840_ranks8.reduce_gather import compile_reduce_gather
 from amd_kernels.gemm.bf16_linear_gather_n896_k35840_ranks8.reference import N_FULL, N_SHARD, gather_norm_reference
 
-from tests.gemm.bf16_linear_gather_n896_k35840_ranks8.multi_gpu8 import run_on_8_gpus
+from tests.multi_gpu8 import run_on_8_gpus
 
 ROWS = (1, 12, 40, 65, 80, 192, 240, 256)
 SPLITS = (1, 7, 35)

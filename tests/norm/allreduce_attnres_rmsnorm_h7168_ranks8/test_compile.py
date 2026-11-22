@@ -5,7 +5,7 @@ served row counts, eager and in a graph, compile nothing."""
 import torch
 import torch.distributed as dist
 
-from tests.norm.allreduce_attnres_rmsnorm_h7168_ranks8.multi_gpu8 import run_on_8_gpus
+from tests.multi_gpu8 import run_on_8_gpus
 from tests.norm.allreduce_attnres_rmsnorm_h7168_ranks8.workload import SERVED_ROWS, make
 
 MODES = (  # (prefix, bank rows used, write idx, output norm, reduce, bank, packed output)

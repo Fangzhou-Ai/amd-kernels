@@ -8,7 +8,7 @@ import random
 import torch
 import torch.distributed as dist
 
-from .harness import run_on_8_gpus
+from tests.multi_gpu8 import run_on_8_gpus
 
 W = 8
 

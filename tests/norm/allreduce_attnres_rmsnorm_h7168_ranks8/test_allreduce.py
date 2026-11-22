@@ -9,7 +9,7 @@ from amd_kernels.norm.allreduce_attnres_rmsnorm_h7168_ranks8.reference import (
     unpack_tiles,
 )
 
-from tests.norm.allreduce_attnres_rmsnorm_h7168_ranks8.multi_gpu8 import run_on_8_gpus
+from tests.multi_gpu8 import run_on_8_gpus
 from tests.norm.allreduce_attnres_rmsnorm_h7168_ranks8.workload import CASES, SERVED_ROWS, make
 
 

@@ -24,7 +24,7 @@ from amd_kernels.norm.allreduce_attnres_rmsnorm_h7168_ranks8.norm_math import (
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from tests.norm.allreduce_attnres_rmsnorm_h7168_ranks8.multi_gpu8 import run_on_8_gpus
+from tests.multi_gpu8 import run_on_8_gpus
 
 
 def _now():
