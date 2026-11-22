@@ -48,6 +48,6 @@ The weight stream lands at ~6.3 TB/s (the measured ceiling); the kernel is that 
 ## Tests
 
 ```bash
-python3 -m pytest tests/attention/kda_mono_decode_k1_h12_d128_ranks8 -q
-python3 benchmarks/attention/kda_mono_decode_k1_h12_d128_ranks8/benchmark_k1.py
+python3 -m pytest tests/attention/kda_mono_decode_k1_h12_d128 -q
+python3 benchmarks/attention/kda_mono_decode_k1_h12_d128/benchmark_k1.py
 ```

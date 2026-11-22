@@ -81,5 +81,5 @@ def test_prefill(auto_warm_up, monkeypatch):
 
 @torch.inference_mode()
 def test_mono(auto_warm_up, monkeypatch):
-    walk("attention/kda_mono_decode_k1_h12_d128_ranks8", [lambda s=s: cases.mono(s, 4) for s in MONO_ROWS])
+    walk("attention/kda_mono_decode_k1_h12_d128", [lambda s=s: cases.mono(s, 4) for s in MONO_ROWS])
     graph_replays_eager(lambda: cases.mono(12, 4), monkeypatch)

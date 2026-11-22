@@ -118,9 +118,9 @@ One line per kernel package. Each package's README has what it does, its entry p
 - [`attention/kda_prefill_h12_d128`](attention/kda_prefill_h12_d128/README.md): the linear-attention (KDA) chunked
   prefill: conv + SiLU, gate and q / k norms, the chunk-group delta-rule scan with fp32 recurrent states, the gated
   RMSNorm (one launch for short batches, staged launches for long ones).
-- [`attention/kda_mono_decode_k1_h12_d128_ranks8`](attention/kda_mono_decode_k1_h12_d128_ranks8/README.md): one
-  persistent launch of a KDA layer's decode (AttnRes, in_proj, conv, delta-rule recurrence, gated norm) for a
-  spec-verify step of up to 16 rows.
+- [`attention/kda_mono_decode_k1_h12_d128`](attention/kda_mono_decode_k1_h12_d128/README.md): one persistent launch of
+  a KDA layer's decode (AttnRes, in_proj, conv, delta-rule recurrence, gated norm) for a spec-verify step of up to 16
+  rows.
 
 ## Indexer
 

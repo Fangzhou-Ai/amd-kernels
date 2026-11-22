@@ -12,7 +12,7 @@ import torch
 
 from . import device as _dev
 
-_SHAPE_HOSTS = {(7168, 12, 128): "amd_kernels.attention.kda_mono_decode_k1_h12_d128_ranks8"}
+_SHAPE_HOSTS = {(7168, 12, 128): "amd_kernels.attention.kda_mono_decode_k1_h12_d128"}
 _OP = "kda_mono_decode"
 
 

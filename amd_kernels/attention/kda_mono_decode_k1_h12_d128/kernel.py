@@ -111,7 +111,7 @@ TL_POINTS = 32
 _STREAM = fx.Stream(None)
 REGIONS = ("xrdy", "proj", "onrm")
 # every mono source file: in every build's JIT cache key
-_SOURCES = source_digest("common/mono", "attention/kda_mono_decode_k1_h12_d128_ranks8")
+_SOURCES = source_digest("common/mono", "attention/kda_mono_decode_k1_h12_d128")
 
 
 @dataclass(frozen=True)

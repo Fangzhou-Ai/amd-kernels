@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from amd_kernels.attention.kda_mono_decode_k1_h12_d128_ranks8 import reference as R
+from amd_kernels.attention.kda_mono_decode_k1_h12_d128 import reference as R
 
 bf = torch.bfloat16
 NPROJ = 6288

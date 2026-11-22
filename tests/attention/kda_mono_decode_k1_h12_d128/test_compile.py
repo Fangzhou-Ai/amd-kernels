@@ -9,7 +9,7 @@ import torch
 from amd_kernels import warm_up
 from flydsl.compiler.jit_function import CompiledFunction, MlirCompiler
 
-from amd_kernels.attention.kda_mono_decode_k1_h12_d128_ranks8 import Workspace, kda_mono_decode_k1
+from amd_kernels.attention.kda_mono_decode_k1_h12_d128 import Workspace, kda_mono_decode_k1
 
 from .workload import clone_state, make, require_gfx950
 

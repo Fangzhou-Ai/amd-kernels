@@ -6,7 +6,7 @@ determinism, and a CUDA graph of two launches replayed over poisoned outputs."""
 
 import pytest
 import torch
-from amd_kernels.attention.kda_mono_decode_k1_h12_d128_ranks8 import Workspace, kda_mono_decode_k1
+from amd_kernels.attention.kda_mono_decode_k1_h12_d128 import Workspace, kda_mono_decode_k1
 
 from .workload import clone_state, cos, make, reference, rel_l2, require_gfx950
 
@@ -56,7 +56,7 @@ def test_block_write_and_no_delta(S, L):
     ws.begin_step()
     s = clone_state(w)
     s["delta"] = None
-    from amd_kernels.attention.kda_mono_decode_k1_h12_d128_ranks8 import reference as R
+    from amd_kernels.attention.kda_mono_decode_k1_h12_d128 import reference as R
 
     ref = clone_state(w)
     ref_core = R.kda_decode_k1(

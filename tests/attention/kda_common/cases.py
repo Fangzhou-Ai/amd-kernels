@@ -11,12 +11,12 @@ from amd_kernels.attention import kda_common as E
 from amd_kernels.attention.kda_prefill_h12_d128 import reference as PR
 
 from tests.attention.kda_decode_fb_gate_spec_h12_d128.inputs import make_inputs
-from tests.attention.kda_mono_decode_k1_h12_d128_ranks8.workload import make as make_mono
+from tests.attention.kda_mono_decode_k1_h12_d128.workload import make as make_mono
 from tests.attention.kda_prefill_h12_d128.inputs import make_case
 
 DECODE_PKG = "amd_kernels.attention.kda_decode_fb_gate_spec_h12_d128"
 PREFILL_PKG = "amd_kernels.attention.kda_prefill_h12_d128"
-MONO_PKG = "amd_kernels.attention.kda_mono_decode_k1_h12_d128_ranks8"
+MONO_PKG = "amd_kernels.attention.kda_mono_decode_k1_h12_d128"
 
 
 class Call:

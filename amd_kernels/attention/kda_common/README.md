@@ -9,7 +9,7 @@ the shape package that serves it, so the caller imports no shape package:
 |---|---|---|
 | `kda_decode_fb_gate_spec` | (heads, head_dim) of the recurrent state [slots, heads, d, d] | `kda_decode_fb_gate_spec_h12_d128` |
 | `kda_prefill` | (heads, head_dim) of the recurrent state cache | `kda_prefill_h12_d128` |
-| `kda_mono_decode` | (hidden, heads, head_dim) of `prefix` [S, hidden] and the state | `kda_mono_decode_k1_h12_d128_ranks8` |
+| `kda_mono_decode` | (hidden, heads, head_dim) of `prefix` [S, hidden] and the state | `kda_mono_decode_k1_h12_d128` |
 
 The single-rank kernels take no world size: 12 local heads already are the TP8 shard. Arguments, dtypes and the
 numerics contract are the routed package's (its `reference.py`); the entry's outputs and in-place states are bit for bit

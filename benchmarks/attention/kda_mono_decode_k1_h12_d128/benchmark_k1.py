@@ -5,7 +5,7 @@ LLC, so every launch streams in_proj from HBM as a layer of the model does), med
 rounds], with its roofline: bytes read and written against the HBM ceilings measured on MI355X (6.5 TB/s
 read, 6.0 TB/s write, 1.57 us graph launch gap).
 
-    python benchmarks/attention/kda_mono_decode_k1_h12_d128_ranks8/benchmark_k1.py [--shapes 12x6 6x6 ...] [--nb 4]
+    python benchmarks/attention/kda_mono_decode_k1_h12_d128/benchmark_k1.py [--shapes 12x6 6x6 ...] [--nb 4]
 """
 
 import argparse
@@ -13,7 +13,7 @@ import statistics
 
 import torch
 
-from amd_kernels.attention.kda_mono_decode_k1_h12_d128_ranks8 import Workspace, kda_mono_decode_k1
+from amd_kernels.attention.kda_mono_decode_k1_h12_d128 import Workspace, kda_mono_decode_k1
 
 HIDDEN, NPROJ, PROJ, NH, HD = 7168, 6288, 1536, 12, 128
 READ_TBS, WRITE_TBS, LAUNCH_US = 6.5, 6.0, 1.57

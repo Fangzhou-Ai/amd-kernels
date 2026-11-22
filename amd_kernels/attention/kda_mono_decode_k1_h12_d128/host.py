@@ -11,7 +11,7 @@ from amd_kernels import warm_up
 from . import kernel as K
 from .kernel import BLOCKS, MAX_S, KdaPreBuild
 
-NAME = "attention/kda_mono_decode_k1_h12_d128_ranks8"
+NAME = "attention/kda_mono_decode_k1_h12_d128"
 HIDDEN, PROJ, NPROJ, NH, HD = K.HIDDEN, K.PROJ, K.NPROJ, K.NH, K.HD
 
 
