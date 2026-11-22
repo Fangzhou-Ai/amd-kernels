@@ -157,7 +157,10 @@ def test_routes_each_covered_key(monkeypatch):
             E.qkv_a_norm_kv_insert(*args)
             (got, _), = rec.calls
             assert got[:8] == args[:8]
-            assert (got[8] is None) if not index else (got[8] == pkg.IndexSide(**args[8]))
+            if index:  # field by field: a dataclass compares tensors with == from Python 3.13
+                assert isinstance(got[8], pkg.IndexSide) and all(getattr(got[8], k) is v for k, v in args[8].items())
+            else:
+                assert got[8] is None
         pkg = prologue._index_host((32, 128))
         monkeypatch.setattr(pkg, "indexer_prep", rec := Recorder())
         E.indexer_prep(*prep_args(n))
