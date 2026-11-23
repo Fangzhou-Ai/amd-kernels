@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
 """Per-step timeline of the fused chain from the kernel's own timestamps (``s_memrealtime``, 100 MHz, wave 0 of every
-workgroup, written to the scratch with ``AMD_KERNELS_MARKOV_TS=1``), under the benchmark's conditions (graph replay,
+workgroup, written to the scratch by a ``kernel.TS = True`` build), under the benchmark's conditions (graph replay,
 rotated ``markov_w2`` copies and inputs). Per step: the tile loop's start, its end (min / median / max over the 256
 workgroups: the spread), the last aggregation, and the tokens at workgroup 0.
 Run: python3 benchmarks/sampling/markov_gumbel_fused_v163840_r512/timeline.py 8 4   (requests, steps)
 """
 
-import os
 import sys
-
-os.environ["AMD_KERNELS_MARKOV_TS"] = "1"
 
 import numpy as np
 import torch
@@ -22,6 +19,8 @@ from amd_kernels.sampling.markov_gumbel_fused_v163840_r512 import (
     markov_gumbel_fused,
     scratch_dwords,
 )
+
+kernel.TS = True  # the stamps; read when the kernel is traced, so before its first call
 
 
 def main():

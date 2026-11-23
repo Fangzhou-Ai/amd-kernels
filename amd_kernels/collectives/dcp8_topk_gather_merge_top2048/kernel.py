@@ -24,8 +24,8 @@ Two receive slots (call parity) bound peer lead and lag: a peer starts call c + 
 rank cannot end call c + 1 before every peer pushed its first round of c + 1, which follows that peer's reads of call c.
 Receivers zero what they read at the end of the call. The device counter is advanced by the last workgroup to arrive
 (ticket) after every workgroup has read it, so graph replays never reuse a host sequence. Waits are atomic loads (a
-plain-load wait loop is deleted by the compiler) and bounded by SPIN_LIMIT; DCP8_TIMING=1 builds stamp the phases
-into the debug buffer. Outputs use plain stores.
+plain-load wait loop is deleted by the compiler) and bounded by SPIN_LIMIT; a build with TIMING = True stamps the
+phases into the debug buffer. Outputs use plain stores.
 """
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -64,7 +64,7 @@ SPIN_LIMIT = 1 << 28
 SLEEP = 1
 STAG = 2
 STAG_MIN_ROWS = 64
-TIMING = bool(__import__("os").environ.get("DCP8_TIMING"))
+TIMING = False  # True: stamp the phases into the debug buffer (benchmark_gather_merge.py prints them)
 
 
 def _now():

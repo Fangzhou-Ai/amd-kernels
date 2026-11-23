@@ -18,6 +18,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from amd_kernels.collectives.dcp8_topk_gather_merge_top2048 import TopkGatherMerge
+from amd_kernels.collectives.dcp8_topk_gather_merge_top2048 import kernel as K
 from amd_kernels.collectives.dcp8_topk_gather_merge_top2048.reference import reference
 
 MAX_ROWS = 256
@@ -114,7 +115,7 @@ def run(rank, port, with_stock):
                 print(f"   stock parts: all-gather {t_g:.1f} us, merge_dcp_scores {t_m:.1f} us", flush=True)
         else:
             t_s = t_g = float("nan")
-        if os.environ.get("DCP8_TIMING"):
+        if K.TIMING:
             g2 = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g2):
                 for s_ in sets[:20]:
