@@ -16,24 +16,24 @@ alternating buffers): module docstring of `kernel.py`. The rows are valid until 
 - `RowAllToAll.warmup`: a collective before capture; compiles both pushes and the wait.
 - `RowAllToAll.__call__`: push of rows `[rows, 20480]` (owner-sorted with `counts`, a CUDA int32 `[8]` the same on every
   rank; or all-gather without) and wait; read the rows with `recv(n)`.
-- `RowAllToAll.gemm_exchange`: the lm_head shard GEMM (`gemm/bf16_n20480_k7168`) of `x[row_indices]` and the exchange of its
-  output in one call: the GEMM pushes its rows itself up to 96 rows (owner mode) / 16 rows (all-gather), above that it writes them
-  locally and one contiguous push moves them. This is the entry the model calls.
-- `RowAllToAll.send_args`, `RowAllToAll.wait`, `RowAllToAll.recv`: for a producer that pushes the rows itself, then the wait and
-  the in-place view.
+- `RowAllToAll.send_args`, `RowAllToAll.wait`, `RowAllToAll.recv`: for a producer that pushes the rows itself (the
+  lm_head GEMM `gemm/bf16_n20480_k7168`), then the wait and the in-place view. `collectives/logits_exchange_common`
+  composes that GEMM with this exchange (`gemm_exchange`, the call the model makes): the GEMM pushes its rows itself up
+  to 96 rows (owner mode) / 16 rows (all-gather), above that it writes them locally and `__call__` moves them.
 - `RowAllToAll.close`: a collective, after every graph that uses the communicator is retired.
 
 All ranks call every exchange in the same order, empty receivers included; one communicator per stream.
 
 ## Performance
 
-MI355X, eight ranks, `benchmark_exchange.py`: hidden rows replicated, owner-sorted rows (request r on rank r % 8, 4 rows per
-request), the lm_head GEMM included in every column, graph replay of 6 distinct inputs over three weight copies (880 MB),
-minimum of nine rounds, MAX over ranks, us per call. `vLLM AG` = `rocm_unquantized_gemm_impl` +
-`tensor_model_parallel_all_gather` (vLLM's default); `vLLM A2A` = GEMM + `all_to_all_single` + permute (vLLM's batch-sharded
-sampling); `this AG` / `this owner` = `gemm_exchange` to every rank / to the owners (rows read in place). Ceiling = the GEMM at
-its HBM or MFMA ceiling (6.5 TB/s / 1.5 PF) + 2.4 us (wait launch gap 1.6 + one flag hop 0.8) + the busiest link's bytes at
-49 GB/s (the measured 8-GPU all-to-all: 343 GB/s out over seven links), the push counted after the GEMM.
+MI355X, eight ranks, `benchmark_exchange.py`: hidden rows replicated, owner-sorted rows (request r on rank r % 8, 4 rows
+per request), the lm_head GEMM included in every column, graph replay of 6 distinct inputs over three weight copies (880
+MB), minimum of nine rounds, MAX over ranks, us per call. `vLLM AG` = `rocm_unquantized_gemm_impl` +
+`tensor_model_parallel_all_gather` (vLLM's default); `vLLM A2A` = GEMM + `all_to_all_single` + permute (vLLM's
+batch-sharded sampling); `this AG` / `this owner` = the entry's `gemm_exchange` to every rank / to the owners (rows read
+in place). Ceiling = the GEMM at its HBM or MFMA ceiling (6.5 TB/s / 1.5 PF) + 2.4 us (wait launch gap 1.6 + one flag
+hop 0.8) + the busiest link's bytes at 49 GB/s (the measured 8-GPU all-to-all: 343 GB/s out over seven links), the push
+counted after the GEMM.
 
 | M | 12 | 24 | 40 | 65 | 80 | 96 | 128 | 160 | 192 |
 |---|---|---|---|---|---|---|---|---|---|

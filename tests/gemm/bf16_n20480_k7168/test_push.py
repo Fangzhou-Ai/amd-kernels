@@ -34,6 +34,8 @@ def _worker(rank, errors):
     rccl = dist.new_group(backend="nccl")
     from amd_kernels.collectives.all_to_all_bf16_n20480_ranks8 import RowAllToAll
     from amd_kernels.gemm.bf16_n20480_k7168 import bf16_gemm_n20480_k7168
+    from amd_kernels.gemm.bf16_n20480_k7168.host import prepare
+    prepare(dev, 256)
     gen = torch.Generator(device=dev).manual_seed(4100 + rank)
     w = (torch.randn(N, K, device=dev, generator=gen) * 0.02).to(torch.bfloat16)
     comm = RowAllToAll(rank, dist.group.WORLD, dev)
@@ -62,6 +64,7 @@ def _worker(rank, errors):
         ag_out = torch.empty(m, WORLD * N, dtype=torch.bfloat16, device=dev)
         ag_serial = torch.empty_like(ag_out)
         ag_ref = _ag_reference(bf16_gemm_n20480_k7168(x[maps[0]], w), rccl)
+        local = torch.empty(m, N, dtype=torch.bfloat16, device=dev)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             for j, (rm, out) in enumerate(zip(maps, outs)):
@@ -72,9 +75,9 @@ def _worker(rank, errors):
             comm.wait()
             ag_out.copy_(comm.recv(m, 1))
             for j, (rm, out) in enumerate(zip(maps, outs_serial)):
-                comm.gemm_exchange(x, w, rm, cs, j % 2, serial_above=1000 if j % 2 else 0)
+                comm(bf16_gemm_n20480_k7168(x, w, local, row_indices=rm), cs, j % 2)
                 out[:n].copy_(comm.recv(n, j % 2))
-            comm.gemm_exchange(x, w, maps[0], None, 1, serial_above=0)
+            comm(bf16_gemm_n20480_k7168(x, w, local, row_indices=maps[0]), None, 1)
             ag_serial.copy_(comm.recv(m, 1))
         for repeat in range(3):
             for out in outs + outs_serial:

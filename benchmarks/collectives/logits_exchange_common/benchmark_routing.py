@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""What the logits exchange entry adds over the package: ``gemm_exchange`` on a communicator built by the entry vs one
-built by the package (the entry adds no call of its own: dispatch 0), CUDA-graph replay, the host time of an eager
-call (enqueue only) and of the call's reason; all-gather mode, min over the rounds of the per-round mean, max over the
+"""What the logits exchange entry adds over the packages: its ``gemm_exchange`` vs the GEMM and exchange packages
+called directly as the entry composes them (dispatch 0: the entry adds no kernel), CUDA-graph replay, the host time of
+an eager call (enqueue only) and of the call's reason; all-gather mode, min over the rounds of the per-round mean, max over the
 eight ranks, us per call.
 
 Run on eight GPUs: python3 benchmarks/collectives/logits_exchange_common/benchmark_routing.py
@@ -99,15 +99,25 @@ def _rank(rank, port, rows_list, rounds):
         host = importlib.import_module(entry._SHAPE_HOSTS[key])
         comm = logits_exchange_comm(rank, dist.group.WORLD, dev, n_shard=n, k=k, max_rows=host.RECV_ROWS)
         direct = host.RowAllToAll(rank, dist.group.WORLD, dev, max_rows=host.RECV_ROWS)
-        direct._local = torch.empty(host.RECV_ROWS, n, dtype=torch.bfloat16, device=dev)
+        gemm_name, op, serial_above = entry._GEMMS[key]
+        gemm = getattr(importlib.import_module(gemm_name), op)
+        local = torch.empty(host.RECV_ROWS, n, dtype=torch.bfloat16, device=dev)
         w = (torch.randn(n, k, device=dev) * 0.02).bfloat16()
+
+        def by_hand(x, idx):
+            if idx.numel() <= serial_above[False]:
+                gemm(x, w, row_indices=idx, push=(direct.send_args(0), None))
+                direct.wait()
+            else:
+                direct(gemm(x, w, local[:idx.numel()], row_indices=idx), None, 0)
+
         if rank == 0:
             print(f"logits gemm exchange {key}\n{HEADER}")
         for rows in rows_list:
             x = torch.randn(rows, k, device=dev).bfloat16()
             idx = torch.arange(rows, device=dev)
             res = timeit([lambda: comm.gemm_exchange(x, w, idx, None, 0),
-                          lambda: direct.gemm_exchange(x, w, idx, None, 0)], rounds)
+                          lambda: by_hand(x, idx)], rounds)
             reason = host_us(lambda: logits_gemm_exchange_unsupported_reason(comm, x, w, idx, None, 0), rounds)
             if rank == 0:
                 _print(rows, res, 0.0, reason)

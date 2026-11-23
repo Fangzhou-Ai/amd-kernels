@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""The logits exchange entry on eight ranks: a communicator built by the entry gives the bits of one built from the
-package (owner mode with empty receivers, all-gather mode; both sides of the push crossover); after the warm-ups
+"""The logits exchange entry on eight ranks: its ``gemm_exchange`` gives the bits of the GEMM package's contiguous GEMM
+exchanged by the exchange package (owner mode with empty receivers, all-gather mode; both sides of the push
+crossover); after the warm-ups
 every row count of both modes compiles nothing; a CUDA graph of ``gemm_exchange`` on it imports and allocates nothing
 and replays the eager bits; another entry's object and a weight of another shape get reasons."""
 import importlib
@@ -38,6 +39,8 @@ def worker(rank, errors):
     for key in keys:
         n, k, world = key
         host = importlib.import_module(entry._SHAPE_HOSTS[key])
+        gemm_name, op, _ = entry._GEMMS[key]
+        gemm = getattr(importlib.import_module(gemm_name), op)
         max_rows = host.RECV_ROWS
         reason = logits_exchange_comm_unsupported_reason(rank, group, dev, n_shard=n, k=k, max_rows=max_rows)
         if reason is not None:
@@ -65,7 +68,7 @@ def worker(rank, errors):
                 errors.append(f"rank {rank}: {r}")
             comm.gemm_exchange(x, w, idx, cs, buf)
             got = comm.recv(recv, buf).clone()
-            direct.gemm_exchange(x, w, idx, cs, buf)
+            direct(gemm(x[idx], w), cs, buf)
             ref = direct.recv(recv, buf).clone()
             torch.cuda.synchronize()
             if not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
@@ -136,8 +139,9 @@ def one_buffer_worker(rank, errors):
     host = importlib.import_module(name)
     one = logits_exchange_comm(rank, group, dev, n_shard=n, k=k, max_rows=40, buffers=1)
     two = logits_exchange_comm(rank, group, dev, n_shard=n, k=k, max_rows=40)
-    if one.pool.numel() * 2 != two.pool.numel() or one.recv(40, 1).data_ptr() != one.recv(40, 0).data_ptr():
-        errors.append(f"rank {rank}: one buffer: pool {one.pool.numel()} vs {two.pool.numel()}")
+    pools = one.exchange.pool.numel(), two.exchange.pool.numel()
+    if pools[0] * 2 != pools[1] or one.recv(40, 1).data_ptr() != one.recv(40, 0).data_ptr():
+        errors.append(f"rank {rank}: one buffer: pool {pools[0]} vs {pools[1]}")
     w = (torch.randn(n, k, device=dev, generator=torch.Generator(device=dev).manual_seed(rank)) * 0.02).bfloat16()
     x = torch.randn(40, k, device=dev, generator=torch.Generator(device=dev).manual_seed(7)).bfloat16()
     for rows, buf in ((8, 0), (40, 1), (24, 0)):

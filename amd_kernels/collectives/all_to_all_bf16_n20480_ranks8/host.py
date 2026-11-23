@@ -11,9 +11,6 @@ from amd_kernels.common.hip_runtime import load_hip_runtime
 from . import kernel
 from .kernel import BUFFERS, N, RECV_ROWS, V, WORLD
 
-# rows up to which the GEMM pushes its rows itself (owner mode, all-gather mode): the measured crossovers of the README
-SERIAL_ABOVE = {True: 96, False: 16}
-
 
 class _IpcHandle(ctypes.Structure):
     _fields_ = [("reserved", ctypes.c_char * 64)]
@@ -115,12 +112,10 @@ class RowAllToAll:
         self.flags = [flag if r == rank else ops.open_mem_handle(h) for r, (_, h) in enumerate(handles)]
         self.peer_table = torch.tensor(self.ptrs + self.flags, dtype=torch.int64, device=device)
         self.counter = torch.zeros(1, dtype=torch.int32, device=device)
+        self._zeros = torch.zeros(WORLD, dtype=torch.int32, device=device)  # the all-gather mode's counts
         self._recv = self.pool.view(torch.bfloat16).view(buffers, max_rows, V)
         self.pushes = {m: kernel.compile_push(m) for m in ("owner", "all")}
         self.waiter = kernel.compile_wait()
-        from amd_kernels.gemm.bf16_n20480_k7168.host import prepare
-
-        prepare(self.counter.device, max_rows)  # gemm_exchange's split-K workspace, not inside a capture
 
     def recv(self, rows, buf=0):
         """This rank's receive buffer ``buf`` [rows, 163840] bf16: the rows pushed by the exchange, in place."""
@@ -153,7 +148,7 @@ class RowAllToAll:
         assert x.is_contiguous() and 0 <= x.shape[0] <= self.max_rows
         mode = "all" if counts is None else "owner"
         if counts is None:
-            counts = self._zero_counts()
+            counts = self._zeros
         assert counts.shape == (WORLD,) and counts.dtype == torch.int32 and counts.is_contiguous()
         rows = x.shape[0]
         nwg = -(-max(rows * 2, 1) // 8) * 8
@@ -161,32 +156,6 @@ class RowAllToAll:
         _run(self.pushes[mode], x.data_ptr(), self.peer_table, counts, self.counter, self.flags[self.rank], rows,
              self.rank, nwg, buf, stream)
         return self.wait()
-
-    def gemm_exchange(self, x, w, row_indices, counts=None, buf=0, serial_above=None):
-        """The lm_head shard GEMM of the rows ``x[row_indices]`` (``bf16_n20480_k7168``) and the exchange of its output:
-        the GEMM pushes the rows itself up to ``serial_above`` rows (one launch less), above that it writes them locally
-        and one contiguous push moves them (full-row streams suit the xGMI better than the tile's row segments).
-        ``serial_above`` defaults to the measured crossover of the mode. Same arguments and result as ``__call__`` with
-        that GEMM's output; returns the communicator."""
-        from amd_kernels.gemm.bf16_n20480_k7168 import bf16_gemm_n20480_k7168
-
-        assert not self.closed and 0 <= buf < BUFFERS and row_indices.ndim == 1
-        rows = row_indices.numel()
-        if serial_above is None:
-            serial_above = SERIAL_ABOVE[counts is not None]
-        if rows <= serial_above:
-            bf16_gemm_n20480_k7168(x, w, row_indices=row_indices, push=(self.send_args(buf), counts))
-            return self.wait()
-        if not hasattr(self, "_local"):
-            self._local = torch.empty(self.max_rows, N, dtype=torch.bfloat16, device=self.device)
-        out = self._local[:rows]
-        bf16_gemm_n20480_k7168(x, w, out, row_indices=row_indices)
-        return self(out, counts, buf)
-
-    def _zero_counts(self):
-        if not hasattr(self, "_zeros"):
-            self._zeros = torch.zeros(WORLD, dtype=torch.int32, device=self.device)
-        return self._zeros
 
     def warmup(self):
         """Collective: compile both pushes and the wait eagerly. Every rank calls this before capture."""

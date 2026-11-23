@@ -7,8 +7,9 @@ has --tokens rows). Four timings, each GEMM included, graph replay of 6 distinct
 minimum of nine rounds, MAX over ranks, us per call:
   vLLM AG       rocm_unquantized_gemm_impl + tensor_model_parallel_all_gather -> [M, 163840]   (vLLM's default)
   vLLM A2A      GEMM + all_to_all_single + permute -> [owned rows, 163840]  (--enable-batch-sharded-sampling)
-  this AG       push GEMM (all ranks) + wait -> [M, 163840] in place in the receive buffer
-  this owner    push GEMM (owner-sorted row map) + wait -> [owned rows, 163840] in place
+  this AG       logits_exchange_common's gemm_exchange (all ranks) -> [M, 163840] in place in the receive buffer
+  this owner    logits_exchange_common's gemm_exchange (owner-sorted row map) -> [owned rows, 163840] in place
+                (the GEMM pushes its rows itself up to the crossover, above it this package's push moves them)
 Ceilings (measured): the GEMM's HBM stream (293.6 MB at 6.5 TB/s) or its MFMA time (1.5 PFLOP/s),
 whichever is larger, plus the exchange: one launch gap and one cross-GPU flag hop (1.6 + 0.8 us) plus the bytes of the
 busiest link at 49 GB/s (the measured 8-GPU all-to-all: 343 GB/s out over seven links): AG moves M x 40 KB per
@@ -16,7 +17,6 @@ link, owner rows (largest owner count) x 40 KB. `% ceiling` = ceiling / this.
 """
 import argparse
 import os
-import statistics
 
 import torch
 import torch.distributed as dist
@@ -35,8 +35,8 @@ def worker(rank, ms, tokens, port):
                                   tensor_model_parallel_all_gather)
     from vllm.distributed.parallel_state import get_tp_group, graph_capture
     from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
-    from amd_kernels.collectives.all_to_all_bf16_n20480_ranks8 import RowAllToAll
-    
+    from amd_kernels.collectives.logits_exchange_common import logits_exchange_comm
+
     with set_current_vllm_config(VllmConfig()):
         init_distributed_environment(WORLD, rank, f"tcp://127.0.0.1:{port}", rank, "nccl")
         initialize_model_parallel(tensor_model_parallel_size=WORLD)
@@ -44,7 +44,7 @@ def worker(rank, ms, tokens, port):
         dev = torch.device("cuda", rank)
         g = torch.Generator(device=dev).manual_seed(rank)
         ws = [(torch.randn(N, K, device=dev, generator=g) * 0.02).to(torch.bfloat16) for _ in range(3)]
-        comm = RowAllToAll(rank, tp.cpu_group, dev)
+        comm = logits_exchange_comm(rank, tp.cpu_group, dev, n_shard=N, k=K, max_rows=256)
         comm.warmup()
         stock = dispatch_unquantized_gemm()
 
@@ -79,7 +79,6 @@ def worker(rank, ms, tokens, port):
             print(f"{'M':>4} {'vLLM AG':>8} {'vLLM A2A':>9} {'this AG':>8} {'this owner':>10} {'AG x':>6} {'A2A x':>6} "
                   f"{'AG ceil':>8} {'AG %':>5} {'own ceil':>9} {'own %':>6}")
         for m in ms:
-            reqs = max(1, m // tokens)
             owner = torch.arange(m) // tokens % WORLD  # request r -> rank r % 8
             order = torch.argsort(owner, stable=True)
             counts = torch.bincount(owner, minlength=WORLD).tolist()

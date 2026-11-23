@@ -174,7 +174,8 @@ One line per kernel package. Each package's README has what it does, its entry p
 - [`collectives/handshake_ranks8`](collectives/handshake_ranks8/README.md): the eight-rank flag barrier and small
   payload exchanges (epoch-tagged words, flag after data, pull) on the shared helpers in `common/`.
 - [`collectives/logits_exchange_common`](collectives/logits_exchange_common/README.md): the lm_head shard GEMM + logits
-  exchange entry (`logits_exchange_comm`): (N shard, K, world size) -> package and the reason a call has no kernel.
+  exchange entry (`logits_exchange_comm`): (N shard, K, world size) -> the exchange and GEMM packages it composes and
+  the reason a call has no kernel.
 - [`collectives/all_to_all_bf16_n20480_ranks8`](collectives/all_to_all_bf16_n20480_ranks8/README.md): logits rows into
   the owner's `[rows, 163840]` layout (or an all-gather).
 - [`collectives/topk_gather_merge_common`](collectives/topk_gather_merge_common/README.md): the DCP top-k gather + merge
