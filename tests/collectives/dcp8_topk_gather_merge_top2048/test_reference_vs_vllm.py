@@ -3,7 +3,7 @@
 import pytest
 import torch
 from amd_kernels.collectives.dcp8_topk_gather_merge_top2048.reference import reference
-from .workload import PAGE, SERVED_ROWS, STRIDE, make_block_table, make_plane
+from .workload import PAGE, STRIDE, make_block_table, make_plane
 
 WORLD = 8
 

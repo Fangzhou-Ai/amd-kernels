@@ -11,7 +11,6 @@ Run on eight otherwise idle GPUs: python3 benchmarks/gemm/bf16_linear_gather_n89
 import argparse
 import os
 import statistics
-import sys
 
 import torch
 import torch.distributed as dist

@@ -42,9 +42,8 @@ def _worker(rank, errors):
         key = K2Build(tokens=S, nblocks=4 + int(reset), reset=reset)
         at = K.scratch_layout(key)["xrow"][0]
         x = comm.scratch[at : at + S * HIDDEN * 2].view(bf).view(S, HIDDEN)
-        got_pre = prefix
-        if cos(x, x_ref) < 0.9999 or cos(got_pre, pre) < 0.9999:
-            errors.append(f"rank {rank} S={S} reset={reset}: AttnRes cos {cos(x, x_ref):.6f} / {cos(got_pre, pre):.6f}")
+        if cos(x, x_ref) < 0.9999 or cos(prefix, pre) < 0.9999:
+            errors.append(f"rank {rank} S={S} reset={reset}: AttnRes cos {cos(x, x_ref):.6f} / {cos(prefix, pre):.6f}")
         want = ref.moe(x, nat["w_gate"], nat["bias"], nat["w_ld"], nat["w_sgu"], nat["w_sd"], nat["w13"],
                        nat["w13s"], nat["w2"], nat["w2s"], nat["ln_w"], nat["w_up"], rank, ar)
         if cos(out, want) < 0.9999:

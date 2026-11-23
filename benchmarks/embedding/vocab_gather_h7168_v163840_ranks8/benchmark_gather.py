@@ -12,7 +12,6 @@ per link of an 8-GPU all-read. `--ids balanced` draws the owners round robin (no
 """
 import argparse
 import os
-import statistics
 
 import torch
 import torch.distributed as dist

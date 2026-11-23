@@ -99,7 +99,7 @@ def test_graph_replay_over_poison():
     S, L, nb = 12, 6, 4
     w = make(S, L, nb)
     ws = Workspace("cuda")
-    s0, s1 = clone_state(w), clone_state(w)
+    s0 = clone_state(w)
     ref0, rc0 = reference(w, L, nb, -1)
 
     def step(s):

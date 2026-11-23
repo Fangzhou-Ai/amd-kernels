@@ -64,7 +64,6 @@ def test_state_continuation():
     whole_state = c["state_cache"].clone()
     out_whole = torch.zeros(first + second, R.NH, R.D, dtype=torch.bfloat16, device="cuda")
     host.chunk_scan(rec, cu, offsets(cu), whole_state, c["state_indices"], c["has_initial_state"], out_whole)
-    ws = R.unpack_record(rec)
     nc1 = first // 64
     rec1, rec2 = rec[:, :nc1].contiguous(), rec[:, nc1:].contiguous()
     cu1 = torch.tensor([0, first], dtype=torch.int32, device="cuda")

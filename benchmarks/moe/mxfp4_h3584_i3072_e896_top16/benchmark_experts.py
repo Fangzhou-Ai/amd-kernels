@@ -11,13 +11,11 @@ tuned rows) and the stock stage kernels alone (BM16 sort handed in, patched rows
 """
 import argparse
 import os
-import statistics
 
 os.environ.setdefault("AITER_SITUV2_A4W4", "1")
 import torch
 
 from amd_kernels.moe.mxfp4_h3584_i3072_e896_top16 import MoeWeights, Sort, mxfp4_moe_experts, quantize_activations
-from amd_kernels.moe.mxfp4_h3584_i3072_e896_top16.host import sort_capacity
 
 E, H, I, TOPK = 896, 3584, 384, 16
 HBM_CEILING = 7.0e12  # measured nontemporal HBM read on MI355X; 6.4-6.7 plain loads
@@ -115,7 +113,6 @@ def main():
             graphs = {"ours": graph_of(ours, a.layers), "stock": graph_of(stock_call, a.layers),
                       "stock_presorted": graph_of(stock_presorted, a.layers)}
             t = interleaved_min(graphs, a.layers, a.rounds)
-            cap = sort_capacity(m)
             nbytes = uniq * EXPERT_BYTES + m * (H // 2 + H // 32) + 2 * m * TOPK * (I // 2 + I // 32) \
                 + 2 * m * TOPK * H * 2 + m * H * 2
             tbs = nbytes / t["ours"] / 1e6
