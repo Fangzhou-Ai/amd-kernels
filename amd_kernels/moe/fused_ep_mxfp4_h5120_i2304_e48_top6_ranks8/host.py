@@ -35,7 +35,7 @@ def sized_tokens(m: int, rows_hint=None) -> int:
     from 9 tokens the 32-row tier (bm 32, 160) is no slower than the 16-row one when routing is uniform and 25 % faster
     when it is not (T 16 hot 155 us against 206); from 49 tokens the 8-wave 64-row tier costs 3 % uniform and saves 6 %
     (zipf) and 25 % (hot)."""
-    s = max(m, min(2 * m, DISPATCH[-2][0]), rows_hint or 0, 1)
+    s = max(m, min(2 * m, DISPATCH[-2][0]), min(rows_hint or 0, MAX_TOKENS), 1)
     if m > 8:
         s = max(s, DISPATCH[3][0])
     if m > 48:

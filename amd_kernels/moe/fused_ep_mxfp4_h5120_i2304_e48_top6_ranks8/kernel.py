@@ -30,7 +30,6 @@ while a peer still reads its arena; a call needs no fences (every cross-rank sto
 store whose completion is waited for before its flag).
 """
 import functools
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -51,7 +50,7 @@ KT1, KT2 = H // 128, I // 128  # 128-K MFMA steps of GEMM1 / GEMM2
 SC1 = 16  # cache policy bit: device-scope (write-through) stores
 SYS = 0x11  # sc0 | sc1: system-coherent loads / write-through stores
 READY_STRIDE = 256  # bytes between two blocks' counters (ready count, then consumer count)
-TRACE = os.environ.get("AKR_EP_TRACE") == "1"  # phase timestamps of every workgroup (benchmarks/.../benchmark_timeline.py)
+TRACE = False  # True: phase timestamps of every workgroup (benchmark_timeline.py sets it before the first compile)
 TRACE_WORDS = 32  # i32 words per workgroup, from word 4096 of the local state: 16 i64 timestamps and sums
 TM = 1024  # tokens per rank the arenas hold
 CNT_STRIDE = 256  # bytes between two expert counters: one remote atomic stream per memory channel
@@ -1009,7 +1008,7 @@ def compile_fused(*, world, epr, nd, nw, bm, kw, pf1, ni, nb1, tn2, pf2, nb2, ho
             first = pop()
         if wave == 0:
             got = (lane < world).select(_load_sys(ctl + CTL_ARRIVE + lane * 64), ep + 1)
-            while fx.rocdl.ballot(T.i64, got < ep + 1) != 0:
+            while fx.rocdl.ballot(T.i64, (got - (ep + 1)) < 0) != 0:  # wrap-safe: the epoch counts every call
                 fx.rocdl.s_sleep(1)
                 got = (lane < world).select(_load_sys(ctl + CTL_ARRIVE + lane * 64), ep + 1)
         fx.gpu.barrier()
@@ -1090,7 +1089,7 @@ def compile_fused(*, world, epr, nd, nw, bm, kw, pf1, ni, nb1, tn2, pf2, nb2, ho
                 fx.generic_store(_gptr(loc + (4096 + bid * TRACE_WORDS + 18) * 4, fx.Int64, 8), tg2)
         if tx < world:
             got = _load_sys(ctl + CTL_FIN + tx * 64)
-            while got < ep + 1:
+            while (got - (ep + 1)) < 0:
                 fx.rocdl.s_sleep(1)
                 got = _load_sys(ctl + CTL_FIN + tx * 64)
         fx.gpu.barrier()

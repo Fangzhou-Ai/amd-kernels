@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the amd-kernels project
-"""Phase timeline of one fused call (``AKR_EP_TRACE=1``): every workgroup stamps the 100 MHz constant clock when it starts,
-leaves the dispatch, sees every rank's rows, has the block table, drains the work queue, sees every rank's finish word and
-ends. ``AKR_EP_TRACE=1 python3 benchmarks/moe/fused_ep_mxfp4_h5120_i2304_e48_top6_ranks8/benchmark_timeline.py --world 8
---tokens 64`` replays graphs of distinct inputs (the steady state of a served decode) and prints, per rank, min / median /
+"""Phase timeline of one fused call (a ``kernel.TRACE = True`` build): every workgroup stamps the 100 MHz constant
+clock when it starts, leaves the dispatch, sees every rank's rows, has the block table, drains the work queue, sees every
+rank's finish word and ends. ``python3 benchmarks/moe/fused_ep_mxfp4_h5120_i2304_e48_top6_ranks8/benchmark_timeline.py
+--world 8 --tokens 64`` replays graphs of distinct inputs (the steady state of a served decode) and prints, per rank, min / median /
 max over its workgroups in us after the rank's first workgroup start, and the mean time per workgroup spent in GEMM1 and
 GEMM2 tiles. The clocks of two GPUs are not comparable, so a rank's wait for the others shows in ``arrived``."""
 import argparse
 import json
-import os
 
 import torch
 import torch.distributed as dist
@@ -35,6 +34,9 @@ def worker(rank, world, port, args):
     dev = torch.device("cuda", rank)
     dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world)
     from amd_kernels.moe.fused_ep_mxfp4_h5120_i2304_e48_top6_ranks8 import ExpertParallel, ExpertWeights
+    from amd_kernels.moe.fused_ep_mxfp4_h5120_i2304_e48_top6_ranks8 import kernel as K
+
+    K.TRACE = True  # read when the kernel is traced: before the first call
     from amd_kernels.moe.fused_ep_mxfp4_h5120_i2304_e48_top6_ranks8.host import config_for, sized_tokens
 
     g = torch.Generator(device=dev).manual_seed(100 + rank)
@@ -87,7 +89,6 @@ def main():
     parser.add_argument("--hint", type=int, default=0)
     parser.add_argument("--route", default="uniform", choices=["uniform", "zipf", "hot"])
     args = parser.parse_args()
-    assert os.environ.get("AKR_EP_TRACE") == "1", "set AKR_EP_TRACE=1"
     import socket
 
     with socket.socket() as s:
