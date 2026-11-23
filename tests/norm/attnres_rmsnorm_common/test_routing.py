@@ -91,6 +91,8 @@ def test_reasons(gfx950, comm, monkeypatch):
     assert "partial must be" in r(comm, **{**args(), "partial": meta(12, 7168, dtype=torch.float32)})
     assert "prefix must be" in r(comm, **{**args(), "prefix": meta(12, 7170)[:, :7168]})
     assert "bank must be" in r(comm, **args(nb=9))
+    assert "a bank needs norm_weight and qk_weight" in r(comm, **{**args(), "norm_weight": None})
+    assert "a bank needs norm_weight and qk_weight" in r(comm, **{**args(), "qk_weight": None})
     assert "bank must be" in r(comm, **{**args(), "bank": meta(12, 8, 7172)[:, :, :7168]})
     assert "num_blocks" in r(comm, **{**args(), "num_blocks": 9})
     assert "num_blocks" in r(comm, **args(), block_write_idx=2)

@@ -90,6 +90,6 @@ def router_sigmoid_bias_topk_unsupported_reason(x, w, bias, routed_scaling_facto
             return f"{_OP}: aux is not router_aux(w, {m}, ...)"
         mb = aux.get("moe_buf")
         if mb is not None and (mb.dtype != torch.bfloat16 or not mb.is_contiguous() or mb.ndim != 2
-                               or mb.shape[0] != m or mb.device != x.device):
+                               or tuple(mb.shape) != (m, host.MOE_BUF_COLS) or mb.device != x.device):
             return f"{_OP}: aux moe_buf is not router_aux(w, {m}, ...)'s"
     return None
