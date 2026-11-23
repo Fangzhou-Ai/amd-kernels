@@ -61,10 +61,13 @@ def _cache_args(cache: torch.Tensor) -> tuple[int, int]:
     return block.bit_length() - 1, cache.stride(0) // _kernel.D
 
 
-def supports_sparse_mla_decode(q: torch.Tensor, main_cache: torch.Tensor, num_heads: int | None = None) -> bool:
-    """The kernel's case: gfx950, 64 query heads of 512 dims, e4m3 q and caches of 512-byte rows."""
+def supports_sparse_mla_decode(q: torch.Tensor, main_cache: torch.Tensor, num_heads: int | None = None,
+                               keys_per_row: int | None = None) -> bool:
+    """The kernel's case: gfx950, 64 query heads of 512 dims, e4m3 q and caches of 512-byte rows, at most
+    ``_kernel.MAX_KEYS`` keys per row (main and extra lists together; more are dropped, not an error)."""
     return (
-        _on_gfx950()
+        (keys_per_row is None or keys_per_row <= _kernel.MAX_KEYS)
+        and _on_gfx950()
         and q.dim() == 3
         and tuple(q.shape[1:]) == (_kernel.H, _kernel.D)
         and q.dtype in (torch.float8_e4m3fn, torch.uint8)

@@ -24,15 +24,17 @@ def sparse_mla_decode_shapes() -> frozenset:
     return _SPARSE_MLA.shapes()
 
 
-def sparse_mla_decode_blocker(q, main_cache, num_heads: int | None = None) -> str | None:
-    """None when a package serves sparse MLA decode for ``q`` [rows, heads, dim] over ``main_cache``."""
+def sparse_mla_decode_blocker(q, main_cache, num_heads: int | None = None,
+                              keys_per_row: int | None = None) -> str | None:
+    """None when a package serves sparse MLA decode for ``q`` [rows, heads, dim] over ``main_cache`` with at most
+    ``keys_per_row`` keys per row (window plus top-k; the kernel's cap is not visible in the tensors, so pass it)."""
     if q.dim() != 3:
         return "sparse_mla_decode: q must be [rows, heads, dim]"
     key = tuple(q.shape[1:])
     reason = _SPARSE_MLA.blocker(key)
     if reason is not None:
         return reason
-    ok = _SPARSE_MLA.package(key).supports_sparse_mla_decode(q, main_cache, num_heads)
+    ok = _SPARSE_MLA.package(key).supports_sparse_mla_decode(q, main_cache, num_heads, keys_per_row)
     return None if ok else _unsupported("sparse_mla_decode", _SPARSE_MLA, key)
 
 
