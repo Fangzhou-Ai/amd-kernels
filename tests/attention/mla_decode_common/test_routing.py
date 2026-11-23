@@ -158,7 +158,9 @@ def test_routes_each_covered_key(monkeypatch):
             (got, _), = rec.calls
             assert got[:8] == args[:8]
             if index:  # field by field: a dataclass compares tensors with == from Python 3.13
-                assert isinstance(got[8], pkg.IndexSide) and all(getattr(got[8], k) is v for k, v in args[8].items())
+                got_side = got[8]
+                assert isinstance(got_side, pkg.IndexSide) and vars(got_side).keys() == args[8].keys()
+                assert all(getattr(got_side, k) is v for k, v in args[8].items())
             else:
                 assert got[8] is None
         pkg = prologue._index_host((32, 128))

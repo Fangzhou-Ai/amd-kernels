@@ -142,6 +142,28 @@ def k2_launch(
     )
 
 
+def weights_unsupported_reason(device, **weights) -> str | None:
+    """None when the layer's weights have the shapes and dtypes this kernel fixes and are contiguous on ``device``, else
+    why not (host checks only; the kernel takes their pointers)."""
+    from .reference import E, HIDDEN, LAT, RI, SI, UP_N
+
+    bf, f32, byte = torch.bfloat16, torch.float32, None
+    want = {"w_o": ((HIDDEN, 1536), bf), "ares_nw": ((HIDDEN,), bf), "ares_qk": ((HIDDEN,), bf),
+            "in_nw": ((HIDDEN,), bf), "w_gate": ((E, HIDDEN), bf), "bias": ((E,), f32), "w_ld": ((LAT, HIDDEN), bf),
+            "ln_w": ((LAT,), bf), "w_sgu": ((2 * SI, HIDDEN), bf), "w_sd": ((HIDDEN, SI), bf),
+            "w_up": ((UP_N, LAT), bf), "w13": ((E, 2 * RI, LAT // 2), byte), "w2": ((E, LAT, RI // 2), byte),
+            "w13s": (None, byte), "w2s": (None, byte)}
+    for name, (shape, dtype) in want.items():
+        t = weights[name]
+        if shape is not None and tuple(t.shape) != shape:
+            return f"{name} {tuple(t.shape)} (the kernel takes {shape})"
+        typed = t.dtype == dtype if dtype is not None else t.element_size() == 1
+        if not typed or not t.is_contiguous() or t.device != device:
+            return (f"{name} must be contiguous {dtype or 'one-byte'} on {device} "
+                    f"(it is {t.dtype}, contiguous {t.is_contiguous()}, on {t.device})")
+    return None
+
+
 @dataclass
 class LayerTailWeights:
     """A layer's weights as vLLM loads them (no copies, no re-quantization): ``w_o`` the rank's o_proj columns

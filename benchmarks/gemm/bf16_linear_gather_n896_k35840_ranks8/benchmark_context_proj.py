@@ -96,12 +96,6 @@ def worker(rank, world, port, rows_list, rounds):
         def pack(i):
             return host.pack_aux(aux, xp, rows)
 
-        if os.environ.get('BENCH_DEBUG'):
-            for name_, f_ in (('replicated', replicated), ('sharded', sharded), ('new', new), ('pack', pack)):
-                f_(0)
-                torch.cuda.synchronize()
-                if rank == 0:
-                    print('eager ok', name_, rows, flush=True)
         res = timeit(ca, [replicated, sharded, new, pack], n, rounds, 10)
         table.append((rows, [(min(r), statistics.median(r)) for r in res]))
     if rank == 0:

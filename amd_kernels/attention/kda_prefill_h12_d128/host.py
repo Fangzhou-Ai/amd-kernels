@@ -132,12 +132,17 @@ _flag_cache = {}
 
 
 def _flags(device, chunks):
-    """Zeroed hand-over flags of the mega launch (every flag is reset by its consumer, so the buffer is zero again after a call)."""
+    """Zeroed hand-over flags of the mega launch, one buffer per stream. Consumers reset their flags, but a poll that gives up
+    at its limit leaves its producer's flag set, and the layout moves with the chunk count, so a later launch would take
+    that flag for its own: the prefix a launch uses is zeroed on its stream before it."""
     need = flags_ints(chunks)
-    buf = _flag_cache.get(device)
+    key = (device, torch.cuda.current_stream(device).cuda_stream)
+    buf = _flag_cache.get(key)
     if buf is None or buf.numel() < need:
         buf = torch.zeros(max(need, 1 << 21), dtype=torch.int32, device=device)
-        _flag_cache[device] = buf
+        _flag_cache[key] = buf
+    else:
+        buf[:need].zero_()
     return buf
 
 

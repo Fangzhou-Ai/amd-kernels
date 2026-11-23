@@ -7,6 +7,7 @@ import torch
 
 from amd_kernels.attention.kda_prefill_h12_d128 import host
 from amd_kernels.attention.kda_prefill_h12_d128 import reference as R
+from amd_kernels.attention.kda_prefill_h12_d128.walk import flags_ints
 
 from .inputs import make_case, require_gfx950
 
@@ -132,9 +133,31 @@ def test_one_launch_hand_over():
                           c["conv_state"].clone(), c["state_cache"].clone(), c["state_indices"], c["has_initial_state"], cu,
                           chunk_indices(cu), offsets(cu), c["norm_weight"], c["norm_eps"], out, c["lower_bound"], walk_wgs=cap)
         torch.cuda.synchronize()
-        assert not host._flags(out.device, chunk_indices(cu).shape[0]).any()
+        assert not _stream_flags(out.device)[:flags_ints(chunk_indices(cu).shape[0])].any()
         outs.append(out)
     assert all(torch.equal(outs[0], o) for o in outs[1:])
+
+
+def _stream_flags(device):
+    return host._flag_cache[(device, torch.cuda.current_stream(device).cuda_stream)]
+
+
+@pytest.mark.parametrize("seq", [[300, 64, 77, 1], [200 + 17 * i for i in range(12)]], ids=["ragged4", "twelve"])
+@torch.inference_mode()
+def test_one_launch_ignores_stale_flags(seq):
+    """A flag an earlier launch left set (a poll that gave up, a larger launch's layout) is not taken for this launch's
+    hand-over: the one-launch path zeroes the flags it uses before it starts."""
+    require_gfx950()
+    c = make_case(seq, init=[i % 3 != 1 for i in range(len(seq))])
+    ref, conv_state, state = reference(c)
+    run(c, "mega")
+    for buf in host._flag_cache.values():
+        buf.fill_(1)
+    out, got_conv, got_state = run(c, "mega")
+    assert not torch.isnan(out.float()).any()
+    assert rel(out, ref) < OUT_TOL
+    assert rel(got_state, state) < STATE_TOL
+    assert torch.equal(got_conv, conv_state)
 
 
 def test_dispatch():

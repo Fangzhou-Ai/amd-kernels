@@ -14,6 +14,7 @@ from .reference import E, H, TOPK
 from .topk import compile_router_sigmoid_bias_top16_e896
 
 MAX_M = 16 * MT_MAX
+MOE_BUF_COLS = 3584  # the latent width of the MoE output the aux launch zeroes
 # row tile (16 rows) -> (K splits, waves along the columns, fragments per column wave[, row splits])
 # measured (benchmark_router.py, graph, min of 15): up to 48 rows more K splits to use every CU; above, two row splits of
 # half the K splits (half the slab bytes; the pair of workgroups sharing the weights sits on one XCD)
@@ -121,7 +122,7 @@ def make_aux(m: int, device: torch.device, zero_moe_buf: bool = True) -> dict:
             "num_valid_ids": torch.empty(2, dtype=i32, device=device),
             "m_indices": torch.empty(cap, dtype=i32, device=device),
             "reverse_sorted": torch.empty(m * TOPK, dtype=i32, device=device),
-            "moe_buf": torch.empty(m, 3584, dtype=torch.bfloat16, device=device) if zero_moe_buf else None}
+            "moe_buf": torch.empty(m, MOE_BUF_COLS, dtype=torch.bfloat16, device=device) if zero_moe_buf else None}
 
 
 def _launch(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None, scale: float, out: tuple | None,
@@ -149,7 +150,7 @@ def _launch(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None, scale: 
                          (aux["num_valid_ids"], 2), (aux["m_indices"], cap), (aux["reverse_sorted"], m * TOPK)):
                 assert t.is_contiguous() and t.numel() >= n and t.device == x.device
             mb = aux.get("moe_buf")
-            zvecs = 0 if mb is None else m * 3584 * 2 // 16
+            zvecs = 0 if mb is None else m * MOE_BUF_COLS * 2 // 16
             ptrs = [_aux_workspace(x.device, stream.cuda_stream, m).data_ptr(), aux["sorted_token_ids"].data_ptr(), aux["sorted_weights"].data_ptr(),
                     aux["sorted_expert_ids"].data_ptr(), aux["num_valid_ids"].data_ptr(), aux["m_indices"].data_ptr(),
                     aux["reverse_sorted"].data_ptr(), 0 if mb is None else mb.data_ptr()]
