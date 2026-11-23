@@ -162,3 +162,19 @@ def test_one_term_p():
     ref = reference(case)
     cos = torch.nn.functional.cosine_similarity(out.double().flatten(1), ref.double().flatten(1), dim=1)
     assert 0.999 <= cos.min() < R.COS_MIN
+
+
+def test_keys_per_row_cap():
+    """More keys per row than the kernel holds are dropped, not an error: the support check and the entry's blocker
+    decline them when the caller says how many it sends."""
+    from amd_kernels import attention
+    from amd_kernels.attention.sparse_mla_decode_fp8kv_h64_d512_rot64 import supports_sparse_mla_decode
+    from amd_kernels.attention.sparse_mla_decode_fp8kv_h64_d512_rot64.kernel import MAX_KEYS
+
+    require_gfx950()
+    q = torch.empty(4, H, D, dtype=torch.float8_e4m3fn, device="cuda")
+    cache = torch.empty(16, D, dtype=torch.float8_e4m3fn, device="cuda")
+    assert supports_sparse_mla_decode(q, cache) and supports_sparse_mla_decode(q, cache, keys_per_row=MAX_KEYS)
+    assert not supports_sparse_mla_decode(q, cache, keys_per_row=MAX_KEYS + 1)
+    assert attention.sparse_mla_decode_blocker(q, cache, keys_per_row=MAX_KEYS) is None
+    assert attention.sparse_mla_decode_blocker(q, cache, keys_per_row=MAX_KEYS + 1) is not None
