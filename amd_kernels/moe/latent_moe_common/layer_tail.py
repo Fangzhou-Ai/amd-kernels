@@ -128,4 +128,7 @@ def layer_tail_launch_unsupported_reason(runner, build: Mapping, *, core, w_o, p
     if (blocks.ndim != 3 or blocks.shape[0] != tokens or blocks.shape[1] < nblocks or blocks.shape[2] != hidden
             or blocks.dtype != torch.bfloat16 or blocks.stride(2) != 1 or blocks.device != dev):
         return f"{_OP}: blocks must be bf16 [{tokens}, >={nblocks}, {hidden}] with unit inner stride"
-    return None
+    reason = host.weights_unsupported_reason(dev, w_o=w_o, ares_nw=ares_nw, ares_qk=ares_qk, in_nw=in_nw, w_gate=w_gate,
+                                             bias=bias, w_ld=w_ld, w_sgu=w_sgu, w_sd=w_sd, w13=w13, w13s=w13s, w2=w2,
+                                             w2s=w2s, ln_w=ln_w, w_up=w_up)
+    return None if reason is None else f"{_OP}: {reason}"

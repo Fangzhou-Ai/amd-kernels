@@ -133,6 +133,7 @@ def test_router_reasons(gfx950):
     assert "aux is not" in r(**router_args(8), aux=aux)
     assert "aux is not" in r(**router_args(4), aux={k: v for k, v in aux.items() if k != "m_indices"})
     assert "moe_buf" in r(**router_args(4), aux={**aux, "moe_buf": meta(5, 3584)})
+    assert "moe_buf" in r(**router_args(4), aux={**aux, "moe_buf": meta(4, 2048)})
 
 
 # experts
@@ -285,10 +286,12 @@ LAUNCH_KW = ("core", "w_o", "prefix", "blocks", "ares_nw", "ares_qk", "in_nw", "
 
 
 def launch_kw(s=12, hidden=7168, k=1536, e=896):
-    kw = {k_: meta(1) for k_ in LAUNCH_KW}
-    kw.update(core=meta(s, k), w_o=meta(hidden, k), prefix=meta(s, hidden), blocks=meta(s, 8, hidden),
-              w13=meta(e, 768, 1792, dtype=u8), out=meta(s, hidden), layer=3)
-    return kw
+    return dict(core=meta(s, k), w_o=meta(hidden, k), prefix=meta(s, hidden), blocks=meta(s, 8, hidden),
+                ares_nw=meta(hidden), ares_qk=meta(hidden), in_nw=meta(hidden), w_gate=meta(e, hidden),
+                bias=meta(e, dtype=f32), w_ld=meta(3584, hidden), ln_w=meta(3584), w_sgu=meta(1536, hidden),
+                w_sd=meta(hidden, 768), w_up=meta(896, 3584), w13=meta(e, 768, 1792, dtype=u8),
+                w2=meta(e, 3584, 192, dtype=u8), w13s=meta(1, dtype=u8), w2s=meta(1, dtype=u8), out=meta(s, hidden),
+                layer=3)
 
 
 @pytest.fixture
@@ -333,6 +336,12 @@ def test_layer_tail_reasons(gfx950, runner):
     assert "contiguous bf16" in r(runner, build, **{**launch_kw(), "prefix": meta(12, 7170)[:, :7168]})
     assert "blocks must be" in r(runner, build, **{**launch_kw(), "blocks": meta(12, 2, 7168)})
     assert "blocks must be" in r(runner, build, **{**launch_kw(), "blocks": meta(12, 8, 7168, dtype=f32)})
+    # the weights' other dims: a model with the same hidden, o_proj K and experts but another intermediate size
+    assert "w2 (896, 3584, 2048) (the kernel takes (896, 3584, 192))" in r(
+        runner, build, **{**launch_kw(), "w2": meta(896, 3584, 2048, dtype=u8)})
+    assert "w13 (896, 8192, 1792)" in r(runner, build, **{**launch_kw(), "w13": meta(896, 8192, 1792, dtype=u8)})
+    assert "w_gate must be contiguous" in r(runner, build, **{**launch_kw(), "w_gate": meta(896, 7168, dtype=f32)})
+    assert "bias must be contiguous" in r(runner, build, **{**launch_kw(), "bias": meta(896)})
     other = SimpleNamespace()
     reason = r(other, build, **launch_kw())
     assert "no kernel for a SimpleNamespace" in reason

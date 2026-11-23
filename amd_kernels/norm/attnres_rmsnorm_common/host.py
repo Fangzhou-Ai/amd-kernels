@@ -92,6 +92,8 @@ def allreduce_attnres_rmsnorm_unsupported_reason(comm, partial, prefix, bank, no
         if not 0 <= num_blocks <= bank.shape[1] or not (block_write_idx < 0 or num_blocks <= block_write_idx
                                                         < bank.shape[1]):
             return f"{_OP}: num_blocks <= block_write_idx < bank rows, or block_write_idx < 0"
+    if bank is not None and (norm_weight is None or qk_weight is None):
+        return f"{_OP}: a bank needs norm_weight and qk_weight"
     for w in (norm_weight, qk_weight, out_norm_weight):
         if w is not None and (w.numel() != h or w.dtype != partial.dtype or w.stride(-1) != 1 or w.device != dev):
             return f"{_OP}: weights must be contiguous bf16 [{h}]"

@@ -110,6 +110,8 @@ class AttnResComm:
                                  or bank.shape[2] != H or bank.dtype != x.dtype or bank.stride(2) != 1
                                  or bank.stride(1) % 8 or bank.stride(0) % 8 or bank.device != dev):
             raise ValueError("bank must be bf16 [rows, <=8, 7168] with strides divisible by eight")
+        if bank is not None and (norm_weight is None or qk_weight is None):
+            raise ValueError("a bank needs norm_weight and qk_weight")
         for w in (norm_weight, qk_weight, out_norm_weight):
             if w is not None and (w.numel() != H or w.dtype != x.dtype or w.stride(-1) != 1 or w.device != dev):
                 raise ValueError("weights must be contiguous bf16 [7168]")
